@@ -17,7 +17,7 @@ use crate::auth::Principal;
 
 use super::types::{
     ApiError, AppState, conversation_visibility, every_agent_id, is_self_or_ancestor,
-    require_admin_or_operator, spawn_store,
+    require_operator_audited, spawn_store,
 };
 use super::{hybrid, memory_backlog};
 
@@ -31,7 +31,7 @@ pub(super) async fn operator_inbox(
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "agents.operator_inbox", &name)?;
+        require_operator_audited(&state.store, &principal, "agents.operator_inbox", &name)?;
         let agent = state
             .store
             .agent_by_name(&name)

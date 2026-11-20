@@ -1154,6 +1154,10 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 
 fn is_untrusted_launch_env(k: &str) -> bool {
     k.starts_with("ANYAGENTS_S3_")
+        || k.starts_with("ANYAGENTS_ADMIN_")
+        || k.starts_with("ANYAGENTS_OIDC_")
+        || k.starts_with("ANYAGENTS_CONTROL_")
+        || k.starts_with("ANYAGENTS_AUTH_")
         || matches!(
             k,
             anyagents_harness::SEAT_LAUNCH_ENV
@@ -1170,6 +1174,8 @@ fn is_untrusted_launch_env(k: &str) -> bool {
                 | "ANYAGENTS_CAPABILITY_KEY"
                 | "ANYAGENTS_MASTER_KEY"
                 | "ANYAGENTS_TICK_TOKEN"
+                | "ANYAGENTS_TIMER_TOKEN"
+                | "ANYAGENTS_TIMER_SCHEDULER_TOKEN"
                 | "ANYAGENTS_DATABASE_URL"
                 | "ANYAGENTS_DIRECT_DATABASE_URL"
                 | "LD_PRELOAD"

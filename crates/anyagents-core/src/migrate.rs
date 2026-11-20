@@ -83,6 +83,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/040_browser_profile_grants.sql"),
     ),
     (40, include_str!("../migrations/041_agent_runtime.sql")),
+    (
+        41,
+        include_str!("../migrations/042_schedule_external_timer.sql"),
+    ),
 ];
 
 /// The version that moves the mailbox search index out of the state

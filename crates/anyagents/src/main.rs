@@ -14,8 +14,10 @@ mod agent;
 mod agent_file;
 mod api;
 mod auth;
+mod auth_device;
 mod channel;
 mod client;
+mod control_cli;
 mod create;
 mod data;
 mod fake_opencode;
@@ -46,6 +48,7 @@ mod serverless_cloud;
 mod signin;
 mod spiron;
 mod telegram;
+mod timer;
 mod ui;
 mod vendor;
 
@@ -85,11 +88,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// View accounts, sign in, or configure provider keys.
+    /// Authenticate via RFC 8628 OIDC Device Flow (`auth login|status|logout`) or manage provider keys.
     #[command(display_order = 3)]
     Auth {
         #[command(subcommand)]
-        action: Option<AuthCommand>,
+        action: Option<control_cli::AuthCommand>,
     },
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
     #[command(hide = true, aliases = ["signin", "login"])]
@@ -105,17 +108,10 @@ enum Command {
         #[command(subcommand)]
         action: HarnessesCommand,
     },
-    /// Upstream provider profile pool (Subscriptions, Coding Plans, and API Keys) shared across harnesses.
-    #[command(hide = true)]
-    Profiles {
-        /// Optional action (`list`, `set`) or provider/harness filter.
-        action: Option<String>,
-        /// Target `<provider>/<profile>` when `action` is `set` (or filter when `action` is `list`).
-        target: Option<String>,
-        /// File holding the API / Coding Plan key when `action` is `set`.
-        #[arg(long = "key-file")]
-        key_file: Option<PathBuf>,
-    },
+    /// Manage upstream provider profiles and 5h + Weekly quotas (`list [--fresh]`, `native-signin`, `set`).
+    Profiles(control_cli::ProfilesCliArgs),
+    /// Manage write-only deployment secrets (`list`, `set`, `grant`, `revoke`, `delete`).
+    Secrets(control_cli::SecretsCliArgs),
     /// List or manage agents.
     #[command(display_order = 2, visible_alias = "agent")]
     Agents {
@@ -287,30 +283,8 @@ enum Command {
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search(SearchArgs),
-    /// List recorded usage. Queried through the daemon socket when it is
-    /// running, with a read-only direct fallback otherwise.
-    Usage {
-        #[arg(long)]
-        agent: Option<String>,
-        /// Group sums (`agent`, `day`, `model`, `harness`). `day` is the
-        /// legacy spelling of `--group-by day`.
-        #[arg(long)]
-        by: Option<String>,
-        #[arg(long = "group-by")]
-        group_by: Option<String>,
-        /// Include causal descendants of `--agent`.
-        #[arg(long)]
-        include_descendants: bool,
-        /// Window start, inclusive (unix ms).
-        #[arg(long = "since-ms")]
-        since_ms: Option<i64>,
-        /// Window end, inclusive (unix ms).
-        #[arg(long = "until-ms")]
-        until_ms: Option<i64>,
-        /// Trailing window in days.
-        #[arg(long)]
-        days: Option<i64>,
-    },
+    /// List recorded usage (`--group-by agent|day|model|harness|profile`).
+    Usage(control_cli::UsageCliArgs),
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     #[command(hide = true)]
@@ -676,27 +650,6 @@ enum KeepersCommand {
 }
 
 #[derive(Subcommand)]
-enum AuthCommand {
-    /// List accounts and quota (also the default).
-    #[command(visible_alias = "status")]
-    List { filter: Option<String> },
-    /// Sign in to an agent or provider profile.
-    Login {
-        target: String,
-        #[arg(long)]
-        profile: Option<String>,
-    },
-    /// Set the key for a provider profile.
-    Set {
-        target: String,
-        #[arg(long)]
-        key_file: Option<PathBuf>,
-    },
-    /// List supported harnesses.
-    Harnesses,
-}
-
-#[derive(Subcommand)]
 enum HarnessesCommand {
     /// List the harnesses this client can sign in. Prints no credential.
     List,
@@ -924,11 +877,7 @@ enum AgentsCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// Grant administrative authority to a root agent (operator only).
-    GrantAdmin { agent: String },
-    /// Revoke administrative authority immediately (operator only).
-    RevokeAdmin { agent: String },
-    /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator or root admin).
+    /// End an agent's remote (cloud) sessions now: every token of each stops authenticating on its next call (operator only).
     RevokeRemote {
         /// Agent name or `agt_...` ID.
         agent: String,
@@ -1136,17 +1085,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Serve { port: Some(port) } => server::run_with_port(&data, Some(port)),
         Command::Serve { port: None } => server::run(&data),
         Command::Status { json } => status_cmd(&data, json),
-        Command::Auth { action } => match action.unwrap_or(AuthCommand::List { filter: None }) {
-            AuthCommand::List { filter } => list_profiles_cmd(&data, filter.as_deref(), false),
-            AuthCommand::Login { target, profile } => sign_in(&data, &target, profile.as_deref()),
-            AuthCommand::Set { target, key_file } => {
-                profiles_cmd(&data, Some("set"), Some(&target), key_file.as_deref())
-            }
-            AuthCommand::Harnesses => {
-                list_harnesses(&data);
-                Ok(())
-            }
-        },
+        Command::Auth { action } => {
+            control_cli::run_auth_cmd(&data, action, sign_in, list_harnesses)
+        }
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
             HarnessesCommand::List => {
@@ -1154,20 +1095,12 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 Ok(())
             }
             HarnessesCommand::Profiles { harness } => {
-                list_profiles_cmd(&data, harness.as_deref(), false)
+                control_cli::profiles_list_cmd(&data, harness.as_deref(), false, None, false)
             }
             HarnessesCommand::Update { harness } => update_harnesses_cmd(&data, harness.as_deref()),
         },
-        Command::Profiles {
-            action,
-            target,
-            key_file,
-        } => profiles_cmd(
-            &data,
-            action.as_deref(),
-            target.as_deref(),
-            key_file.as_deref(),
-        ),
+        Command::Profiles(args) => control_cli::run_profiles_cmd(&data, args),
+        Command::Secrets(args) => control_cli::run_secrets_cmd(&data, args),
         Command::Mcp {
             config,
             _profile: _,
@@ -1501,29 +1434,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 options: args.options,
             },
         ),
-        Command::Usage {
-            agent,
-            by,
-            group_by,
-            include_descendants,
-            since_ms,
-            until_ms,
-            days,
-        } => agent::usage(
-            &data,
-            &agent::UsageParams {
-                agent,
-                group_by: group_by.or(by),
-                since_ms,
-                until_ms,
-                days,
-                include_descendants: include_descendants.then_some(true),
-            },
-        )
-        .map_err(|err| match err {
-            agent::UsageError::Store(err) => err,
-            agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
-        }),
+        Command::Usage(args) => control_cli::run_usage_cmd(&data, args),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
         Command::Describe {
@@ -2137,118 +2048,6 @@ fn model_cmd(
     )
 }
 
-fn profiles_cmd(
-    data: &Path,
-    action: Option<&str>,
-    target: Option<&str>,
-    key_file: Option<&Path>,
-) -> Result<(), anyagents_core::Error> {
-    use anyagents_core::Error;
-    match action.map(str::trim).filter(|s| !s.is_empty()) {
-        Some("set") => {
-            let profile = target
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    Error::Message(
-                        "usage: anyagents profiles set <provider>/<profile> --key-file <path>"
-                            .into(),
-                    )
-                })?;
-            let key = match key_file {
-                Some(kf) => std::fs::read_to_string(kf)?,
-                None if ui::is_pretty() && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
-                    signin::read_secret_line("API key", Some(std::time::Duration::from_secs(300)))?
-                }
-                None => {
-                    return Err(Error::Message(
-                        "--key-file <path> is required for `profiles set`".into(),
-                    ));
-                }
-            };
-            if client::can_call_server(data) {
-                let body = serde_json::json!({"profile": profile, "key": key});
-                match client::call::<serde_json::Value>(
-                    data,
-                    "POST",
-                    "/v1/profiles",
-                    Some(body.to_string().into_bytes()),
-                    &client::authority(data),
-                ) {
-                    Ok(result) => {
-                        let result = result
-                            .ok_or_else(|| Error::Message("the server answered nothing".into()))?;
-                        if ui::is_pretty() {
-                            ui::success(&format!("Profile {profile} saved"));
-                        } else {
-                            println!("{result}");
-                        }
-                        return Ok(());
-                    }
-                    Err(err) if err.contains("404") => {}
-                    Err(err) => return Err(Error::Message(err)),
-                }
-            }
-            let (prov, prof) = create::set_provider_profile(data, profile, &key)?;
-            if ui::is_pretty() {
-                ui::success(&format!("Profile {prov}/{prof} saved"));
-            } else {
-                println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
-            }
-            Ok(())
-        }
-        Some("refresh") | Some("reset") => {
-            create::force_refresh_provider_profiles(data, target)?;
-            // A server lists afresh itself; without one, sync here first.
-            if !client::can_call_server(data)
-                && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
-            {
-                let _ = create::sync_and_list_provider_profiles(&store, data);
-            }
-            list_profiles_cmd(data, target, true)
-        }
-        Some("models") | Some("catalog") => {
-            let catalogs = if client::can_call_server(data) {
-                let path = match target.map(str::trim).filter(|s| !s.is_empty()) {
-                    Some(t) => format!("/v1/profiles/models?filter={t}"),
-                    None => "/v1/profiles/models".to_string(),
-                };
-                match client::call::<serde_json::Value>(
-                    data,
-                    "GET",
-                    &path,
-                    None,
-                    &client::authority(data),
-                ) {
-                    Ok(Some(val)) => val,
-                    Ok(None) | Err(_) => create::probe_profile_models_catalog(data, target),
-                }
-            } else {
-                create::probe_profile_models_catalog(data, target)
-            };
-            if ui::is_pretty() {
-                ui::value("Profile models", &catalogs);
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&catalogs)
-                        .map_err(|e| Error::Message(e.to_string()))?
-                );
-            }
-            Ok(())
-        }
-        Some("signin") | Some("sign-in") | Some("login") => {
-            let prof_target = target
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("claude-code");
-            sign_in(data, prof_target, None)
-        }
-        Some("list") => list_profiles_cmd(data, target, false),
-        other => list_profiles_cmd(data, other, false),
-    }
-}
-
 /// The installer's sign-in, run against either a server master profile
 /// (`<data>/profiles/<harness>/<profile>`) when `target` is a harness catalog
 /// ID or `profile` is specified, or against a recorded agent's own config directory.
@@ -2580,96 +2379,6 @@ fn apply_local_subagent_default(
         cfg.agents.insert(ag.to_string(), spec);
     } else {
         cfg.default = spec;
-    }
-}
-
-/// `profiles`: the server's snapshot when a server answers, which costs no
-/// probe; otherwise a listing made here, probing every provider inline.
-/// `fresh` asks the server for a listing made after this call.
-fn list_profiles_cmd(
-    data: &Path,
-    filter: Option<&str>,
-    fresh: bool,
-) -> Result<(), anyagents_core::Error> {
-    let filter = filter.filter(|f| {
-        let t = f.trim();
-        !t.is_empty()
-            && !t.eq_ignore_ascii_case("list")
-            && !t.eq_ignore_ascii_case("refresh")
-            && !t.eq_ignore_ascii_case("reset")
-    });
-    let path = if fresh {
-        "/v1/profiles?fresh=true"
-    } else {
-        "/v1/profiles"
-    };
-    let (entries, usage_age_ms): (Vec<create::ProviderProfileEntry>, Option<i64>) =
-        match client::get::<Vec<server::ServedProfile>>(data, path)
-            .map_err(anyagents_core::Error::Message)?
-        {
-            Some(served) => {
-                let age = served.iter().filter_map(|s| s.usage_age_ms).max();
-                (served.into_iter().map(|s| s.entry).collect(), age)
-            }
-            None => {
-                let store = anyagents_core::Store::open(data.join("state.db"))?;
-                let mut entries = create::list_provider_profiles_fast(&store, data);
-                if entries.iter().any(|e| e.usage.is_none()) {
-                    create::enrich_profiles_usage(data, &mut entries);
-                }
-                (entries, None)
-            }
-        };
-    let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
-        e.provider == f_trimmed
-            || e.profile == f_trimmed
-            || format!("{}/{}", e.provider, e.profile) == f_trimmed
-            || e.account
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(f_trimmed))
-            || e.compatible_harnesses.iter().any(|h| h == f_trimmed)
-    };
-    let filtered: Vec<create::ProviderProfileEntry> = entries
-        .into_iter()
-        .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
-        .collect();
-    if let Some(age) = usage_age_ms {
-        eprintln!(
-            "usage as of {} ago; the server refreshes it in the background",
-            age_text(age)
-        );
-    }
-    if ui::is_pretty() {
-        ui::print_profiles_pretty(&filtered);
-        return Ok(());
-    }
-    println!(
-        "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\tAGENTS",
-        "PROVIDER", "PROFILE", "KIND", "USAGE / BALANCE", "COMPATIBLE HARNESSES"
-    );
-    for e in filtered {
-        let usage = e.usage.as_deref().unwrap_or("-");
-        let harnesses = e.compatible_harnesses.join(",");
-        let agents = if e.assigned_agents.is_empty() {
-            "-".to_string()
-        } else {
-            e.assigned_agents.join(",")
-        };
-        println!(
-            "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\t{}",
-            e.provider, e.profile, e.kind, usage, harnesses, agents
-        );
-    }
-    Ok(())
-}
-
-/// A short age: `42s`, `3m 05s`, `2h 10m`.
-fn age_text(ms: i64) -> String {
-    let secs = ms.max(0) / 1000;
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
-        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
     }
 }
 
@@ -3086,22 +2795,24 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
     Ok(())
 }
 
-/// Physical fixture roots keep system aliases (for example a temporary-root
-/// symlink) outside the boundary. Product readers still refuse all symlinks.
 #[cfg(test)]
-pub(crate) fn test_tempdir() -> tempfile::TempDir {
-    tempfile::tempdir_in(
-        std::env::temp_dir()
-            .canonicalize()
-            .expect("physical temporary root"),
-    )
-    .expect("owned temporary fixture")
-}
+pub(crate) use cli_query_tests::test_tempdir;
 
 #[cfg(test)]
 mod cli_query_tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Physical fixture roots keep system aliases (for example a temporary-root
+    /// symlink) outside the boundary. Product readers still refuse all symlinks.
+    pub(crate) fn test_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("physical temporary root"),
+        )
+        .expect("owned temporary fixture")
+    }
 
     #[test]
     fn internal_commands_are_hidden_but_direct_help_still_parses() {

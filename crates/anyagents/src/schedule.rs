@@ -932,10 +932,6 @@ const LOCAL_WATCH_PROBE_MS: i64 = 1_000;
 /// Spacing before a due tick or triggered watch whose wake was not written (a
 /// held lifecycle lock, a store error) is tried again.
 const RETRY_MS: i64 = 1_000;
-/// Longest a timer trusts its cached schedules without re-reading them. It covers
-/// writes from another process and wall-clock steps; every change made through
-/// this module wakes the timers at once.
-const SAFETY_NET_MS: i64 = 60_000;
 /// A task child that ended a parent-initiated turn without reporting is nudged
 /// this long after the parent's message was delivered.
 const CHILD_NUDGE_AFTER_MS: i64 = 15_000;
@@ -965,10 +961,8 @@ fn change_feed(data_dir: &Path) -> Arc<tokio::sync::watch::Sender<u64>> {
     )
 }
 
-/// Wake this process's schedule timers for `data_dir`: an active schedule was
-/// created, changed or cancelled. [`create_agent_schedule`] and
-/// [`cancel_agent_schedule`] call it; any other in-process writer of schedules
-/// should too. A write from another process is read within [`SAFETY_NET_MS`].
+/// Wake this process's schedule watchers for `data_dir`: an active schedule was
+/// created, changed or cancelled.
 pub fn schedules_changed(data_dir: &Path) {
     let feeds = FEEDS
         .lock()
@@ -978,16 +972,25 @@ pub fn schedules_changed(data_dir: &Path) {
     }
 }
 
-/// Start the server's schedule timer loop (local timers, watches, and the
-/// turn-ownership guard). Steps at once at startup, then sleeps until its
-/// earliest due time, a schedule change, or a kernel/store/health wakeup.
+/// Start the server's schedule watch + turn-ownership loop (local timers are
+/// owned by [`crate::timer::LocalTokioTimerBackend`]).
+pub(crate) fn start_watch_loops(
+    store: Arc<Store>,
+    health: HealthBoard,
+    stopping: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let feed = change_feed(store.data_dir());
+    spawn_local_timer(store, health, feed.subscribe(), stopping, true)
+}
+
+#[cfg(test)]
 pub fn start_loops(
     store: Arc<Store>,
     health: HealthBoard,
     stopping: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let feed = change_feed(store.data_dir());
-    spawn_local_timer(store, health, feed.subscribe(), stopping)
+    spawn_local_timer(store, health, feed.subscribe(), stopping, false)
 }
 
 fn spawn_local_timer(
@@ -995,8 +998,9 @@ fn spawn_local_timer(
     health: HealthBoard,
     mut changes: tokio::sync::watch::Receiver<u64>,
     mut stopping: tokio::sync::watch::Receiver<bool>,
+    watches_only: bool,
 ) -> tokio::task::JoinHandle<()> {
-    let timer = Timer::local_event_driven();
+    let timer = Timer::local_event_driven(watches_only);
     let stop = Arc::clone(&timer.stop);
     let timer = Arc::new(Mutex::new(timer));
     let mut store_changes = store.subscribe_changes();
@@ -1064,13 +1068,18 @@ fn spawn_local_timer(
                 t.set_local_fallback(fallback, now);
                 deadline = t.recompute_deadline(now);
             }
-            let wait = deadline
-                .saturating_sub(anyagents_core::now_ms())
-                .clamp(0, SAFETY_NET_MS);
+            let sleep_wait = async {
+                if deadline == i64::MAX {
+                    std::future::pending::<()>().await;
+                } else {
+                    let wait = deadline.saturating_sub(anyagents_core::now_ms()).max(0) as u64;
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+            };
             tokio::select! {
                 biased;
                 _ = stopping.wait_for(|stop| *stop) => break,
-                () = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
+                () = sleep_wait => {}
                 Ok(()) = changes.changed() => {}
                 ready = local_events.changed() => {
                     let fallback = local_events.fallback().clone();
@@ -1112,9 +1121,9 @@ impl Timer {
         }
     }
 
-    fn local_event_driven() -> Self {
+    fn local_event_driven(watches_only: bool) -> Self {
         Self {
-            plan: Plan::new(true),
+            plan: Plan::new_with_mode(true, watches_only),
             guard: Some(TurnGuard::default()),
             deadline: i64::MIN,
             stop: Arc::default(),
@@ -1261,9 +1270,29 @@ struct Step {
     deadline: i64,
 }
 
-/// Evaluate due local schedules and reminders in one bounded on-demand pass
-/// for `POST /v1/internal/tick` in pure serverless mode. Returns `(fired_count, woken_agents)`.
-pub(crate) fn tick_serverless_schedules(
+/// Evaluate a single `watch` schedule without scanning unrelated rows.
+/// Returns `(fired, next_probe_at_ms)`.
+pub(crate) fn evaluate_single_watch_schedule(
+    store: &Store,
+    health: &HealthBoard,
+    sched: &AgentSchedule,
+    now: i64,
+) -> (bool, Option<i64>) {
+    let mut entry = Entry {
+        sched: sched.clone(),
+        watch: parse_watch_spec(&sched.spec).ok(),
+        check_at: i64::MAX,
+        idle_target: None,
+    };
+    let out = evaluate_watch_entry(store, health, &mut entry, false, &HashSet::new(), now);
+    (
+        out.fired,
+        (entry.check_at < i64::MAX).then_some(entry.check_at),
+    )
+}
+
+/// Evaluate due schedules during an operator-initiated maintenance pass.
+pub(crate) fn evaluate_maintenance_schedules(
     store: &Store,
     health: &HealthBoard,
     now: i64,
@@ -1721,6 +1750,7 @@ struct Entry {
 /// The active schedules managed by the schedule timer loop.
 struct Plan {
     event_driven: bool,
+    watches_only: bool,
     local_fallback: HashSet<WatchTarget>,
     entries: Vec<Entry>,
     /// Change-feed generation the entries were read at.
@@ -1751,8 +1781,13 @@ impl EntryOutcome {
 
 impl Plan {
     fn new(event_driven: bool) -> Self {
+        Self::new_with_mode(event_driven, false)
+    }
+
+    fn new_with_mode(event_driven: bool, watches_only: bool) -> Self {
         Self {
             event_driven,
+            watches_only,
             local_fallback: HashSet::new(),
             entries: Vec::new(),
             generation: 0,
@@ -1785,7 +1820,7 @@ impl Plan {
             Ok(entries) => {
                 self.entries = entries;
                 self.generation = generation;
-                self.reload_at = now.saturating_add(SAFETY_NET_MS);
+                self.reload_at = i64::MAX;
             }
             Err(err) => {
                 eprintln!("Schedule census unavailable: {err}");
@@ -1807,6 +1842,9 @@ impl Plan {
         let mut live: Option<HashSet<AgentId>> = None;
         let mut entries = Vec::new();
         for sched in schedules {
+            if self.watches_only && sched.kind != "watch" {
+                continue;
+            }
             let watch = if sched.kind == "watch" {
                 parse_watch_spec(&sched.spec).ok()
             } else {
@@ -1960,70 +1998,24 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
         entry.check_at = due;
         return EntryOutcome::default();
     }
-    // Until a re-read shows the slot claimed, this one waits out a retry.
     entry.check_at = now.saturating_add(RETRY_MS);
-    let agent = match schedule_owner(store, sched) {
-        Owner::Live(agent) => agent,
-        Owner::Gone => return cancel_for_gone_owner(store, sched),
-        Owner::Unknown => return EntryOutcome::default(),
-    };
-    let source_key = format!("schedule:{}:{}", sched.id, due);
-    if sched.kind == "at" {
-        return EntryOutcome {
-            fired: deliver_scheduled_wake(store, &agent, sched, &source_key, now),
-            wrote: true,
-        };
-    }
-    let interval = sched.interval_ms.unwrap_or(60_000).max(1_000);
-    let next_due = Store::next_recurring_fire_ms(
+    match crate::timer::fire_schedule_by_id(
+        store,
+        &HealthBoard::default(),
+        &crate::timer::NoopTimerBackend,
         &sched.id,
-        sched.agent_id.as_str(),
-        sched.created_at_ms,
-        due,
-        interval,
+        Some(due),
         now,
-    );
-    // An occurrence can be delivered even if no later slot fits in the
-    // stored timestamp type. Do not leave an active row with no deadline.
-    let next_state = if next_due.is_some() {
-        "active"
-    } else {
-        "fired"
-    };
-    let Some(previous_pending) = previous_wake_pending(store, &agent, sched) else {
-        return EntryOutcome::default();
-    };
-    if previous_pending {
-        // The undelivered tick already stands for this one; the owner
-        // receives a single wake and the schedule moves to its next slot.
-        if let Err(err) = store.claim_schedule_tick(
-            &sched.id,
-            Some(due),
-            next_state,
-            next_due,
-            None,
-            None,
-            Some("coalesced"),
-        ) {
-            eprintln!("Schedule {} coalesce write failed: {err}", sched.id);
+    ) {
+        Ok(res) if res.reason.as_deref() == Some("lifecycle_busy") => EntryOutcome::default(),
+        Ok(res) => EntryOutcome {
+            fired: res.fired,
+            wrote: true,
+        },
+        Err(err) => {
+            eprintln!("Schedule {} fire failed: {err}", sched.id);
+            EntryOutcome::default()
         }
-        return EntryOutcome::WROTE;
-    }
-    EntryOutcome {
-        fired: claim_and_deliver_scheduled_wake(
-            store,
-            &agent,
-            sched,
-            Some(due),
-            next_state,
-            next_due,
-            None,
-            Some("fired"),
-            &sched.prompt,
-            &source_key,
-            now,
-        ),
-        wrote: true,
     }
 }
 
@@ -2152,6 +2144,7 @@ fn evaluate_watch_entry(
     EntryOutcome { fired, wrote: true }
 }
 
+#[cfg(test)]
 fn deliver_scheduled_wake(
     store: &Store,
     agent: &Agent,

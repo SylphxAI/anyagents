@@ -386,7 +386,6 @@ fn roster_authorization_matches_the_single_agent_checks() {
     };
     let root = make("root", None, None);
     let admin = make("admin", None, None);
-    store.set_agent_admin(&admin.id, true).unwrap();
     let peer = make("peer", None, None);
     let lead = make("lead", Some(&root), Some("siblings"));
     let sib = make("sib", Some(&root), Some("siblings"));
@@ -1285,6 +1284,7 @@ fn reset_session_requires_management_authority_and_quiescence_before_any_pin_cha
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = |a: &Agent| Principal::Agent {
@@ -1401,6 +1401,7 @@ fn a_search_past_its_index_budget_answers_partial_and_the_background_completes_i
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let search = |term: &str| {
@@ -1557,6 +1558,7 @@ fn hybrid_search_fuses_cited_dense_ranges_reranks_and_never_widens_access() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = Principal::Agent {
@@ -1650,6 +1652,7 @@ fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -1736,6 +1739,7 @@ fn canonical_conversation_scopes_files_under_real_ancestor_authority() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -2104,6 +2108,7 @@ fn writes_on_the_tcp_listeners_hold_the_stop() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         use tokio::io::AsyncWriteExt;
@@ -2183,6 +2188,7 @@ fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         use hyper::service::Service as _;
@@ -2362,6 +2368,7 @@ fn describe_preserves_scope_and_audits_authorized_policy_updates() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().to_path_buf(),
         },
@@ -2424,16 +2431,15 @@ fn describe_preserves_scope_and_audits_authorized_policy_updates() {
         }
         assert_eq!(store.agent(&mind.id).unwrap(), before);
 
-        // An admin's self update is allowed and has the same atomic audit.
-        store.set_agent_admin(&parent.id, true).unwrap();
-        let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated", "description":"Admin self charter"})).unwrap()))
+        // Operator update on a root agent is allowed and leaves an atomic audit row.
+        let _ = set_description_route(Principal::Operator, State(state.clone()), AxumPath("parent".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated", "description":"Operator charter"})).unwrap()))
             .await.unwrap_or_else(|e| panic!("{}", e.message));
         let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
         let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
         let rows: Vec<(String,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
         assert_eq!(rows, expected_audit);
-        let self_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-        assert_eq!(self_audit, ("agent:parent".into(),"public".into(),"isolated".into(),"scope".into()));
+        let op_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(op_audit, ("operator".into(),"public".into(),"isolated".into(),"scope".into()));
         assert_eq!(store.agent(&mind.id).unwrap().description.as_deref(), Some("Public charter"));
         // Every runtime-config pass reads the store's policy; none owns it.
         for _ in 0..2 {
@@ -2465,6 +2471,7 @@ fn spawn_defaults_to_private_regardless_of_role() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -3053,6 +3060,7 @@ fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profi
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -4579,6 +4587,7 @@ fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: dir.path().into(),
         },
@@ -4769,6 +4778,7 @@ fn archetype_validation_state(data: &Path) -> AppState {
         sign_in: Arc::new(Mutex::new(ProcessRunner)),
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         auth: auth::Mode::Trusted {
             data_dir: data.into(),
         },
@@ -5796,8 +5806,7 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
     }
     assert_eq!(store.list_schedules(None, true).unwrap().len(), 3);
     assert!(authorize_schedule_target(store, &Principal::Operator, None).is_err());
-    // Only top-level agents can hold administrative authority.
-    assert!(store.set_agent_admin(&child.id, true).is_err());
+    // Child sees only its own schedule (1), parent sees itself + child (2), operator sees all (3).
     assert_eq!(
         list_fleet_schedules(store, &child_principal).unwrap()["schedules"]
             .as_array()
@@ -5805,15 +5814,13 @@ async fn fleet_schedules_enforce_owner_authority_and_reject_all_mutations() {
             .len(),
         1
     );
-    store.set_agent_admin(&parent.id, true).unwrap();
     assert_eq!(
-        list_fleet_schedules(store, &principal).unwrap()["schedules"]
+        list_fleet_schedules(store, &Principal::Operator).unwrap()["schedules"]
             .as_array()
             .unwrap()
             .len(),
         3
     );
-    store.set_agent_admin(&parent.id, false).unwrap();
     assert_eq!(
         list_fleet_schedules(store, &principal).unwrap()["schedules"]
             .as_array()
@@ -7051,7 +7058,6 @@ async fn agents_report_to_the_operator_and_only_the_operator_reads_it() {
         .store
         .create_agent(anyagents_core::NewAgent::new("report-root", "opencode"))
         .unwrap();
-    state.store.set_agent_admin(&root.id, true).unwrap();
     let mut new = anyagents_core::NewAgent::new("report-child", "opencode");
     new.parent_id = Some(root.id.clone());
     let child = state.store.create_agent(new).unwrap();
@@ -9007,6 +9013,7 @@ fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
     let state_b = AppState {
         store: Arc::clone(&store_b),
@@ -9017,6 +9024,7 @@ fn stateless_two_replicas_mcp_and_gateway_never_revoke_capabilities_or_overwrite
         },
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
+        timer_backend: Arc::new(crate::timer::NoopTimerBackend),
     };
 
     // 1. Replica A creates a remote-sandbox-backed agent with a live local capability,

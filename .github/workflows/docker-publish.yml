@@ -190,7 +190,7 @@ jobs:
         with:
           name: oci-digest-coordinator
           path: ${{ runner.temp }}/digests/coordinator.txt
-          retention-days: 7
+          retention-days: 1
 
   sandbox:
     needs: resolve
@@ -282,7 +282,7 @@ jobs:
         with:
           name: oci-digest-${{ matrix.target }}
           path: ${{ runner.temp }}/digests/${{ matrix.target }}.txt
-          retention-days: 7
+          retention-days: 1
 
   summary:
     needs: [resolve, coordinator, sandbox]

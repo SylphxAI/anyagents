@@ -58,9 +58,14 @@ fn read_sqlite_agents(
     } else {
         "NULL"
     };
+    let is_admin_col = if cols.contains("is_admin") {
+        "is_admin"
+    } else {
+        "0"
+    };
     let select_sql = format!(
         "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms,
-                launch_env, parent_id, is_admin, role, description, {runtime_col}, {budget_col}
+                launch_env, parent_id, {is_admin_col}, role, description, {runtime_col}, {budget_col}
          FROM agents"
     );
     let mut stmt = sqlite.prepare(&select_sql)?;

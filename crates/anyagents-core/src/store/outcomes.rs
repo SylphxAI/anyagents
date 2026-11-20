@@ -100,13 +100,9 @@ impl Store {
                 }
                 let actor = format!("agent:{}", caller.name);
                 if !ok {
-                    if caller.parent_id.is_some() || !caller.is_admin {
-                        return Err(Error::PermissionDenied("administrative authority required".into()));
-                    }
-                    tx.db_execute(
-                        "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, 'agents.verdict', ?3)",
-                        &db_params![now, actor, target.name],
-                    )?;
+                    return Err(Error::PermissionDenied(
+                        "administrative authority required".into(),
+                    ));
                 }
                 (actor, format!("agent:{id}"))
             } else {

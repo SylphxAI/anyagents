@@ -185,6 +185,19 @@ fn start_server(data: &std::path::Path) -> Serve {
     start_server_with_env(data, &[])
 }
 
+fn local_operator_call(
+    socket: &std::path::Path,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (String, serde_json::Value) {
+    let answer = support::call_raw(socket, method, path, body, "x-anyagents-admin-csrf: 1\r\n");
+    let status = answer.lines().next().unwrap_or_default().to_string();
+    let at = answer.find("\r\n\r\n").map(|at| at + 4).expect(&answer);
+    let value = serde_json::from_str(&answer[at..]).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
 /// [`start_server`] with extra variables in the server's own environment.
 fn start_server_with_env(data: &std::path::Path, env: &[(&str, &str)]) -> Serve {
     let mut command = support::contract_server();
@@ -1196,25 +1209,21 @@ async fn mcp_tools_use_the_server_socket() {
         cross_tree_err.contains("administrative authority required"),
         "unexpected error: {cross_tree_err}"
     );
-    {
-        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
-        let alpha_rec = store.agent_by_name("alpha").unwrap();
-        let beta_rec = store.agent_by_name("beta").unwrap();
-        store.set_agent_admin(&alpha_rec.id, true).unwrap();
-        store.set_agent_admin(&beta_rec.id, true).unwrap();
-    }
-    let transferred_to_beta: serde_json::Value = ok_json(
-        call(
-            &alpha,
-            "agents",
-            serde_json::json!({
-                "action": "transfer",
-                "name": &spawned.id,
-                "parent": "beta",
-                "prompt": "handing off worker-1 to beta"
-            }),
-        )
-        .await,
+    // Cross-tree transfer is strictly an operator control-plane operation.
+    let sock = dir.path().join("anyagents.sock");
+    let (tx_status, transferred_to_beta) = local_operator_call(
+        &sock,
+        "POST",
+        &format!("/v1/agents/{}/transfer", spawned.id),
+        &serde_json::json!({
+            "parent": "beta",
+            "prompt": "handing off worker-1 to beta"
+        })
+        .to_string(),
+    );
+    assert!(
+        tx_status.contains("200"),
+        "{tx_status} {transferred_to_beta}"
     );
     assert_eq!(transferred_to_beta["previous_parent"], "alpha");
     assert_eq!(transferred_to_beta["new_parent"], "beta");
@@ -1229,28 +1238,22 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(beta_to_worker.deliveries[0].to, "agent:worker-1");
 
-    let transferred_back: serde_json::Value = ok_json(
-        call(
-            &beta,
-            "agents",
-            serde_json::json!({
-                "action": "transfer",
-                "name": &spawned.id,
-                "parent": "alpha",
-                "prompt": "returning worker-1 to alpha"
-            }),
-        )
-        .await,
+    let (tx_back_status, transferred_back) = local_operator_call(
+        &sock,
+        "POST",
+        &format!("/v1/agents/{}/transfer", spawned.id),
+        &serde_json::json!({
+            "parent": "alpha",
+            "prompt": "returning worker-1 to alpha"
+        })
+        .to_string(),
+    );
+    assert!(
+        tx_back_status.contains("200"),
+        "{tx_back_status} {transferred_back}"
     );
     assert_eq!(transferred_back["previous_parent"], "beta");
     assert_eq!(transferred_back["new_parent"], "alpha");
-    {
-        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
-        let alpha_rec = store.agent_by_name("alpha").unwrap();
-        let beta_rec = store.agent_by_name("beta").unwrap();
-        store.set_agent_admin(&alpha_rec.id, false).unwrap();
-        store.set_agent_admin(&beta_rec.id, false).unwrap();
-    }
 
     // Archive the sub-agent (`state = archived`), then pause `beta` to verify `to: ["all"]` reports paused Root peers in `skipped`.
     let archived: AgentView =
@@ -1680,15 +1683,15 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
             self_mut_err.contains("administrative authority required"),
             "unexpected error: {self_mut_err}"
         );
-        store.set_agent_admin(&agent.id, true).unwrap();
-        let desc_res: serde_json::Value = ok_json(
-            call(
-                &alpha,
-                "describe",
-                serde_json::json!({"agent": "self", "description": "Standing owner role description."}),
-            )
-            .await,
+        // Operator updates root description via control-plane REST API, preserving directory permissions.
+        let sock = dir.path().join("anyagents.sock");
+        let (desc_status, desc_res) = local_operator_call(
+            &sock,
+            "POST",
+            "/v1/agents/alpha/description",
+            &serde_json::json!({"description": "Standing owner role description."}).to_string(),
         );
+        assert!(desc_status.contains("200"), "{desc_status} {desc_res}");
         assert_eq!(desc_res["system_prompt_synced"], true);
         let after_meta = std::fs::metadata(&alpha_cfg).unwrap();
         assert_eq!(after_meta.permissions().mode() & 0o7777, 0o0700);

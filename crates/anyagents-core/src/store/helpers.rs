@@ -234,16 +234,15 @@ pub(super) fn agent_from_row_db(row: &DbRow<'_>) -> Result<Agent, Error> {
         Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
         _ => None,
     };
-    let runtime_raw: Option<String> = row.get(13)?;
-    let budget_raw: Option<i64> = row.get(14)?;
+    let runtime_raw: Option<String> = row.get(12)?;
+    let budget_raw: Option<i64> = row.get(13)?;
     let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &launch_env);
     let remote_budget_micros = decode_budget_column(budget_raw, &launch_env);
     Ok(Agent {
-        is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
-        role: row.get(11)?,
-        description: row.get(12)?,
+        role: row.get(10)?,
+        description: row.get(11)?,
         harness,
         runtime,
         remote_budget_micros,
@@ -259,8 +258,8 @@ pub(super) fn agent_from_row_db(row: &DbRow<'_>) -> Result<Agent, Error> {
 
 pub(super) fn agent_summary_from_row_db(row: &DbRow<'_>) -> Result<AgentSummary, Error> {
     let harness: String = row.get(2)?;
-    let runtime_raw: Option<String> = row.get(9)?;
-    let budget_raw: Option<i64> = row.get(10)?;
+    let runtime_raw: Option<String> = row.get(8)?;
+    let budget_raw: Option<i64> = row.get(9)?;
     let runtime = decode_runtime_column(runtime_raw.as_deref(), &harness, &[]);
     let remote_budget_micros = decode_budget_column(budget_raw, &[]);
     Ok(AgentSummary {
@@ -276,8 +275,7 @@ pub(super) fn agent_summary_from_row_db(row: &DbRow<'_>) -> Result<AgentSummary,
             _ => None,
         },
         role: row.get(6)?,
-        is_admin: row.get(7)?,
-        created_at_ms: row.get(8)?,
+        created_at_ms: row.get(7)?,
     })
 }
 

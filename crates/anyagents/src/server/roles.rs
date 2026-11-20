@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Principal;
 use crate::create;
 
-use super::types::{ApiError, AppState, require_admin_or_operator, spawn_store};
+use super::types::{ApiError, AppState, require_operator_audited, spawn_store};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -179,7 +179,7 @@ async fn put_role_route(
     let raw = extract_role_markdown(&headers, &body)?;
     spawn_store(move || {
         let slug = name.trim().to_string();
-        require_admin_or_operator(&state.store, &principal, "roles.put", &slug)?;
+        require_operator_audited(&state.store, &principal, "roles.put", &slug)?;
         if !create::valid_template_stem(&slug) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -224,7 +224,7 @@ async fn delete_role_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
         let slug = name.trim().to_string();
-        require_admin_or_operator(&state.store, &principal, "roles.delete", &slug)?;
+        require_operator_audited(&state.store, &principal, "roles.delete", &slug)?;
         if !create::valid_template_stem(&slug) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -285,6 +285,7 @@ mod tests {
             },
             identity: Arc::new(ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         }
     }
 

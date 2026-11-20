@@ -42,6 +42,7 @@ mod memory_backlog;
 mod messaging;
 mod messaging_conversation;
 mod messaging_delivery;
+pub(crate) mod oidc_bearer;
 mod ops;
 pub(crate) mod outbound_history;
 mod profile_models;
@@ -56,8 +57,10 @@ pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod serverless_envelope;
 mod serverless_failure;
+pub(crate) mod serverless_maintenance;
 mod serverless_memory;
-mod serverless_watches;
+pub(crate) mod serverless_watches;
+pub(crate) mod timer_fire;
 mod types;
 mod webhooks_mcp;
 
@@ -108,6 +111,7 @@ use types::{SignInLine, require_operator, spawn_store};
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     ops::public_health_router()
+        .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::public_router())
         .route(
@@ -118,7 +122,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route))
+        .merge(timer_fire::router())
         .fallback(ops::public_not_found)
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
@@ -129,6 +133,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
 
 fn build_webhook_router(state: AppState) -> Router {
     let base = ops::public_health_router()
+        .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())
         .route(
@@ -139,7 +144,7 @@ fn build_webhook_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route));
+        .merge(timer_fire::router());
     // In Pure Serverless mode there is no reachable host Unix socket, so expose
     // the full authenticated control/agent API and embedded `/admin` console on
     // the HTTP listener strictly when fail-closed operator auth
@@ -173,6 +178,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
 
 pub(crate) fn build_router(state: AppState) -> Router {
     admin_ui::mount_admin_routes(mount_authenticated_api_routes(Router::new()))
+        .merge(oidc_bearer::discovery_router())
         .route("/v1/webhooks/healthz", get(ops::webhook_healthz))
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())
@@ -184,7 +190,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route))
+        .merge(timer_fire::router())
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
             &state.store,

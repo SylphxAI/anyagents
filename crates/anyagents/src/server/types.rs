@@ -28,6 +28,8 @@ pub(crate) struct AppState {
     pub(crate) identity: Arc<ServingIdentity>,
     /// The last provider-profile listing, refreshed in the background.
     pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
+    /// Event-driven timer backend (local Tokio timers or external webhook/delayed-run scheduler).
+    pub(crate) timer_backend: Arc<dyn crate::timer::TimerBackend>,
 }
 
 /// Resolve the logical workspace directory inside a remote sandbox VM.
@@ -98,27 +100,20 @@ pub(super) fn require_operator(principal: &Principal) -> Result<(), ApiError> {
     }
 }
 
-/// Authority is read from SQLite on every call, not from the capability.
-pub(super) fn require_admin_or_operator(
+/// Only the deployment operator holds cross-tree administrative authority.
+pub(super) fn require_operator_audited(
     store: &Store,
     principal: &Principal,
     action: &str,
     target: &str,
 ) -> Result<String, ApiError> {
-    let actor = match principal {
-        Principal::Operator => "operator".to_string(),
-        Principal::Agent { agent_id, name } => {
-            let agent = store.agent(agent_id).map_err(ApiError::from_store)?;
-            if agent.parent_id.is_some() || !agent.is_admin {
-                return Err(ApiError::forbidden("administrative authority required"));
-            }
-            format!("agent:{name}")
-        }
-    };
+    if !principal.is_operator() {
+        return Err(ApiError::forbidden("administrative authority required"));
+    }
     store
-        .record_admin_audit(&actor, action, target)
+        .record_admin_audit("operator", action, target)
         .map_err(ApiError::from_store)?;
-    Ok(actor)
+    Ok("operator".to_string())
 }
 
 /// Whether this call was made by the tool server behind the HTTP MCP route.
@@ -286,23 +281,6 @@ pub(super) fn conversation_visibility(
         }
         Principal::Agent { agent_id, .. } => {
             let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
-            let admin = caller.parent_id.is_none() && caller.is_admin;
-            if admin {
-                let requested = if requested.eq_ignore_ascii_case("self") {
-                    caller.name.as_str()
-                } else {
-                    requested
-                };
-                store
-                    .record_admin_audit(
-                        &format!("agent:{}", caller.name),
-                        "conversation.read",
-                        requested,
-                    )
-                    .map_err(ApiError::from_store)?;
-                return Ok((requested.to_string(), None));
-            }
-
             if requested.eq_ignore_ascii_case("self") {
                 return Ok((caller.name, Some(vec![caller.id.to_string()])));
             }

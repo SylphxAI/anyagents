@@ -438,7 +438,6 @@
       });
 
       const badges = el("div", { class: "badge-row" });
-      if (meta.is_admin) badges.appendChild(pill("ADMIN", "purple"));
       badges.appendChild(pill(st, stateTone(st)));
       if (agent.has_open_turn) badges.appendChild(pill("OPEN TURN", "accent"));
       if (meta.unread_count > 0) badges.appendChild(pill(`${meta.unread_count} unread`, "warning"));
@@ -523,7 +522,6 @@
 
     const badgesEl = $("insp-badges");
     clearNode(badgesEl);
-    if (meta.is_admin) badgesEl.appendChild(pill("ADMIN", "purple"));
     badgesEl.appendChild(pill(st, stateTone(st)));
     if (agent.runtime) badgesEl.appendChild(pill(`${agent.harness}@${agent.runtime}`, agent.runtime === "cloud" ? "accent" : "muted"));
     if (agent.turn_state) badgesEl.appendChild(pill(`turn:${agent.turn_state}`, "muted"));
@@ -534,11 +532,6 @@
     }
 
     // Button visibility & state
-    const toggleAdminBtn = $("btn-toggle-admin");
-    toggleAdminBtn.disabled = Boolean(agent.parent);
-    toggleAdminBtn.textContent = meta.is_admin ? "Revoke Admin" : "Grant Admin";
-    toggleAdminBtn.title = agent.parent ? "Only root agents may hold admin authority" : "";
-
     $("btn-pause-agent").disabled = agent.state === "paused" || agent.state === "archived";
     $("btn-wake-agent").disabled = agent.state === "archived";
     $("btn-archive-agent").disabled = agent.state === "archived";
@@ -723,23 +716,6 @@
         await loadFleet();
       } catch (err) {
         toast(`Runtime switch failed: ${err.message}`, "error");
-      }
-    });
-
-    $("btn-toggle-admin").addEventListener("click", async () => {
-      const agent = state.agents.find((a) => a.name === state.selectedAgentName);
-      if (!agent) return;
-      const meta = state.agentsMeta[agent.id] || {};
-      const nextAdmin = !meta.is_admin;
-      try {
-        await api(`/v1/agents/${encodeURIComponent(agent.name)}/admin`, {
-          method: "POST",
-          body: { admin: nextAdmin },
-        });
-        toast(`${nextAdmin ? "Granted" : "Revoked"} admin on "${agent.name}"`, "success");
-        await loadFleet();
-      } catch (err) {
-        toast(`Toggle admin failed: ${err.message}`, "error");
       }
     });
 
@@ -1040,18 +1016,17 @@
       $("native-start-btn").disabled = true;
 
       try {
-        const resp = await fetch(
-          `/v1/harnesses/${encodeURIComponent(harness)}/sign-in?profile=${encodeURIComponent(profile)}`,
-          {
-            method: "POST",
-            credentials: "same-origin",
-            headers: {
-              [CSRF_HEADER]: "1",
-              accept: "application/x-ndjson",
-            },
-            signal: controller.signal,
-          }
-        );
+        const resp = await fetch("/v1/profiles/native-signin", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            [CSRF_HEADER]: "1",
+            "content-type": "application/json",
+            accept: "application/x-ndjson",
+          },
+          body: JSON.stringify({ harness, profile }),
+          signal: controller.signal,
+        });
 
         if (resp.status === 401) {
           handleUnauthorized();
@@ -1297,10 +1272,10 @@
 
   function renderTickStatus(overview) {
     const authText = [];
-    if (overview.tick_token_configured) authText.push("ANYAGENTS_TICK_TOKEN");
-    if (overview.tick_jwks_configured) authText.push("ANYAGENTS_TICK_JWKS_URL");
+    if (overview.timer_jwks_configured) authText.push("ANYAGENTS_TIMER_JWKS_URL");
+    if (overview.timer_token_configured) authText.push("ANYAGENTS_TIMER_TOKEN");
     $("tick-auth-status").textContent =
-      authText.length > 0 ? `Tick auth: ${authText.join(" + ")}` : "External /v1/internal/tick auth unconfigured";
+      authText.length > 0 ? `Timer fire auth (/v1/internal/fire/{id}): ${authText.join(" + ")}` : "Event-driven /v1/internal/fire/{id} auth unconfigured";
 
     const body = $("tick-status-body");
     clearNode(body);

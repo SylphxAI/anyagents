@@ -2652,7 +2652,6 @@ fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
 fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
     let (_dir, store) = setup();
     let original_worker = agent(&store, "original_worker");
-    store.set_agent_admin(&original_worker.id, true).unwrap();
     store.join_group("owners", &original_worker.id).unwrap();
     store
         .receive(&original_worker.id, Incoming::new("revenue check"))
@@ -2663,7 +2662,6 @@ fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
         .unwrap();
     assert_eq!(renamed.id, original_worker.id);
     assert_eq!(renamed.name, "renamed_worker");
-    assert!(renamed.is_admin);
 
     let with_role = store
         .set_agent_role(&original_worker.id, Some("Revenue"))
@@ -4052,7 +4050,6 @@ fn narrow_agent_reads_match_the_full_rows() {
                 state: agent.state.clone(),
                 parent_id: agent.parent_id.clone(),
                 role: agent.role.clone(),
-                is_admin: agent.is_admin,
                 created_at_ms: agent.created_at_ms,
             }
         );

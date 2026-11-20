@@ -964,7 +964,7 @@ pub(crate) fn resolve_and_commit_staged_signin(
     {
         // Moving agents onto the new profile is the server's rebalance; a
         // sign-in never reconfigures other agents' seats from this process.
-        let _ = sync_and_list_provider_profiles_inner(&store, data, true, false);
+        let _ = sync_and_list_provider_profiles_inner(&store, data, true, false, true);
     }
     Ok((chosen_profile, final_dir, final_email.or(final_id)))
 }

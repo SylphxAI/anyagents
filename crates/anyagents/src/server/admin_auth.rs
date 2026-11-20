@@ -61,7 +61,7 @@ const SESSION_DOMAIN: &[u8] = b"anyagents-admin-session-v1:";
 
 const PREAUTH_TTL_SECS: i64 = 600;
 const SESSION_TTL_SECS: i64 = 12 * 3600;
-const CLOCK_SKEW_SECS: i64 = 60;
+pub(crate) const CLOCK_SKEW_SECS: i64 = 60;
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT_SECS: u64 = 10;
 const MAX_HTTP_BODY_BYTES: u64 = 512 * 1024;
@@ -112,7 +112,7 @@ pub(crate) fn is_oidc_configured() -> bool {
     OidcConfig::from_env().is_some()
 }
 
-fn env_non_empty(name: &str) -> Option<String> {
+pub(crate) fn env_non_empty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|v| v.trim().to_string())
@@ -202,7 +202,7 @@ pub(crate) fn session_signing_key_from_env() -> Option<[u8; 32]> {
     None
 }
 
-fn unix_now_secs() -> i64 {
+pub(crate) fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -416,7 +416,7 @@ fn validate_http_url(raw: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_discovery(issuer: &str) -> Result<OidcDiscovery, String> {
+pub(crate) async fn fetch_discovery(issuer: &str) -> Result<OidcDiscovery, String> {
     {
         let guard = DISCOVERY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(issuer)
@@ -477,136 +477,12 @@ async fn fetch_discovery(issuer: &str) -> Result<OidcDiscovery, String> {
     Ok(doc)
 }
 
-fn strip_leading_zeros(bytes: &[u8]) -> Vec<u8> {
-    let first_non_zero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
-    bytes[first_non_zero..].to_vec()
-}
+pub(crate) use super::oidc_bearer::parse_jwks;
 
-/// Parse an RFC 7517 JWKS JSON document into verifiable `ES256`, `RS256`, and `EdDSA` keys.
-pub(crate) fn parse_jwks(raw: &[u8]) -> Result<Vec<AdminJwk>, String> {
-    let doc: Value = serde_json::from_slice(raw).map_err(|e| format!("invalid JWKS JSON: {e}"))?;
-    let keys = doc
-        .get("keys")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "JWKS missing `keys` array".to_string())?;
-
-    let mut parsed = Vec::new();
-    for entry in keys {
-        if let Some(key_use) = entry.get("use").and_then(Value::as_str)
-            && key_use != "sig"
-        {
-            continue;
-        }
-        let kid = entry
-            .get("kid")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let alg = entry
-            .get("alg")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let kty = entry.get("kty").and_then(Value::as_str).unwrap_or("");
-        match kty {
-            "EC" => {
-                if entry.get("crv").and_then(Value::as_str) != Some("P-256") {
-                    continue;
-                }
-                if let Some(ref a) = alg
-                    && a != "ES256"
-                {
-                    continue;
-                }
-                let Some(x_b64) = entry.get("x").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(y_b64) = entry.get("y").and_then(Value::as_str) else {
-                    continue;
-                };
-                let (Ok(x), Ok(y)) = (
-                    URL_SAFE_NO_PAD.decode(x_b64.trim()),
-                    URL_SAFE_NO_PAD.decode(y_b64.trim()),
-                ) else {
-                    continue;
-                };
-                if x.len() != 32 || y.len() != 32 {
-                    continue;
-                }
-                let mut uncompressed = [0u8; 65];
-                uncompressed[0] = 0x04;
-                uncompressed[1..33].copy_from_slice(&x);
-                uncompressed[33..65].copy_from_slice(&y);
-                parsed.push(AdminJwk {
-                    kid,
-                    alg,
-                    key: JwkKey::EcP256 { uncompressed },
-                });
-            }
-            "RSA" => {
-                if let Some(ref a) = alg
-                    && a != "RS256"
-                {
-                    continue;
-                }
-                let Some(n_b64) = entry.get("n").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(e_b64) = entry.get("e").and_then(Value::as_str) else {
-                    continue;
-                };
-                let (Ok(n_raw), Ok(e_raw)) = (
-                    URL_SAFE_NO_PAD.decode(n_b64.trim()),
-                    URL_SAFE_NO_PAD.decode(e_b64.trim()),
-                ) else {
-                    continue;
-                };
-                let n = strip_leading_zeros(&n_raw);
-                let e = strip_leading_zeros(&e_raw);
-                if n.is_empty() || e.is_empty() {
-                    continue;
-                }
-                parsed.push(AdminJwk {
-                    kid,
-                    alg,
-                    key: JwkKey::Rsa { n, e },
-                });
-            }
-            "OKP" => {
-                if entry.get("crv").and_then(Value::as_str) != Some("Ed25519") {
-                    continue;
-                }
-                if let Some(ref a) = alg
-                    && a != "EdDSA"
-                {
-                    continue;
-                }
-                let Some(x_b64) = entry.get("x").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Ok(decoded) = URL_SAFE_NO_PAD.decode(x_b64.trim()) else {
-                    continue;
-                };
-                if decoded.len() != 32 {
-                    continue;
-                }
-                let mut public_key = [0u8; 32];
-                public_key.copy_from_slice(&decoded);
-                parsed.push(AdminJwk {
-                    kid,
-                    alg,
-                    key: JwkKey::Ed25519 { public_key },
-                });
-            }
-            _ => {}
-        }
-    }
-    Ok(parsed)
-}
-
-async fn fetch_jwks(jwks_uri: &str, force_refresh: bool) -> Result<Vec<AdminJwk>, String> {
+pub(crate) async fn fetch_jwks(
+    jwks_uri: &str,
+    force_refresh: bool,
+) -> Result<Vec<AdminJwk>, String> {
     if !force_refresh {
         let guard = ADMIN_JWKS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(jwks_uri)
@@ -1182,7 +1058,7 @@ async fn exchange_authorization_code(
     .map_err(|e| format!("OIDC token exchange join error: {e}"))?
 }
 
-async fn fetch_userinfo(
+pub(crate) async fn fetch_userinfo(
     userinfo_endpoint: &str,
     access_token: &str,
 ) -> Result<UserInfoClaims, String> {

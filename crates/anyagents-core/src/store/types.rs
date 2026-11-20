@@ -44,7 +44,6 @@ pub struct TurnOwnershipSnapshot {
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
-    pub is_admin: bool,
     pub id: AgentId,
     pub name: String,
     pub role: Option<String>,
@@ -225,7 +224,6 @@ pub struct AgentSummary {
     pub state: String,
     pub parent_id: Option<AgentId>,
     pub role: Option<String>,
-    pub is_admin: bool,
     pub created_at_ms: i64,
 }
 
@@ -291,6 +289,8 @@ pub struct AgentSchedule {
     pub last_observed: Option<String>,
     pub state: String,
     pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_timer_id: Option<String>,
 }
 
 /// Input for [`Store::create_schedule`].

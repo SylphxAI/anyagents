@@ -192,6 +192,7 @@ pub(super) async fn send(
     // that is the one place a body chooses the author, and an inbox is still
     // only ever its own.
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let response = spawn_store(move || {
         let route_named = match &principal {
             Principal::Agent { name, .. } if state.auth.is_trusted() => body
@@ -284,6 +285,7 @@ pub(super) async fn send(
         // a dispatch mid-flight after recording `pending_remote_turns`.
         for agent_name in recipient_names {
             let store_disp = Arc::clone(&dispatch_store);
+            let timer_disp = Arc::clone(&dispatch_timer);
             let call = super::in_flight::carry();
             tokio::spawn(async move {
                 let _call = call;
@@ -295,9 +297,12 @@ pub(super) async fn send(
                 else {
                     return;
                 };
-                if let Err(err) =
-                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &agent.id)
-                        .await
+                if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                    store_disp,
+                    &agent.id,
+                    Some(timer_disp),
+                )
+                .await
                 {
                     eprintln!(
                         "anyagents-serverless: /v1/send dispatch failed for {}: {err}",
@@ -692,12 +697,7 @@ pub(super) fn can_actor_read_agent_private(
 ) -> bool {
     match principal {
         Principal::Operator => true,
-        Principal::Agent { agent_id, .. } => {
-            is_self_or_ancestor(store, agent_id, target)
-                || store
-                    .agent(agent_id)
-                    .is_ok_and(|caller| caller.is_admin && caller.parent_id.is_none())
-        }
+        Principal::Agent { agent_id, .. } => is_self_or_ancestor(store, agent_id, target),
     }
 }
 
@@ -846,7 +846,6 @@ pub(super) fn check_targets(
                         && clean_room != "peers"
                         && !clean_room.starts_with("telegram:")
                         && !store.is_group_public(clean_room)
-                        && !sender.is_admin
                         && let Ok(Some(members)) = store.room_members(room)
                     {
                         let is_member_or_parent = members.iter().any(|m| {

@@ -625,6 +625,7 @@ mod tests {
             auth,
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
         let caller = Principal::Agent {
             agent_id: p.id.clone(),
@@ -831,6 +832,7 @@ mod tests {
             &c.id,
             Some(Arc::clone(&provider)),
             cb.clone(),
+            None,
         )
         .await;
         assert!(first.is_err());
@@ -849,10 +851,11 @@ mod tests {
                 .is_none_or(|hb| hb.turn_state == "idle")
         );
 
-        let woken = dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb)
-            .await
-            .unwrap()
-            .expect("must wake on fresh sandbox");
+        let woken =
+            dispatch_next_mailbox_message_inner(Arc::clone(&s), &c.id, Some(provider), cb, None)
+                .await
+                .unwrap()
+                .expect("must wake on fresh sandbox");
         assert_eq!(woken.turn.status, "running");
         assert_eq!(
             s.sandbox_binding(&c.id)
@@ -999,6 +1002,7 @@ mod tests {
             &agent.id,
             Some(provider),
             Some("http://127.0.0.1:1".to_string()),
+            None,
         )
         .await
         .expect("zombie 409 must self-heal on a fresh lease within the same dispatch")

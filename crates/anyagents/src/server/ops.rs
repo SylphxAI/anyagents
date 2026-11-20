@@ -18,13 +18,14 @@ use crate::create;
 use crate::operator;
 
 use super::types::{
-    ApiError, AppState, SignInLine, require_admin_or_operator, require_operator, spawn_store,
+    ApiError, AppState, SignInLine, require_operator, require_operator_audited, spawn_store,
 };
 use super::{ServedProfile, in_flight, quota_rotation, serverless};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route("/v1/profiles/native-signin", post(native_signin_route))
         .route("/v1/profiles/models", get(profile_models_route))
         .route(
             "/v1/subagent-defaults",
@@ -71,7 +72,7 @@ async fn mint_capability(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "agents.mint_capability", &name)?;
+        require_operator_audited(&state.store, &principal, "agents.mint_capability", &name)?;
         let agent = state
             .store
             .agent_by_name(&name)
@@ -102,7 +103,7 @@ pub(super) async fn revoke_remote_sessions_route(
     Json(body): Json<RevokeRemoteSessionsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(
+        require_operator_audited(
             &state.store,
             &principal,
             "agents.revoke_remote_sessions",
@@ -234,10 +235,60 @@ pub(super) async fn usage_report(
             .iter()
             .map(|agent| (agent.id.clone(), agent.name.clone()))
             .collect();
+        let agent_profiles: std::collections::HashMap<anyagents_core::AgentId, String> =
+            if matches!(group_by, anyagents_core::UsageGroupBy::Profile) {
+                agents
+                    .iter()
+                    .map(|agent| {
+                        let cfg =
+                            anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+                        let bound = create::bound_profile_name(&cfg).or_else(|| {
+                            if !state.store.is_postgres() {
+                                return None;
+                            }
+                            state
+                                .store
+                                .blob_store()
+                                .get_agent_file(&agent.id, "markers", ".anyagents-profile")
+                                .ok()
+                                .flatten()
+                                .and_then(|e| String::from_utf8(e.content).ok())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        });
+                        let resolved = match bound {
+                            Some(b) if b.contains('/') => b,
+                            Some(b) => {
+                                let prov = create::upstream_provider_of(
+                                    &agent.harness,
+                                    agent.model.as_deref(),
+                                );
+                                format!("{prov}/{b}")
+                            }
+                            None => {
+                                let prov = create::upstream_provider_of(
+                                    &agent.harness,
+                                    agent.model.as_deref(),
+                                );
+                                format!("{prov}/default")
+                            }
+                        };
+                        (agent.id.clone(), resolved)
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let records = state.store.list_usage(None).map_err(ApiError::from_store)?;
-        let report =
-            anyagents_core::aggregate_usage(&records, &agent_ids, &names, filter, now_ms())
-                .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+        let report = anyagents_core::aggregate_usage_with_profiles(
+            &records,
+            &agent_ids,
+            &names,
+            &agent_profiles,
+            filter,
+            now_ms(),
+        )
+        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
         Ok(Json(report))
     })
     .await
@@ -332,26 +383,42 @@ async fn profile_models_route(
 
 #[derive(Debug, Default, Deserialize)]
 struct ProfilesQuery {
-    /// Answer with a listing made after this call rather than the snapshot.
+    /// Answer with a fresh live-probed listing (`?fresh=1` or `?fresh=true`).
     #[serde(default)]
-    fresh: Option<bool>,
+    fresh: Option<String>,
+}
+
+fn parse_fresh_flag(raw: Option<&str>) -> Result<bool, ApiError> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    match val.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("invalid `fresh` query value `{other}`: expected 1, 0, true, or false"),
+        )),
+    }
 }
 
 /// `GET /v1/profiles`: the last listing at once, each entry marked with the
-/// age of its usage reading; see [`super::profiles`].
+/// age of its usage reading; pass `?fresh=1` (or `?fresh=true`) to bypass
+/// stale caches and probe live 5h + Weekly quotas across all providers.
 async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
     Query(query): Query<ProfilesQuery>,
 ) -> Result<Json<Vec<ServedProfile>>, ApiError> {
+    let fresh = parse_fresh_flag(query.fresh.as_deref())?;
     let store = Arc::clone(&state.store);
     spawn_store(move || {
-        require_admin_or_operator(&store, &principal, "profiles.list", "profiles").map(drop)
+        require_operator_audited(&store, &principal, "profiles.list", "profiles").map(drop)
     })
     .await?;
     state
         .profiles
-        .list(&state.store, query.fresh.unwrap_or(false))
+        .list(&state.store, fresh)
         .await
         .map(Json)
         .map_err(|why| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why))
@@ -370,7 +437,7 @@ async fn set_profile_route(
     Json(body): Json<SetProfileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
+        require_operator_audited(&state.store, &principal, "profiles.set", &body.profile)?;
         let (provider, profile) =
             create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
                 .map_err(ApiError::from_store)?;
@@ -413,7 +480,7 @@ async fn set_subagent_defaults_route(
 ) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
     spawn_store(move || {
         let target_label = body.agent.as_deref().unwrap_or("global");
-        require_admin_or_operator(
+        require_operator_audited(
             &state.store,
             &principal,
             "subagents.set_default",
@@ -467,18 +534,69 @@ struct SignInQuery {
     profile: Option<String>,
 }
 
-/// `POST /v1/harnesses/{id}/sign-in`. The body stays open while the vendor
-/// command runs. Each link or code is one JSON line, and the last line is the
-/// outcome. The credential never appears here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSignInRequest {
+    /// Target harness or provider (`claude-code`, `codex`, `agy`, `anthropic`, `openai`, `google-antigravity`, ...).
+    #[serde(alias = "provider")]
+    harness: String,
+    /// Target profile name (defaults to `"default"`).
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+fn canonical_signin_harness(raw: &str) -> String {
+    match anyagents_harness::normalize_harness_name(raw) {
+        "anthropic" => "claude-code".to_string(),
+        "openai" => "codex".to_string(),
+        "google-antigravity" => "agy".to_string(),
+        "deepseek" => "dsh".to_string(),
+        "xai" => "grok".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `POST /v1/profiles/native-signin`: canonical Control-Plane REST route to
+/// stream a native provider/harness sign-in flow into a profile.
+async fn native_signin_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<NativeSignInRequest>,
+) -> Result<Response, ApiError> {
+    let harness = canonical_signin_harness(&body.harness);
+    if harness.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "harness (or provider) is required",
+        ));
+    }
+    start_native_signin_stream(principal, state, harness, body.profile).await
+}
+
+/// `POST /v1/harnesses/{id}/sign-in`: delegates to the canonical native sign-in stream.
 async fn sign_in_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<SignInQuery>,
 ) -> Result<Response, ApiError> {
+    start_native_signin_stream(
+        principal,
+        state,
+        canonical_signin_harness(&id),
+        query.profile,
+    )
+    .await
+}
+
+async fn start_native_signin_stream(
+    principal: Principal,
+    state: AppState,
+    id: String,
+    profile_opt: Option<String>,
+) -> Result<Response, ApiError> {
     require_operator(&principal)?;
-    let profile = query
-        .profile
+    let profile = profile_opt
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -577,4 +695,362 @@ impl anyagents_installer::SignInSink for ChannelSink {
     }
 
     fn done(&mut self, _: &anyagents_installer::SignInOutcome) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use anyagents_core::{BillingMode, NewAgent, NewUsage, Store, UsageGroupBy, UsageReport};
+    use anyagents_installer::{CommandRunner, InstallError, LineSink};
+    use anyagents_supervisor::HealthBoard;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt as _;
+    use serde_json::{Value, json};
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use crate::create::{ProviderProfileEntry, QuotaWindow, parse_quota_windows_from_usage};
+    use crate::server::{build_router, profiles::ProfileSnapshots};
+
+    const OP_TOKEN: &str = "ops-unit-test-operator-token-0123456789";
+
+    struct FakeSignInRunner;
+    impl CommandRunner for FakeSignInRunner {
+        fn run(
+            &mut self,
+            _program: &str,
+            _args: &[String],
+            _dir: &Path,
+            _env: &[(&str, &str)],
+            on_line: &mut dyn LineSink,
+        ) -> Result<(), InstallError> {
+            on_line.line("Open https://auth.example.com/device and enter code ABCD-EFGH");
+            Ok(())
+        }
+    }
+
+    fn make_app(store: Arc<Store>, profiles: Arc<ProfileSnapshots>) -> axum::Router {
+        let state = AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(FakeSignInRunner)),
+            auth: auth::Mode::Confined {
+                operator_digest: Some(auth::operator_digest(OP_TOKEN)),
+            },
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles,
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
+        };
+        build_router(state)
+    }
+
+    #[test]
+    fn openai_and_all_provider_5h_and_weekly_quota_parsing() {
+        // OpenAI/Codex payload with BOTH primary_window (5h) and secondary_window (7d).
+        let openai_val = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25.0,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 7200
+                },
+                "secondary_window": {
+                    "used_percent": 40.0,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 259200
+                }
+            }
+        });
+        let summary = crate::create::format_openai_usage_summary(&openai_val).unwrap();
+        assert!(summary.contains("5h: 75% left ↻2h"), "{summary}");
+        assert!(summary.contains("7d: 60% left ↻3d"), "{summary}");
+        assert!(summary.ends_with(" (pro)"), "{summary}");
+        let (q5, q7) = parse_quota_windows_from_usage(&summary);
+        assert_eq!(
+            q5,
+            Some(QuotaWindow {
+                remaining_pct: 75,
+                reset_eta: Some("2h".into())
+            })
+        );
+        assert_eq!(
+            q7,
+            Some(QuotaWindow {
+                remaining_pct: 60,
+                reset_eta: Some("3d".into())
+            })
+        );
+
+        // Claude/Anthropic & Google Antigravity summary strings also parse cleanly into both windows.
+        let (c5, c7) =
+            parse_quota_windows_from_usage("5h: 82% left ↻1h30m · 7d: 45% left ↻4d02h (max 20x)");
+        assert_eq!(c5.unwrap().remaining_pct, 82);
+        assert_eq!(c7.unwrap().remaining_pct, 45);
+
+        let (g5, g7) = parse_quota_windows_from_usage(
+            "5h: 95% left ↻45m · 7d: 70% left ↻5d · opus: 70% left (ultra)",
+        );
+        assert_eq!(g5.unwrap().remaining_pct, 95);
+        assert_eq!(g7.unwrap().remaining_pct, 70);
+    }
+
+    #[tokio::test]
+    async fn profiles_fresh_1_bypasses_cache_and_returns_5h_and_weekly_across_providers() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let seen_fresh_flags = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let flags_ref = Arc::clone(&seen_fresh_flags);
+
+        let snapshots = Arc::new(ProfileSnapshots::with_refresh_for_test(Arc::new(
+            move |_, _, fresh| {
+                flags_ref.lock().unwrap().push(fresh);
+                let pct5 = if fresh { 91 } else { 50 };
+                let pct7 = if fresh { 84 } else { 40 };
+                vec![
+                    ProviderProfileEntry {
+                        provider: "anthropic".into(),
+                        profile: "default".into(),
+                        account: Some("claude@example.com".into()),
+                        kind: "subscription".into(),
+                        compatible_harnesses: vec!["claude-code".into()],
+                        assigned_agents: vec![],
+                        subagent_count: 0,
+                        usage: Some(format!("5h: {pct5}% left ↻2h · 7d: {pct7}% left ↻3d (max)")),
+                        quota_5h: None,
+                        quota_weekly: None,
+                    },
+                    ProviderProfileEntry {
+                        provider: "openai".into(),
+                        profile: "default".into(),
+                        account: Some("codex@example.com".into()),
+                        kind: "subscription".into(),
+                        compatible_harnesses: vec!["codex".into()],
+                        assigned_agents: vec![],
+                        subagent_count: 0,
+                        usage: Some(format!("5h: {pct5}% left ↻1h · 7d: {pct7}% left ↻4d (pro)")),
+                        quota_5h: None,
+                        quota_weekly: None,
+                    },
+                    ProviderProfileEntry {
+                        provider: "google-antigravity".into(),
+                        profile: "default".into(),
+                        account: Some("agy@example.com".into()),
+                        kind: "subscription".into(),
+                        compatible_harnesses: vec!["agy".into()],
+                        assigned_agents: vec![],
+                        subagent_count: 0,
+                        usage: Some(format!(
+                            "5h: {pct5}% left · 7d: {pct7}% left · opus: {pct7}% left (ultra)"
+                        )),
+                        quota_5h: None,
+                        quota_weekly: None,
+                    },
+                ]
+            },
+        )));
+        let app = make_app(store, snapshots);
+
+        // Initial cached call (fresh=false)
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/profiles")
+                    .header(operator::HEADER, OP_TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let list1: Vec<Value> =
+            serde_json::from_slice(&r1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(list1.len(), 3);
+        assert_eq!(list1[0]["quota_5h"]["remaining_pct"], json!(50));
+        assert_eq!(list1[0]["quota_weekly"]["remaining_pct"], json!(40));
+
+        // Fresh call (`?fresh=1`) bypasses cache and returns updated 5h + Weekly across ALL providers!
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/profiles?fresh=1")
+                    .header(operator::HEADER, OP_TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let list2: Vec<Value> =
+            serde_json::from_slice(&r2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(list2.len(), 3);
+        for item in &list2 {
+            assert_eq!(item["quota_5h"]["remaining_pct"], json!(91), "{item}");
+            assert_eq!(item["quota_weekly"]["remaining_pct"], json!(84), "{item}");
+        }
+        assert_eq!(*seen_fresh_flags.lock().unwrap(), vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn profiles_native_signin_route_requires_operator_and_streams_ndjson() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("ops-signin-cap-key-0123456789abcdef")
+            .unwrap();
+        let ag = store
+            .create_agent(NewAgent::new("regular", "codex"))
+            .unwrap();
+        let cap = store.issue_capability(&ag.id).unwrap();
+        let app = make_app(store, Arc::new(ProfileSnapshots::default()));
+
+        // Agent caller is forbidden (403).
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/profiles/native-signin")
+                    .header("content-type", "application/json")
+                    .header(operator::AGENT_HEADER, &cap)
+                    .body(Body::from(r#"{"harness":"codex","profile":"acct-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // Operator caller succeeds and receives NDJSON stream with link/code + terminal line.
+        let ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/profiles/native-signin")
+                    .header("content-type", "application/json")
+                    .header(operator::HEADER, OP_TOKEN)
+                    .body(Body::from(r#"{"harness":"openai","profile":"acct-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-ndjson")
+        );
+        let bytes = ok.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("\"kind\""), "expected NDJSON stream: {body}");
+    }
+
+    #[tokio::test]
+    async fn usage_group_by_profile_rolls_up_agents_sharing_a_profile() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let a1 = store
+            .create_agent(NewAgent::new("alpha", "claude-code"))
+            .unwrap();
+        let a2 = store
+            .create_agent(NewAgent::new("beta", "claude-code"))
+            .unwrap();
+        let a3 = store.create_agent(NewAgent::new("gamma", "codex")).unwrap();
+
+        // Bind alpha and beta to anthropic/acct-1, gamma to openai/acct-2.
+        for (ag, prof) in [
+            (&a1, "anthropic/acct-1\n"),
+            (&a2, "anthropic/acct-1\n"),
+            (&a3, "openai/acct-2\n"),
+        ] {
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &ag.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join(".anyagents-profile"), prof).unwrap();
+        }
+
+        store
+            .record_usage(NewUsage {
+                agent_id: a1.id.clone(),
+                harness: "claude-code".into(),
+                model: Some("claude-sonnet-4-6".into()),
+                input_tokens: 1000,
+                output_tokens: 400,
+                cache_read_tokens: 50,
+                cache_write_tokens: 10,
+                reported_cost_micros: Some(100_000),
+                estimated_cost_micros: None,
+                billing_mode: BillingMode::Subscription,
+                quota_state: None,
+                day: "2026-11-20".into(),
+            })
+            .unwrap();
+        store
+            .record_usage(NewUsage {
+                agent_id: a2.id.clone(),
+                harness: "claude-code".into(),
+                model: Some("claude-sonnet-4-6".into()),
+                input_tokens: 2000,
+                output_tokens: 600,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reported_cost_micros: Some(250_000),
+                estimated_cost_micros: None,
+                billing_mode: BillingMode::Subscription,
+                quota_state: None,
+                day: "2026-11-20".into(),
+            })
+            .unwrap();
+        store
+            .record_usage(NewUsage {
+                agent_id: a3.id.clone(),
+                harness: "codex".into(),
+                model: Some("gpt-5".into()),
+                input_tokens: 500,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reported_cost_micros: Some(50_000),
+                estimated_cost_micros: None,
+                billing_mode: BillingMode::Subscription,
+                quota_state: None,
+                day: "2026-11-20".into(),
+            })
+            .unwrap();
+
+        let app = make_app(store, Arc::new(ProfileSnapshots::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/usage?group_by=profile")
+                    .header(operator::HEADER, OP_TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let report: UsageReport =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(report.group_by, UsageGroupBy::Profile);
+        assert_eq!(report.profiles.len(), 2);
+
+        let p_anth = &report.profiles[0];
+        assert_eq!(p_anth.profile, "anthropic/acct-1");
+        assert_eq!(p_anth.totals.turns, 2);
+        assert_eq!(p_anth.totals.input_tokens, 3000);
+        assert_eq!(p_anth.totals.output_tokens, 1000);
+        assert_eq!(p_anth.totals.reported_cost_micros, Some(350_000));
+        assert_eq!(p_anth.agent_names.len(), 2);
+
+        let p_oai = &report.profiles[1];
+        assert_eq!(p_oai.profile, "openai/acct-2");
+        assert_eq!(p_oai.totals.turns, 1);
+        assert_eq!(p_oai.totals.input_tokens, 500);
+        assert_eq!(p_oai.totals.reported_cost_micros, Some(50_000));
+    }
 }

@@ -738,7 +738,7 @@ fn pg_remote_turn_store_survives_replica_handoff_and_settles_idempotently() {
         .expect("open replica B");
 
     const {
-        assert!(anyagents_core::db::PG_LATEST_VERSION >= 7);
+        assert!(anyagents_core::db::PG_LATEST_VERSION >= 8);
     }
 
     let agent = store_a

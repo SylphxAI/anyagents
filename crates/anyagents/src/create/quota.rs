@@ -7,10 +7,10 @@ use anyagents_core::{Agent, agent_config_dir};
 use super::credentials::persist_refreshed_credentials;
 use super::profile_identity::read_first_non_empty_file;
 use super::{
-    ProviderProfileEntry, bound_profile_of_provider, extract_profile_account_identity,
-    probe_one_profile_usage, propagate_profile_files_to_bound_agents,
-    sync_fresher_bound_agent_credentials, update_profile_json_identity, upstream_provider_of,
-    write_seat_shared_file,
+    ProviderProfileEntry, QuotaWindow, bound_profile_of_provider, extract_profile_account_identity,
+    probe_one_profile_usage, probe_one_profile_usage_with_options,
+    propagate_profile_files_to_bound_agents, sync_fresher_bound_agent_credentials,
+    update_profile_json_identity, upstream_provider_of, write_seat_shared_file,
 };
 
 /// Unknown, malformed and out-of-range observations carry no quota authority.
@@ -191,11 +191,163 @@ pub(super) fn overlay_active_quota_reset_on_cached_usage(
 /// reading reports; such a reading has no capacity left until the limit lifts.
 pub(crate) const USAGE_LIMITED_PREFIX: &str = "limited";
 
+/// Parse structured `(quota_5h, quota_weekly)` windows from any provider's
+/// canonical usage summary string (e.g. `"5h: 72% left ↻2h15m · 7d: 45% left ↻3d04h (pro)"`).
+pub(crate) fn parse_quota_windows_from_usage(
+    usage: &str,
+) -> (Option<QuotaWindow>, Option<QuotaWindow>) {
+    let trimmed = usage.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    let body = if trimmed.ends_with(')')
+        && let Some(idx) = trimmed.rfind(" (")
+    {
+        &trimmed[..idx]
+    } else {
+        trimmed
+    };
+    let mut quota_5h = None;
+    let mut quota_weekly = None;
+    for part in body.split(" · ") {
+        let Some((label_raw, rest_raw)) = part.split_once(':') else {
+            continue;
+        };
+        let label = label_raw.trim().to_ascii_lowercase();
+        let rest = rest_raw.trim();
+        let Some((pct_raw, after_pct)) = rest.split_once("% left") else {
+            continue;
+        };
+        let Ok(pct) = pct_raw.trim().parse::<i64>() else {
+            continue;
+        };
+        let reset_eta = after_pct
+            .trim()
+            .strip_prefix('↻')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let window = QuotaWindow {
+            remaining_pct: pct.clamp(0, 100),
+            reset_eta,
+        };
+        match label.as_str() {
+            "5h" => quota_5h = Some(window),
+            "7d" | "weekly" => quota_weekly = Some(window),
+            _ => {}
+        }
+    }
+    (quota_5h, quota_weekly)
+}
+
+/// Format an OpenAI/Codex `/backend-api/wham/usage` payload into a unified
+/// `5h` + `7d` usage summary string, capturing BOTH `primary_window` and
+/// `secondary_window` when reported.
+pub(crate) fn format_openai_usage_summary(val: &serde_json::Value) -> Option<String> {
+    let parse_window = |ptr: &str| -> Option<(Option<i64>, i64, Option<String>)> {
+        let win = val.pointer(ptr)?;
+        let used = win
+            .get("used_percent")
+            .and_then(serde_json::Value::as_f64)?;
+        if !used.is_finite() {
+            return None;
+        }
+        let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
+        let window_secs = win
+            .get("limit_window_seconds")
+            .and_then(serde_json::Value::as_i64);
+        let eta = (rem < 100)
+            .then(|| {
+                win.get("reset_after_seconds")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(format_reset_eta_secs)
+            })
+            .flatten();
+        Some((window_secs, rem, eta))
+    };
+
+    let primary = parse_window("/rate_limit/primary_window");
+    let secondary = parse_window("/rate_limit/secondary_window");
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+
+    let mut win_5h: Option<(i64, Option<String>)> = None;
+    let mut win_7d: Option<(i64, Option<String>)> = None;
+
+    match (primary, secondary) {
+        (Some((p_secs, p_rem, p_eta)), Some((s_secs, s_rem, s_eta))) => {
+            for (secs, rem, eta, is_primary) in
+                [(p_secs, p_rem, p_eta, true), (s_secs, s_rem, s_eta, false)]
+            {
+                let is_short = secs.map_or(is_primary, |s| s <= 86_400);
+                if is_short {
+                    win_5h = Some((rem, eta));
+                } else {
+                    win_7d = Some((rem, eta));
+                }
+            }
+        }
+        (Some((p_secs, p_rem, p_eta)), None) => {
+            if p_secs.is_some_and(|s| s <= 86_400) {
+                win_5h = Some((p_rem, p_eta));
+            } else {
+                win_7d = Some((p_rem, p_eta));
+            }
+        }
+        (None, Some((s_secs, s_rem, s_eta))) => {
+            if s_secs.is_some_and(|s| s <= 86_400) {
+                win_5h = Some((s_rem, s_eta));
+            } else {
+                win_7d = Some((s_rem, s_eta));
+            }
+        }
+        (None, None) => return None,
+    }
+
+    let mut parts = Vec::new();
+    if let Some((rem, eta)) = win_5h {
+        let eta_str = eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
+        parts.push(format!("5h: {rem}% left{eta_str}"));
+    }
+    if let Some((rem, eta)) = win_7d {
+        let eta_str = eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
+        parts.push(format!("7d: {rem}% left{eta_str}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join(" · ");
+    match val.get("plan_type").and_then(serde_json::Value::as_str) {
+        Some(plan) if !plan.is_empty() => Some(format!("{joined} ({plan})")),
+        _ => Some(joined),
+    }
+}
+
 /// Syncs any fresher OAuth credentials from active seats back into
 /// `<data>/profiles/<provider>/<profile>` and probes native upstream usage,
-/// quota, or balance for each profile in parallel.
-pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileEntry]) {
-    if crate::sandbox::is_isolated_test_env() || entries.is_empty() {
+/// quota, or balance for each profile in parallel. When `bypass_cache` is
+/// `true` (`GET /v1/profiles?fresh=1`), stale on-disk usage caches are bypassed.
+pub(crate) fn enrich_profiles_usage_with_options(
+    data: &Path,
+    entries: &mut [ProviderProfileEntry],
+    bypass_cache: bool,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    if crate::sandbox::is_isolated_test_env() {
+        for entry in entries.iter_mut() {
+            if let Some(ref usage) = entry.usage {
+                let (q5, q7) = parse_quota_windows_from_usage(usage);
+                if entry.quota_5h.is_none() {
+                    entry.quota_5h = q5;
+                }
+                if entry.quota_weekly.is_none() {
+                    entry.quota_weekly = q7;
+                }
+            }
+        }
         return;
     }
     sync_fresher_bound_agent_credentials(data);
@@ -203,23 +355,41 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
-            if entry.usage.is_some() {
+            if entry.usage.is_some() && !bypass_cache {
                 continue;
             }
             let provider = entry.provider.clone();
             let profile = entry.profile.clone();
-            handles
-                .push(s.spawn(move || (idx, probe_one_profile_usage(data, &provider, &profile))));
+            handles.push(s.spawn(move || {
+                (
+                    idx,
+                    probe_one_profile_usage_with_options(data, &provider, &profile, bypass_cache),
+                )
+            }));
         }
         for handle in handles {
             if let Ok((idx, Some(usage))) = handle.join()
                 && let Some(entry) = entries.get_mut(idx)
             {
+                let (q5, q7) = parse_quota_windows_from_usage(&usage);
                 entry.usage = Some(usage);
+                entry.quota_5h = q5;
+                entry.quota_weekly = q7;
             }
         }
     });
     for entry in entries.iter_mut() {
+        if let Some(ref usage) = entry.usage
+            && (entry.quota_5h.is_none() || entry.quota_weekly.is_none())
+        {
+            let (q5, q7) = parse_quota_windows_from_usage(usage);
+            if entry.quota_5h.is_none() {
+                entry.quota_5h = q5;
+            }
+            if entry.quota_weekly.is_none() {
+                entry.quota_weekly = q7;
+            }
+        }
         if entry.account.is_none() {
             let prof_dir = data
                 .join("profiles")

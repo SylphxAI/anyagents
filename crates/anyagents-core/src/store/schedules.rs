@@ -19,7 +19,7 @@ pub(super) fn cancel_archived_schedules(
     id: &AgentId,
 ) -> Result<(), Error> {
     conn.db_execute(
-        "UPDATE agent_schedules SET state = 'cancelled', next_fire_at_ms = NULL
+        "UPDATE agent_schedules SET state = 'cancelled', next_fire_at_ms = NULL, external_timer_id = NULL
          WHERE agent_id = ?1 AND state = 'active'",
         &db_params![id.as_str()],
     )?;
@@ -250,40 +250,113 @@ impl Store {
         agent_id: Option<&AgentId>,
         id_or_all: &str,
     ) -> Result<usize, Error> {
+        Ok(self.cancel_schedules_returning(agent_id, id_or_all)?.len())
+    }
+
+    /// Cancel matching active schedules and return their pre-cancellation snapshots
+    /// (including `external_timer_id` and `next_fire_at_ms`) so callers can cancel
+    /// pending triggers on the active [`TimerBackend`].
+    pub fn cancel_schedules_returning(
+        &self,
+        agent_id: Option<&AgentId>,
+        id_or_all: &str,
+    ) -> Result<Vec<AgentSchedule>, Error> {
         let target = id_or_all.trim();
         self.write_tx(|tx| {
-            let count = if target.eq_ignore_ascii_case("all") || target == "*" {
+            let matched = if target.eq_ignore_ascii_case("all") || target == "*" {
+                match agent_id {
+                    Some(aid) => tx.db_query_vec(
+                        concat!(
+                            "SELECT ",
+                            schedule_cols!(),
+                            " FROM agent_schedules WHERE agent_id = ?1 AND state = 'active'"
+                        ),
+                        &db_params![aid.as_str()],
+                        schedule_from_row_db,
+                    )?,
+                    None => tx.db_query_vec(
+                        concat!(
+                            "SELECT ",
+                            schedule_cols!(),
+                            " FROM agent_schedules WHERE state = 'active'"
+                        ),
+                        &[],
+                        schedule_from_row_db,
+                    )?,
+                }
+            } else {
+                match agent_id {
+                    Some(aid) => tx.db_query_vec(
+                        concat!(
+                            "SELECT ",
+                            schedule_cols!(),
+                            " FROM agent_schedules WHERE id = ?1 AND agent_id = ?2 AND state = 'active'"
+                        ),
+                        &db_params![target, aid.as_str()],
+                        schedule_from_row_db,
+                    )?,
+                    None => tx.db_query_vec(
+                        concat!(
+                            "SELECT ",
+                            schedule_cols!(),
+                            " FROM agent_schedules WHERE id = ?1 AND state = 'active'"
+                        ),
+                        &db_params![target],
+                        schedule_from_row_db,
+                    )?,
+                }
+            };
+            if matched.is_empty() {
+                return Ok(matched);
+            }
+            if target.eq_ignore_ascii_case("all") || target == "*" {
                 match agent_id {
                     Some(aid) => tx.db_execute(
                         "UPDATE agent_schedules
-                         SET state = 'cancelled', next_fire_at_ms = NULL
+                         SET state = 'cancelled', next_fire_at_ms = NULL, external_timer_id = NULL
                          WHERE agent_id = ?1 AND state = 'active'",
                         &db_params![aid.as_str()],
                     )?,
                     None => tx.db_execute(
                         "UPDATE agent_schedules
-                         SET state = 'cancelled', next_fire_at_ms = NULL
+                         SET state = 'cancelled', next_fire_at_ms = NULL, external_timer_id = NULL
                          WHERE state = 'active'",
                         &[],
                     )?,
-                }
+                };
             } else {
                 match agent_id {
                     Some(aid) => tx.db_execute(
                         "UPDATE agent_schedules
-                         SET state = 'cancelled', next_fire_at_ms = NULL
+                         SET state = 'cancelled', next_fire_at_ms = NULL, external_timer_id = NULL
                          WHERE id = ?1 AND agent_id = ?2 AND state = 'active'",
                         &db_params![target, aid.as_str()],
                     )?,
                     None => tx.db_execute(
                         "UPDATE agent_schedules
-                         SET state = 'cancelled', next_fire_at_ms = NULL
+                         SET state = 'cancelled', next_fire_at_ms = NULL, external_timer_id = NULL
                          WHERE id = ?1 AND state = 'active'",
                         &db_params![target],
                     )?,
-                }
-            };
-            Ok(count)
+                };
+            }
+            Ok(matched)
+        })
+    }
+
+    /// Persist or clear the external timer/run identifier for a schedule.
+    pub fn set_schedule_external_timer_id(
+        &self,
+        id: &str,
+        external_timer_id: Option<&str>,
+    ) -> Result<(), Error> {
+        let cleaned = external_timer_id.map(str::trim).filter(|s| !s.is_empty());
+        self.write_tx(|tx| {
+            tx.db_execute(
+                "UPDATE agent_schedules SET external_timer_id = ?2 WHERE id = ?1",
+                &db_params![id.trim(), cleaned],
+            )?;
+            Ok(())
         })
     }
 
@@ -475,6 +548,7 @@ fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
         last_observed: row.get(9)?,
         state: row.get(10)?,
         created_at_ms: row.get(11)?,
+        external_timer_id: row.get(12)?,
     })
 }
 

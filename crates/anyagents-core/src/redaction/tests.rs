@@ -1266,17 +1266,21 @@ fn admin_operator_and_deep_ancestor_are_authorized() {
         .unwrap();
     let m = f.message("deep canary");
     f.redact(&request(m.id.as_str(), None)).unwrap();
-    f.store.set_agent_admin(&f.peer.id, true).unwrap();
     let out = f
         .store
         .record_outbound(&f.target.id, "group:fixture", None, "outbound canary")
         .unwrap();
-    f.store
-        .redact_conversation(
+    // Unrelated peer agent is denied; operator is authorized.
+    assert!(matches!(
+        f.store.redact_conversation(
             Actor::Agent(f.peer.id.clone()),
             &f.target.id,
             &request(&out, None),
-        )
+        ),
+        Err(Error::PermissionDenied(_))
+    ));
+    f.store
+        .redact_conversation(Actor::Operator, &f.target.id, &request(&out, None))
         .unwrap();
     let tool = f
         .store

@@ -19,7 +19,7 @@ use super::agents_roster::{
 };
 use super::messaging::{Actor, can_actor_message_agent};
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited,
     resolve_remote_sandbox_workdir, runs_off_host, spawn_store, via_http_mcp,
 };
 use super::{file_cache, in_flight, reap_queue, serverless, serverless_failure};
@@ -215,27 +215,40 @@ pub(super) async fn archive_agent_route(
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
         if found.parent_id.is_none() && !is_self {
-            require_admin_or_operator(
-                &state.store,
-                &principal,
-                "agents.archive_root",
-                &found.name,
-            )?;
+            require_operator_audited(&state.store, &principal, "agents.archive_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.archive", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.archive", &found.name)?;
         }
         let _lifecycle = state
             .store
             .lock_agent_lifecycle(&found.id)
             .map_err(ApiError::from_store)?;
+        let prev_schedules = state
+            .store
+            .list_schedules(Some(&found.id), true)
+            .unwrap_or_default();
+        let prev_turns = state
+            .store
+            .remote_turn_store()
+            .list_active_for_agent(&found.id)
+            .unwrap_or_default();
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        for sched in &prev_schedules {
+            crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+        }
+        super::serverless_maintenance::cancel_all_agent_system_timers(
+            &state.store,
+            state.timer_backend.as_ref(),
+            &found.id,
+            &prev_turns,
+        );
         finish_agent_archive_locked(&state, &agent, is_self)?;
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
@@ -258,6 +271,7 @@ pub(super) async fn verdict_route(
     Json(body): Json<VerdictRequest>,
 ) -> Result<Json<anyagents_core::Outcome>, ApiError> {
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let (outcome, rework_id) = spawn_store(move || {
         let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
             ApiError::new(
@@ -276,6 +290,11 @@ pub(super) async fn verdict_route(
             Principal::Operator => None,
             Principal::Agent { agent_id, .. } => Some(agent_id),
         };
+        let prev_schedules = s.list_schedules(Some(&target.id), true).unwrap_or_default();
+        let prev_turns = s
+            .remote_turn_store()
+            .list_active_for_agent(&target.id)
+            .unwrap_or_default();
         let prof = create::bound_profile_name(&cfg);
         let (outcome, changed) = s
             .apply_verdict(actor, &target.id, kind, body.reason, prof)
@@ -283,6 +302,15 @@ pub(super) async fn verdict_route(
         let mut rework_id = None;
         if let Some(agent) = changed {
             if agent.state == "archived" {
+                for sched in &prev_schedules {
+                    crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+                }
+                super::serverless_maintenance::cancel_all_agent_system_timers(
+                    &state.store,
+                    state.timer_backend.as_ref(),
+                    &target.id,
+                    &prev_turns,
+                );
                 finish_agent_archive_locked(&state, &agent, false)?;
             } else {
                 clear_explicitly_archived(s.data_dir(), &agent.id);
@@ -298,8 +326,12 @@ pub(super) async fn verdict_route(
         let call = in_flight::carry();
         tokio::spawn(async move {
             let _call = call;
-            if let Err(err) =
-                serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &id).await
+            if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                dispatch_store,
+                &id,
+                Some(dispatch_timer),
+            )
+            .await
             {
                 eprintln!("anyagents-serverless: verdict rework dispatch failed for `{id}`: {err}");
             }
@@ -817,13 +849,13 @@ pub(super) async fn pause_agent_route(
                     "a root agent cannot pause itself; pass a target agent name or id in `agent`",
                 ));
             }
-            require_admin_or_operator(&state.store, &principal, "agents.pause_root", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.pause_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.pause", &found.name)?;
         }
         // Serialized with this agent's harness, profile, wake and archive
         // transitions, as the command-line pause is.
@@ -890,18 +922,36 @@ pub(super) async fn delete_agent_route(
                     "a root agent cannot delete itself",
                 ));
             }
-            require_admin_or_operator(&state.store, &principal, "agents.delete_root", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.delete_root", &found.name)?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
                 if agent_id != &found.id && !is_self_or_ancestor(&state.store, agent_id, &found)
         ) {
-            require_admin_or_operator(&state.store, &principal, "agents.delete", &found.name)?;
+            require_operator_audited(&state.store, &principal, "agents.delete", &found.name)?;
         }
+        let prev_schedules = state
+            .store
+            .list_schedules(Some(&found.id), true)
+            .unwrap_or_default();
+        let prev_turns = state
+            .store
+            .remote_turn_store()
+            .list_active_for_agent(&found.id)
+            .unwrap_or_default();
         state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        for sched in &prev_schedules {
+            crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+        }
+        super::serverless_maintenance::cancel_all_agent_system_timers(
+            &state.store,
+            state.timer_backend.as_ref(),
+            &found.id,
+            &prev_turns,
+        );
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
         // Health is a projection: the supervisor may publish stopped before
         // its worker exits. Allow that normal shutdown to release actual
@@ -1009,6 +1059,7 @@ pub(super) async fn wake_agent_route(
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_guard = CancelWakeOnDrop(Arc::clone(&cancelled));
     let dispatch_store = Arc::clone(&state.store);
+    let dispatch_timer = Arc::clone(&state.timer_backend);
     let out: Result<(Json<AgentView>, anyagents_core::AgentId), ApiError> =
         spawn_store(move || {
             use std::sync::atomic::Ordering;
@@ -1031,12 +1082,7 @@ pub(super) async fn wake_agent_route(
                 if !is_self_or_ancestor(&state.store, caller_id, &found)
                     && can_actor_message_agent(&state.store, &actor, &found).is_err()
                 {
-                    require_admin_or_operator(
-                        &state.store,
-                        &principal,
-                        "agents.wake",
-                        &found.name,
-                    )?;
+                    require_operator_audited(&state.store, &principal, "agents.wake", &found.name)?;
                 }
             }
             let _lifecycle = state
@@ -1193,9 +1239,12 @@ pub(super) async fn wake_agent_route(
         let call = in_flight::carry();
         tokio::spawn(async move {
             let _call = call;
-            if let Err(err) =
-                serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &agent_id)
-                    .await
+            if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                dispatch_store,
+                &agent_id,
+                Some(dispatch_timer),
+            )
+            .await
             {
                 eprintln!(
                     "anyagents-serverless: wake dispatch failed for `{}`: {err}",

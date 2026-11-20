@@ -463,6 +463,11 @@ async fn serve(
     if !serverless && auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
+    let timer_backend = crate::timer::build_timer_backend(
+        Arc::clone(&store),
+        health.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let state = AppState {
         store: Arc::clone(&store),
         health,
@@ -470,7 +475,20 @@ async fn serve(
         auth,
         identity,
         profiles: Default::default(),
+        timer_backend,
     };
+    if serverless || crate::server::timer_fire::configured_timer_scheduler_url().is_some() {
+        let rec_store = Arc::clone(&store);
+        let rec_timer = Arc::clone(&state.timer_backend);
+        tokio::spawn(async move {
+            if let Err(err) =
+                super::serverless_maintenance::startup_reconcile_serverless(rec_store, rec_timer)
+                    .await
+            {
+                eprintln!("anyagents-serverless: startup reconciliation warning: {err}");
+            }
+        });
+    }
     let _ = boundary;
     let listener = api_listener;
     let poller = if serverless {
@@ -660,7 +678,7 @@ async fn serve(
                 }
             });
         }
-        crate::schedule::start_loops(
+        crate::schedule::start_watch_loops(
             Arc::clone(&store),
             state.health.clone(),
             stopping.subscribe(),

@@ -15,7 +15,7 @@ use crate::auth::Principal;
 use super::messaging::{Actor, can_actor_message_agent};
 use super::serverless;
 use super::types::{
-    ApiError, AppState, is_self_or_ancestor, require_admin_or_operator, spawn_store,
+    ApiError, AppState, is_self_or_ancestor, require_operator_audited, spawn_store,
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -86,12 +86,16 @@ async fn telegram_webhook(
     if serverless::is_serverless_mode() {
         for agent_id in target_agents {
             let store_disp = Arc::clone(&state.store);
+            let timer_disp = Arc::clone(&state.timer_backend);
             let call = super::in_flight::carry();
             tokio::spawn(async move {
                 let _call = call;
-                if let Err(err) =
-                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &agent_id)
-                        .await
+                if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                    store_disp,
+                    &agent_id,
+                    Some(timer_disp),
+                )
+                .await
                 {
                     eprintln!(
                         "anyagents-serverless: telegram webhook dispatch failed for {agent_id}: {err}"
@@ -108,7 +112,7 @@ pub(super) async fn channels_route(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        require_operator_audited(&state.store, &principal, "channels.list", "channels")?;
         let channels: Vec<_> = state
             .store
             .list_channels()
@@ -220,7 +224,7 @@ async fn add_channel_route(
             Principal::Operator => true,
         };
         if !authorized_by_lineage {
-            require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
+            require_operator_audited(&state.store, &principal, "channels.add", &body.agent)?;
         }
         let result = crate::telegram::request_or_bind_telegram_channel(
             &state.store,

@@ -28,8 +28,6 @@ impl From<Error> for UsageError {
 
 pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
     match action {
-        AgentsCommand::GrantAdmin { agent } => set_admin(data, &agent, true)?,
-        AgentsCommand::RevokeAdmin { agent } => set_admin(data, &agent, false)?,
         AgentsCommand::RevokeRemote { agent, session } => {
             revoke_remote_cmd(data, &agent, session.as_deref())?
         }
@@ -1139,48 +1137,6 @@ fn revoke_remote_cmd(data: &Path, agent: &str, session: Option<&str>) -> Result<
     Ok(())
 }
 
-fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
-    let body = serde_json::json!({"admin": admin});
-    match client::call::<serde_json::Value>(
-        data,
-        "POST",
-        &format!("/v1/agents/{agent}/admin"),
-        Some(body.to_string().into_bytes()),
-        &client::authority(data),
-    ) {
-        Ok(result) => {
-            let result =
-                result.ok_or_else(|| Error::Message("the server answered nothing".into()))?;
-            if crate::ui::is_pretty() {
-                presentation::admin(&result, agent, admin);
-            } else {
-                println!("{}", result);
-            }
-            return Ok(());
-        }
-        Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
-        Err(err) => return Err(Error::Message(err)),
-    }
-    let store = open(data)?;
-    let rec = store.agent_by_name(agent)?;
-    store.record_admin_audit(
-        "operator",
-        if admin {
-            "agents.grant_admin"
-        } else {
-            "agents.revoke_admin"
-        },
-        &rec.name,
-    )?;
-    store.set_agent_admin(&rec.id, admin)?;
-    if crate::ui::is_pretty() {
-        presentation::admin(&serde_json::json!({"agent": rec.name}), agent, admin);
-    } else {
-        println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
-    }
-    Ok(())
-}
-
 fn apply_parent_filter_for_views(
     agents: &mut Vec<AgentView>,
     parent_filter: Option<&str>,
@@ -1808,21 +1764,17 @@ pub fn usage(data: &Path, params: &UsageParams) -> Result<(), UsageError> {
         .as_deref()
         .map(str::trim)
         .filter(|g| !g.is_empty());
-    let by_day = match group_by {
-        None | Some("agent") => false,
-        Some("day") => true,
-        Some(other) => {
-            return Err(UsageError::Refused(format!(
-                "unknown usage grouping: {other}"
-            )));
-        }
+    let parsed_group_by = match group_by {
+        None => anyagents_core::UsageGroupBy::Agent,
+        Some(raw) => anyagents_core::UsageGroupBy::parse(raw).map_err(UsageError::Refused)?,
     };
+    let by_day = matches!(parsed_group_by, anyagents_core::UsageGroupBy::Day);
 
     // 1) Socket-first: the daemon resolves the caller from its credential
     // and enforces the causal authorization boundary server-side.
     match crate::client::get::<UsageReport>(data, &usage_path("/v1/usage", params)) {
         Ok(Some(report)) => {
-            print_report(&report);
+            crate::control_cli::print_usage_report(&report);
             return Ok(());
         }
         Ok(None) => {} // daemon unavailable: fall through to the read-only open
@@ -1942,7 +1894,7 @@ fn usage_path(route: &str, params: &UsageParams) -> String {
 }
 
 /// Render a socket `UsageReport` in the historical table/TSV shape.
-fn print_report(report: &anyagents_core::UsageReport) {
+pub(crate) fn print_report(report: &anyagents_core::UsageReport) {
     let grouped = !matches!(report.group_by, anyagents_core::UsageGroupBy::Agent);
     if crate::ui::is_pretty() {
         if report.buckets.is_empty() {

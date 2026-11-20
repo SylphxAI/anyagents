@@ -19,7 +19,7 @@ use anyagents_channel_telegram::{
     replace_managed_bot_token, send_checklist, send_location, send_media_ref, send_message,
     send_poll, sent_message_id, set_message_reaction, stop_poll, unpin_chat_message,
 };
-use anyagents_core::{Channel, CredentialStore, FileCredentialStore, Store};
+use anyagents_core::{Channel, CredentialStore, Store, StoreCredentialStore};
 
 /// Something the Telegram poller acts on may have changed: a binding written
 /// here, a local receipt left pending, a bound agent's lifecycle (the poller
@@ -137,7 +137,7 @@ fn api_base() -> String {
 /// never delays another bot's update.
 pub fn poll_channel_once(
     store: &Store,
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     channel: &Channel,
     timeout_s: u64,
 ) -> Result<(), anyagents_core::Error> {
@@ -182,7 +182,7 @@ fn verify_webhook_secret(expected: &str, provided: Option<&str>) -> bool {
 /// `X-Telegram-Bot-Api-Secret-Token`.
 pub fn ensure_webhook(
     store: &Store,
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     channel: &Channel,
     webhook_base: &str,
 ) -> Result<(), anyagents_core::Error> {
@@ -364,7 +364,7 @@ fn resolve_chat_title_and_type(
 /// Runs in both webhook mode and long-polling mode.
 pub fn reconcile_channel_groups(
     store: &Store,
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     channel: &Channel,
     cancelled: &dyn Fn() -> bool,
 ) {
@@ -619,9 +619,21 @@ fn commit_group_discovery(
     }
 }
 
+fn delete_webhook_with_token(
+    token: &str,
+    channel_id: &anyagents_core::ChannelId,
+) -> Result<(), anyagents_core::Error> {
+    let call = BotCall {
+        method: "deleteWebhook".to_string(),
+        body: serde_json::json!({ "drop_pending_updates": false }),
+    };
+    call_api(token, &call, SHORT_TIMEOUT_S, Some(channel_id))?;
+    Ok(())
+}
+
 /// Remove a Telegram webhook so long polling can resume cleanly.
 pub fn delete_webhook(
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     channel: &Channel,
 ) -> Result<(), anyagents_core::Error> {
     if channel.kind != "telegram" {
@@ -631,12 +643,7 @@ pub fn delete_webhook(
         return Ok(());
     };
     let token = token_of(secrets, credential_ref)?;
-    let call = BotCall {
-        method: "deleteWebhook".to_string(),
-        body: serde_json::json!({ "drop_pending_updates": false }),
-    };
-    call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
-    Ok(())
+    delete_webhook_with_token(&token, &channel.id)
 }
 
 fn is_agent_explicitly_archived(data_dir: &std::path::Path, agent: &anyagents_core::Agent) -> bool {
@@ -687,12 +694,15 @@ pub(crate) fn detach_archived_agent_from_telegram_groups(
         {
             eprintln!("Telegram archive membership write failed: {err}");
         }
-        if drop_live_webhook && is_live && owns_channel {
-            let dir = data_dir.to_path_buf();
-            let ch = channel.clone();
+        if drop_live_webhook
+            && is_live
+            && owns_channel
+            && let Some(cred) = channel.credential_ref.as_deref()
+            && let Ok(token) = store_token(store, data_dir, cred)
+        {
+            let id = channel.id.clone();
             std::thread::spawn(move || {
-                let secrets = FileCredentialStore::new(&dir);
-                let _ = delete_webhook(&secrets, &ch);
+                let _ = delete_webhook_with_token(&token, &id);
             });
         }
     }
@@ -723,9 +733,8 @@ pub fn receive_webhook(
             "channel {channel_id} has no attached agent"
         )));
     };
-    let secrets = FileCredentialStore::new(data_dir);
-    let token =
-        token_of(&secrets, credential_ref).map_err(|err| WebhookError::Store(err.to_string()))?;
+    let token = store_token(store, data_dir, credential_ref)
+        .map_err(|err| WebhookError::Store(err.to_string()))?;
     let expected = webhook_secret(&token, channel.id.as_str());
     if !verify_webhook_secret(&expected, secret_header) {
         return Err(WebhookError::Unauthorized);
@@ -755,7 +764,7 @@ pub fn receive_webhook(
 
 fn poll_channel(
     store: &Store,
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     channel: &Channel,
     timeout_s: u64,
 ) -> Result<(), anyagents_core::Error> {
@@ -1103,7 +1112,7 @@ fn known_bot_identities(
     if let Some(bot) = current_bot {
         push_bot(&mut out, bot);
     }
-    let secrets = FileCredentialStore::new(store.data_dir());
+    let secrets = StoreCredentialStore::new(store);
     {
         for ch in store.list_channels()? {
             if ch.kind == "telegram" {
@@ -1363,7 +1372,7 @@ fn discover_peer_bots_in_chat(
             other
                 .credential_ref
                 .as_deref()
-                .and_then(|cred| token_of(&FileCredentialStore::new(store.data_dir()), cred).ok())
+                .and_then(|cred| token_of(&StoreCredentialStore::new(store), cred).ok())
         } else {
             None
         };
@@ -1854,7 +1863,7 @@ pub fn bind_agent_telegram_token(
             "Telegram token has no validated bot identity".into(),
         ));
     }
-    let secrets = FileCredentialStore::new(data_dir);
+    let secrets = StoreCredentialStore::with_data_dir(store, data_dir);
     let existing_channels = store.list_channels()?;
     for ch in &existing_channels {
         if ch.kind == "telegram" {
@@ -2118,7 +2127,7 @@ fn handle_managed_bot_event(
     };
     let mut mem = Memory::try_from_state(&ch.state)?;
     let cred_ref = format!("channel-bindings/{}/managed-{}", ch.id, event.update_id);
-    let secrets = FileCredentialStore::new(store.data_dir());
+    let secrets = StoreCredentialStore::new(store);
     secrets.write(&cred_ref, new_bot_token.as_bytes())?;
     store.set_credential_ref(&ch.id, &cred_ref)?;
     mem.bot = Some(format!("{}:{}", event.bot_id, clean_uname));
@@ -2164,7 +2173,7 @@ pub fn request_or_bind_telegram_channel(
         return bind_agent_telegram_token(store, data_dir, target_agent, tok, None);
     }
 
-    let secrets = FileCredentialStore::new(data_dir);
+    let secrets = StoreCredentialStore::with_data_dir(store, data_dir);
     let all_channels = store.list_channels()?;
 
     // If `bot_id` is supplied, first check if we already hold its token on disk;
@@ -2466,7 +2475,7 @@ pub fn sync_agent_telegram_bot_name(
     let Some(credential_ref) = channel.credential_ref.as_deref() else {
         return;
     };
-    let Ok(token) = token_of(&FileCredentialStore::new(data_dir), credential_ref) else {
+    let Ok(token) = store_token(store, data_dir, credential_ref) else {
         return;
     };
     let raw_name = format_telegram_bot_display_name(&agent.name);
@@ -2562,10 +2571,7 @@ pub fn post_text(
     for (idx, chunk) in chunks.iter().enumerate() {
         let chunk_reply = if idx == 0 { reply_to } else { None };
         let outbound = outbound_call(store, from, bot, chat_id, chunk, chunk_reply, thread)?;
-        let token = token_of(
-            &FileCredentialStore::new(data_dir),
-            &outbound.credential_ref,
-        )?;
+        let token = store_token(store, data_dir, &outbound.credential_ref)?;
         // A refusal of a later chunk is no refusal of the post: the earlier
         // chunks are already in the chat.
         let response = call_api(
@@ -2649,12 +2655,7 @@ pub fn post_location(
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = send_location(
         chat_id, latitude, longitude, title, address, reply_to, thread,
     );
@@ -2714,12 +2715,7 @@ pub fn post_poll(
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = send_poll(
         chat_id,
         question,
@@ -2829,12 +2825,7 @@ pub fn post_media(
         ));
     }
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let response = if let Some(upload) = upload {
         match call_api_multipart(
             &token,
@@ -2935,12 +2926,7 @@ pub fn post_checklist(
         .filter(|s| !s.is_empty())
     {
         let channel = channel_for(store, from, bot)?;
-        let Some(credential_ref) = channel.credential_ref else {
-            return Err(anyagents_core::Error::Message(
-                "telegram channel has no credential".into(),
-            ));
-        };
-        let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+        let token = channel_token(store, data_dir, &channel)?;
         let call = send_checklist(chat_id, bc_id, title, tasks, reply_to, thread);
         if let Ok(resp) = call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))
             && let Ok(message_id) = sent_message_id(&resp)
@@ -3122,12 +3108,7 @@ pub fn react_message(
         thread,
     } = target;
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = set_message_reaction(chat_id, message_id, emoji, None);
     call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
     if let Some(e) = emoji.map(str::trim).filter(|s| !s.is_empty()) {
@@ -3178,12 +3159,7 @@ pub fn edit_message(
     let translated = translate_agent_mentions_for_telegram(store, text);
     let text = translated.as_str();
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = edit_message_text(chat_id, message_id, text);
     if let Err(err) = call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id)) {
         if err.to_string().contains("\"class\":\"invalid_entities\"") {
@@ -3238,12 +3214,7 @@ pub fn delete_chat_message(
     message_id: i64,
 ) -> Result<(), anyagents_core::Error> {
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = delete_message(chat_id, message_id);
     call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
     if chat_is_room(store, chat_id)? {
@@ -3281,12 +3252,7 @@ pub fn pin_message(
     pin: bool,
 ) -> Result<(), anyagents_core::Error> {
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = if pin {
         pin_chat_message(chat_id, message_id, Some(true))
     } else {
@@ -3306,12 +3272,7 @@ pub fn close_poll(
     message_id: i64,
 ) -> Result<(), anyagents_core::Error> {
     let channel = channel_for(store, from, bot)?;
-    let Some(credential_ref) = channel.credential_ref else {
-        return Err(anyagents_core::Error::Message(
-            "telegram channel has no credential".into(),
-        ));
-    };
-    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let token = channel_token(store, data_dir, &channel)?;
     let call = stop_poll(chat_id, message_id);
     call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
     Ok(())
@@ -3962,7 +3923,7 @@ fn channel_for(
 }
 
 fn token_of(
-    secrets: &FileCredentialStore,
+    secrets: &dyn CredentialStore,
     credential_ref: &str,
 ) -> Result<String, anyagents_core::Error> {
     let secret = secrets.read(credential_ref)?;
@@ -3970,6 +3931,28 @@ fn token_of(
         .as_str()
         .map(|s| s.trim().to_string())
         .map_err(|_| anyagents_core::Error::Message("telegram token is not text".into()))
+}
+
+fn store_token(
+    store: &Store,
+    data_dir: &std::path::Path,
+    credential_ref: &str,
+) -> Result<String, anyagents_core::Error> {
+    token_of(
+        &StoreCredentialStore::with_data_dir(store, data_dir),
+        credential_ref,
+    )
+}
+
+fn channel_token(
+    store: &Store,
+    data_dir: &std::path::Path,
+    channel: &Channel,
+) -> Result<String, anyagents_core::Error> {
+    let credential_ref = channel.credential_ref.as_deref().ok_or_else(|| {
+        anyagents_core::Error::Message("telegram channel has no credential".into())
+    })?;
+    store_token(store, data_dir, credential_ref)
 }
 
 /// The update list from a `getUpdates` response. Anything else is refused.
@@ -4376,6 +4359,7 @@ fn call_api(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use anyagents_core::FileCredentialStore;
 
     // The integration harness includes this module, so its transport fixtures
     // must share this lock with these tests rather than defining another one.
@@ -5584,6 +5568,38 @@ pub(crate) mod tests {
             !Memory::try_from_state(&unchanged.state)
                 .unwrap()
                 .is_room(-10088)
+        );
+    }
+
+    #[test]
+    fn bind_and_read_channel_token_through_store_credential_store() {
+        let _env = env_lock();
+        let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("creds-bot", "codex"))
+            .unwrap();
+        let bound = bind_agent_telegram_token(
+            &store,
+            dir.path(),
+            &agent,
+            "123456:store-backed-token",
+            Some((123456, "creds_test_bot")),
+        )
+        .unwrap();
+        assert_eq!(bound["status"], "bound");
+
+        let channel = channel_for(&store, &agent.name, None).unwrap();
+        let cred_ref = channel.credential_ref.as_deref().unwrap();
+        let secrets = StoreCredentialStore::new(&store);
+        assert_eq!(
+            token_of(&secrets, cred_ref).unwrap(),
+            "123456:store-backed-token"
+        );
+        assert_eq!(
+            channel_token(&store, dir.path(), &channel).unwrap(),
+            "123456:store-backed-token"
         );
     }
 }
