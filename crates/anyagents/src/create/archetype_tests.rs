@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-
-use anyagents_core::{NewAgent, Store, agent_config_dir};
+use anyagents_core::{NewAgent, agent_config_dir};
 
 #[cfg(unix)]
 use super::archetypes::open_archetype_nofollow;

@@ -1,6 +1,4 @@
-use std::path::{Path, PathBuf};
-
-use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
+use anyagents_core::{NewAgent, agent_config_dir, agent_work_dir};
 
 #[cfg(unix)]
 use super::archetypes::read_archetype_file;
@@ -19,10 +17,7 @@ use super::quota::{
 #[cfg(unix)]
 use super::signin::signin_staging_owner_exited;
 use super::signin::validate_staged_credentials;
-use super::spawn::{
-    create_with_consumer, create_with_seat_and_sandbox_mode, is_git_repo_dir,
-    provision_cloud_sandbox_worktree_marker,
-};
+use super::spawn::{create_with_consumer, create_with_seat_and_sandbox_mode};
 use super::*;
 
 #[test]

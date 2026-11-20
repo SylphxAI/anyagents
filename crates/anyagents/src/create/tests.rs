@@ -1,8 +1,6 @@
-use std::path::{Path, PathBuf};
-
 #[cfg(unix)]
 use anyagents_core::AgentId;
-use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
+use anyagents_core::{NewAgent, agent_config_dir, agent_work_dir};
 
 use super::profile_rotation::{count_bound_profile_agents, rebalance_provider_profiles};
 use super::profiles::{
