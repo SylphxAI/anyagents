@@ -316,15 +316,14 @@ struct ProfileModelsQuery {
 }
 
 async fn profile_models_route(
-    principal: Principal,
+    _principal: Principal,
     State(state): State<AppState>,
     Query(query): Query<ProfileModelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
         let target = query.profile.as_deref().or(query.filter.as_deref());
-        Ok(Json(create::probe_profile_models_catalog(
-            state.store.data_dir(),
+        Ok(Json(super::profile_models::catalog_for_store(
+            &state.store,
             target,
         )))
     })

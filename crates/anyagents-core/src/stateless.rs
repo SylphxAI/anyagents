@@ -11,6 +11,7 @@ pub mod gateway_routes;
 pub mod locks;
 pub mod obligations;
 pub mod remote_turns;
+pub mod remote_turns_ext;
 pub mod sandbox_bindings;
 pub mod wakes;
 
@@ -37,6 +38,7 @@ pub use remote_turns::{
     is_terminal_remote_turn_status, sanitize_pg_json, sanitize_pg_text, verify_callback_token_hash,
     verify_hmac_sha256_signature,
 };
+pub use remote_turns_ext::{ACTIVE_REMOTE_TURN_FRESHNESS_MS, MAX_INBOX_SEQ_META_KEY};
 pub use sandbox_bindings::{
     DEFAULT_REMOTE_SANDBOX_WORKDIR, FsSandboxBindingStore, PgSandboxBindingStore, SandboxBinding,
     SandboxBindingStore,

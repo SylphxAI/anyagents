@@ -21,6 +21,8 @@ pub struct AgentQueryMetadata {
     pub aliases: HashMap<String, Vec<String>>,
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,
+    /// Active non-terminal serverless remote turns (`agent_id -> earliest created_at_ms`).
+    pub active_remote_turns: HashMap<String, i64>,
     pub schedules: HashMap<String, Vec<AgentSchedule>>,
     /// Agents with a run of errored turns in progress, or parked for one.
     pub turn_errors: HashMap<String, TurnErrors>,
