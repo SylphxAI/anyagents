@@ -159,14 +159,20 @@ impl Mode {
             return decided;
         }
         if let Some(token) = presented.agent_token.as_deref() {
+            if token.starts_with(anyagents_core::REMOTE_SESSION_TOKEN_PREFIX) {
+                if !presented.allows_remote_session {
+                    return Err(AuthError::Unauthenticated(
+                        "the session is not authenticated".into(),
+                    ));
+                }
+                return agent_for_capability(store, token);
+            }
             // A machine without the boundary knows no capabilities: its route
             // is the agent the tool server reads from its own config directory,
             // which the server resolves to an existing agent and nothing else.
-            // Remote session tokens are always verified against the store.
             if self.is_trusted()
                 && !crate::server::serverless::is_serverless_mode()
                 && !crate::server::admin_auth::is_oidc_configured()
-                && !token.starts_with(anyagents_core::REMOTE_SESSION_TOKEN_PREFIX)
                 && let Some(id) = presented.agent_id.as_deref()
             {
                 return agent_named(store, id);
@@ -176,6 +182,11 @@ impl Mode {
         if let Some(bearer) = presented.bearer_token.as_deref()
             && anyagents_core::is_remote_session_token(bearer)
         {
+            if !presented.allows_remote_session {
+                return Err(AuthError::Unauthenticated(
+                    "the session is not authenticated".into(),
+                ));
+            }
             return agent_for_capability(store, bearer);
         }
         match self {
@@ -262,8 +273,40 @@ pub struct Presented {
     bearer_token: Option<String>,
     admin_csrf: bool,
     is_state_changing: bool,
+    allows_remote_session: bool,
     agent_id: Option<String>,
     route_agent: Option<String>,
+}
+
+/// Whether a request method and path are explicitly admitted for remote session
+/// tokens (`aars_*`): sandbox browser-profile sync and media retrieval only.
+/// Every other internal coordinator API route refuses remote session tokens
+/// fail-closed.
+fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
+    if path.contains("..") || path.contains('\\') {
+        return false;
+    }
+    let is_profile_archive = path
+        .strip_prefix("/v1/browser-profiles/")
+        .and_then(|rest| rest.strip_suffix("/archive"))
+        .is_some_and(|seg| !seg.is_empty() && !seg.contains('/'));
+    match *method {
+        axum::http::Method::GET => {
+            path == "/v1/browser-profiles"
+                || is_profile_archive
+                || path.strip_prefix("/v1/media/").is_some_and(|rest| {
+                    let mut parts = rest.split('/');
+                    let first = parts.next().is_some_and(|s| !s.is_empty());
+                    let second = match parts.next() {
+                        None => true,
+                        Some(s) => !s.is_empty(),
+                    };
+                    first && second && parts.next().is_none()
+                })
+        }
+        axum::http::Method::PUT => is_profile_archive,
+        _ => false,
+    }
 }
 
 fn bearer_header(parts: &Parts) -> Option<String> {
@@ -322,6 +365,7 @@ impl Presented {
                     | axum::http::Method::PATCH
                     | axum::http::Method::DELETE
             ),
+            allows_remote_session: allows_remote_session_path(&parts.method, parts.uri.path()),
             agent_id: header(parts, AGENT_ID_HEADER),
             route_agent: parts
                 .extensions
@@ -1017,7 +1061,34 @@ mod tests {
             assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
         }
 
-        // 8. Even in Mode::Trusted, a remote session token ignores spoofed `x-anyagents-agent-id`.
+        // 8. Internal API routes (outside browser-profiles and media) refuse remote session tokens (401).
+        for (method, uri) in [
+            ("GET", "/"),
+            ("GET", "/v1/agents"),
+            ("POST", "/v1/send"),
+            ("GET", "/v1/secrets"),
+            ("DELETE", "/v1/browser-profiles/team-site"),
+            ("PUT", "/v1/agents/sandbox-agent/browser-profiles"),
+            ("GET", "/v1/browser-profiles/../secrets"),
+        ] {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(operator::AGENT_HEADER, &tok)
+                .body(())
+                .unwrap()
+                .into_parts();
+            let err = Principal::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.0.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+
+        // 9. Even in Mode::Trusted, a remote session token ignores spoofed `x-anyagents-agent-id`.
         let trusted = Mode::Trusted {
             data_dir: dir.path().to_path_buf(),
         };
@@ -1034,7 +1105,7 @@ mod tests {
             expected
         );
 
-        // 9. Revoking the remote session immediately invalidates it (401).
+        // 10. Revoking the remote session immediately invalidates it (401).
         store.revoke_remote_sessions(&off_host.id, None).unwrap();
         let (mut parts, ()) = axum::http::Request::builder()
             .method("GET")

@@ -1717,23 +1717,32 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 5. Cross-agent unauthorized profile/media access and operator-only delete fail closed with 403.
-        for (method, uri, tok) in [
+        // 5. Cross-agent unauthorized profile/media access fails closed with 403,
+        //    and operator-only delete is refused fail-closed at auth (401).
+        for (method, uri, tok, expected_status) in [
             (
                 "GET",
                 "/v1/browser-profiles/team-site/archive",
                 sess_b.token.as_str(),
+                StatusCode::FORBIDDEN,
             ),
             (
                 "PUT",
                 "/v1/browser-profiles/team-site/archive",
                 sess_b.token.as_str(),
+                StatusCode::FORBIDDEN,
             ),
-            ("GET", media_uri.as_str(), sess_b.token.as_str()),
+            (
+                "GET",
+                media_uri.as_str(),
+                sess_b.token.as_str(),
+                StatusCode::FORBIDDEN,
+            ),
             (
                 "DELETE",
                 "/v1/browser-profiles/team-site",
                 sess_a.token.as_str(),
+                StatusCode::UNAUTHORIZED,
             ),
         ] {
             let body = if method == "PUT" {
@@ -1748,7 +1757,7 @@ mod tests {
                 .body(body)
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(resp.status(), expected_status, "{method} {uri}");
         }
 
         // 6. Distinct dual-authority (`x-anyagents-agent: A` + `Authorization: Bearer B`) fails closed with 401.
