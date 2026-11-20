@@ -160,20 +160,52 @@ pub(crate) fn persist_spawned_agent_config_to_store(
             let _ = blobs.put_agent_file(agent_id, "config", rel, &bytes, false);
         }
     }
-    let secret_rels = [
+    let secret_rels = collect_spawned_secret_rels(config_dir);
+    for rel in secret_rels {
+        let path = config_dir.join(&rel);
+        if let Ok(bytes) = std::fs::read(&path)
+            && !bytes.is_empty()
+        {
+            let _ = blobs.put_agent_file(agent_id, "secrets", &rel, &bytes, true);
+        }
+    }
+}
+
+/// Collect relative secret file paths to persist into PostgreSQL `agent_files(namespace = 'secrets')`
+/// when a new agent is spawned, including any `{file:~/...}` key files referenced by `opencode.json`.
+fn collect_spawned_secret_rels(config_dir: &Path) -> Vec<String> {
+    let mut rels: Vec<String> = [
         ".gemini/antigravity-cli/antigravity-oauth-token",
         ".claude/.credentials.json",
         ".credentials.json",
         ".codex/auth.json",
-    ];
-    for rel in secret_rels {
-        let path = config_dir.join(rel);
-        if let Ok(bytes) = std::fs::read(&path)
-            && !bytes.is_empty()
-        {
-            let _ = blobs.put_agent_file(agent_id, "secrets", rel, &bytes, true);
+        "auth.json",
+        "credentials.json",
+        ".spiron/auth.json",
+        ".config/sylphx/auth.json",
+        ".config/sylphx/credentials.json",
+        ".config/sylphx/key",
+        ".config/opencode/sylphx.key",
+        "data-home/opencode/auth.json",
+        ".local/share/opencode/auth.json",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for candidate in [
+        ".config/opencode/opencode.json",
+        "opencode/opencode.json",
+        "opencode.json",
+    ] {
+        if let Ok(text) = std::fs::read_to_string(config_dir.join(candidate)) {
+            for r in super::workspace::extract_file_tilde_refs(&text) {
+                if !rels.contains(&r) {
+                    rels.push(r);
+                }
+            }
         }
     }
+    rels
 }
 
 #[cfg(test)]
@@ -239,5 +271,21 @@ mod tests {
         let resolved =
             resolve_default_model_for_harness(data, "opencode", Some("openai/default"), None);
         assert_eq!(resolved.as_deref(), Some("openai/gpt-5.4"));
+    }
+
+    #[test]
+    fn collect_spawned_secret_rels_includes_opencode_file_tilde_key_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
+        std::fs::write(
+            cfg.join(".config/opencode/opencode.json"),
+            r#"{"provider":{"custom":{"options":{"apiKey":"{file:~/.config/custom/provider.key}"}}}}"#,
+        )
+        .unwrap();
+        let rels = collect_spawned_secret_rels(cfg);
+        assert!(rels.iter().any(|r| r == ".config/custom/provider.key"));
+        assert!(rels.iter().any(|r| r == ".config/opencode/sylphx.key"));
+        assert!(rels.iter().any(|r| r == ".spiron/auth.json"));
     }
 }
