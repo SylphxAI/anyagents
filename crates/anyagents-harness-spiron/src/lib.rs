@@ -14,6 +14,7 @@ pub mod cloud;
 mod cloud_api;
 #[cfg(test)]
 mod cloud_tests;
+mod startup_stderr;
 mod stdio;
 
 pub use cloud::{SpironCloudConfig, SpironCloudHarness, SpironCloudProvider};
@@ -202,18 +203,6 @@ fn control_id(kind: &str) -> String {
     format!("{kind}-{}-{nanos}", std::process::id())
 }
 
-fn exit_before_listen_error(status: std::process::ExitStatus, log: &Path) -> ListenError {
-    let stderr = anyagents_harness_stream::read_bounded_masked_log(log);
-    let trimmed = stderr.trim();
-    if trimmed.is_empty() {
-        ListenError::Failed(format!("spiron exited with {status} before it listened"))
-    } else {
-        ListenError::Failed(format!(
-            "spiron exited with {status} before it listened: {trimmed}"
-        ))
-    }
-}
-
 fn wait_exited(child: &mut Child, grace: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + grace;
     loop {
@@ -246,7 +235,7 @@ impl SpironHarness {
     }
 
     /// Start a v2 process that listens on `socket` and outlives this server,
-    /// and attach to it. Its output goes to `log`; launch errors fail closed.
+    /// and attach to it. Both streams go to `log`; launch errors fail closed.
     ///
     /// `spawned` is told the process's pid as soon as it exists, before it
     /// listens, so the host can record it: a host that dies before the
@@ -258,6 +247,29 @@ impl SpironHarness {
         patience: Duration,
         spawned: impl FnOnce(u32) -> Result<(), String>,
     ) -> Result<Self, ListenError> {
+        Self::start_listening(launch, socket, log, patience, spawned, false)
+    }
+
+    /// Like [Self::launch_listening], but report a bounded stderr-only tail on
+    /// early exit. Stderr goes to `log` and stdout to its `.stdout.log` sibling.
+    pub fn launch_listening_with_stderr_tail(
+        launch: SpironLaunch,
+        socket: &Path,
+        log: &Path,
+        patience: Duration,
+        spawned: impl FnOnce(u32) -> Result<(), String>,
+    ) -> Result<Self, ListenError> {
+        Self::start_listening(launch, socket, log, patience, spawned, true)
+    }
+
+    fn start_listening(
+        launch: SpironLaunch,
+        socket: &Path,
+        log: &Path,
+        patience: Duration,
+        spawned: impl FnOnce(u32) -> Result<(), String>,
+        stderr_tail: bool,
+    ) -> Result<Self, ListenError> {
         let failed = |error: String| ListenError::Failed(error);
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(failed(format!(
@@ -266,11 +278,11 @@ impl SpironHarness {
             )));
         }
         let args = launch.build_launch_args(socket);
-        let output = std::fs::File::create(log)
-            .map_err(|err| failed(format!("cannot open {}: {err}", log.display())))?;
-        let errors = output
-            .try_clone()
-            .map_err(|err| failed(format!("cannot open {}: {err}", log.display())))?;
+        let (stdout, stderr, capture) =
+            startup_stderr::launch_logs(log, stderr_tail).map_err(failed)?;
+        let exit_error = |status| {
+            startup_stderr::exit_before_listen(status, capture.as_ref(), log, &launch.environment)
+        };
         // Its own process group (as every harness), stdin on /dev/null: a
         // server's group signal and a server's exit leave it running.
         let mut command = anyagents_harness::spawn_command(&launch.program, &launch.environment)
@@ -279,8 +291,8 @@ impl SpironHarness {
             .args(&args)
             .current_dir(&launch.work_dir)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::from(errors));
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
         let mut child =
             anyagents_harness::spawn_child(&mut command).map_err(|err| failed(err.to_string()))?;
         if let Err(error) = spawned(child.id()) {
@@ -290,7 +302,7 @@ impl SpironHarness {
         let deadline = Instant::now() + patience;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                return Err(exit_before_listen_error(status, log));
+                return Err(exit_error(status));
             }
             if std::os::unix::net::UnixStream::connect(socket).is_ok() {
                 break;
@@ -320,7 +332,7 @@ impl SpironHarness {
             Ok(inner) => inner,
             Err(err) => {
                 if let Some(status) = wait_exited(&mut child, Duration::from_millis(250)) {
-                    return Err(exit_before_listen_error(status, log));
+                    return Err(exit_error(status));
                 }
                 anyagents_harness::kill_child(&mut child, &launch.environment);
                 return Err(failed(err.to_string()));

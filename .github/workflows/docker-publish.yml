@@ -41,7 +41,8 @@ on:
       platforms:
         description: Comma-separated OCI target platforms
         required: false
-        default: linux/amd64,linux/arm64
+        # Avoid slow QEMU arm64 builds by default. Dispatch can opt in; tags/releases stay multi-arch.
+        default: linux/amd64
         type: string
       install_harnesses:
         description: Space-separated public CLI harnesses for sandbox-full
