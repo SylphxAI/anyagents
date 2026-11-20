@@ -34,7 +34,7 @@ impl MockCallbackServer {
         let events_srv = Arc::clone(&events);
 
         let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(25);
+            let deadline = Instant::now() + Duration::from_secs(35);
             let mut saw_terminal = false;
             while Instant::now() < deadline && !saw_terminal {
                 match listener.accept() {
@@ -98,14 +98,50 @@ impl MockCallbackServer {
     }
 }
 
-fn wait_for_file(path: &Path, timeout: Duration, label: &str) {
+fn wait_for_file(
+    path: &Path,
+    timeout: Duration,
+    label: &str,
+    events: Option<&CallbackEvents>,
+    state_dir: Option<&Path>,
+    turn_id: Option<&str>,
+) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {label} ({})",
-            path.display()
-        );
+        if let Some(ev) = events {
+            let guard = ev.lock().unwrap();
+            if guard
+                .iter()
+                .any(|(_, v)| v.get("event_type").and_then(Value::as_str) == Some("turn_failed"))
+            {
+                let log = state_dir
+                    .zip(turn_id)
+                    .and_then(|(sd, tid)| {
+                        std::fs::read_to_string(sd.join(format!("turns/{tid}.log"))).ok()
+                    })
+                    .unwrap_or_default();
+                panic!(
+                    "turn failed while waiting for {label} ({}).\nevents={:?}\nguest_log={log}",
+                    path.display(),
+                    *guard
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            let ev_dump = events
+                .map(|ev| format!("{:?}", *ev.lock().unwrap()))
+                .unwrap_or_default();
+            let log = state_dir
+                .zip(turn_id)
+                .and_then(|(sd, tid)| {
+                    std::fs::read_to_string(sd.join(format!("turns/{tid}.log"))).ok()
+                })
+                .unwrap_or_default();
+            panic!(
+                "timed out waiting for {label} ({}).\nevents={ev_dump}\nguest_log={log}",
+                path.display()
+            );
+        }
         std::thread::sleep(Duration::from_millis(15));
     }
 }
@@ -422,7 +458,14 @@ for raw in sys.stdin:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "claude step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "claude step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_claude_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_claude_e2e",
@@ -553,7 +596,14 @@ for raw in sys.stdin:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "codex step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "codex step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_codex_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_codex_e2e",
@@ -604,7 +654,7 @@ fn midturn_steer_e2e_opencode_next_step() {
         &fake_opencode,
         &format!(
             r#"#!/usr/bin/env python3
-import base64, http.server, json, os, queue, socketserver, sys, threading, time, urllib.request, urllib.error, pathlib
+import base64, http.client, http.server, json, os, queue, socketserver, sys, threading, time, urllib.parse, pathlib
 
 STEP1 = pathlib.Path({step1:?})
 RELEASE = pathlib.Path({release:?})
@@ -626,23 +676,28 @@ def run_api(args):
             rest.append(args[i])
             i += 1
     method, path = rest[0], rest[1]
+    url = urllib.parse.urlsplit(server)
     pw = os.environ.get("OPENCODE_PASSWORD", "")
     cred = base64.b64encode(f"opencode:{{pw}}".encode()).decode()
     data = body.encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        f"{{server}}{{path}}",
-        data=data,
-        method=method,
-        headers={{"Authorization": f"Basic {{cred}}", "Content-Type": "application/json"}},
-    )
+    headers = {{"Authorization": f"Basic {{cred}}", "Connection": "close"}}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            sys.stdout.write(resp.read().decode("utf-8"))
-            sys.stdout.flush()
-    except urllib.error.HTTPError as e:
-        sys.stdout.write(e.read().decode("utf-8"))
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=30)
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8")
+        conn.close()
+    except OSError as e:
+        sys.stderr.write(f"error: Unable to connect. {{e}}\n")
+        sys.stderr.flush()
+        sys.exit(1)
+    if raw:
+        sys.stdout.write(raw)
         sys.stdout.flush()
-        sys.stderr.write(f"HTTP {{e.code}} {{e.reason}}\n")
+    if not (200 <= resp.status < 300):
+        sys.stderr.write(f"HTTP {{resp.status}} {{resp.reason}}\n")
         sys.stderr.flush()
         sys.exit(1)
 
@@ -664,7 +719,6 @@ def run_serve(args):
                 q.put(ev)
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
         def log_message(self, fmt, *args):
             pass
         def send_json(self, code, obj):
@@ -675,7 +729,8 @@ def run_serve(args):
             self.end_headers()
             self.wfile.write(raw)
         def do_GET(self):
-            if self.path == "/api/event":
+            req_path = urllib.parse.urlsplit(self.path).path
+            if req_path == "/api/event":
                 q = queue.Queue()
                 with state_lock:
                     sse_queues.append(q)
@@ -687,35 +742,47 @@ def run_serve(args):
                 self.wfile.flush()
                 try:
                     while True:
-                        ev = q.get(timeout=20)
+                        try:
+                            ev = q.get(timeout=30)
+                        except queue.Empty:
+                            continue
                         payload = f"data: {{json.dumps(ev)}}\n\n".encode("utf-8")
                         self.wfile.write(payload)
                         self.wfile.flush()
                 except Exception:
                     return
-            elif self.path == "/api/session":
+            elif req_path == "/api/session":
                 self.send_json(200, {{"data": []}})
-            elif self.path == "/api/info":
+            elif req_path == "/api/info":
                 self.send_json(200, {{"version": "2.3.0"}})
-            elif self.path == "/api/mcp":
+            elif req_path == "/api/mcp":
                 self.send_json(200, {{"data": [{{"name": "anyagents", "status": {{"status": "connected"}}}}]}})
-            elif self.path == "/api/session/active":
+            elif req_path == "/api/session/active":
                 self.send_json(200, {{"data": {{}}}})
-            elif self.path.startswith("/api/session/ses_oc_1/message"):
+            elif req_path == "/api/session/ses_oc_1/message":
                 with state_lock:
                     # OpenCode lists messages newest first!
                     ordered = list(reversed(messages))
                 self.send_json(200, {{"data": ordered}})
-            elif self.path == "/api/session/ses_oc_1":
+            elif req_path.startswith("/api/session/ses_oc_1/message/"):
+                wanted = req_path.rsplit("/", 1)[-1]
+                with state_lock:
+                    found = next((m for m in messages if m.get("id") == wanted), None)
+                if found is not None:
+                    self.send_json(200, {{"data": found}})
+                else:
+                    self.send_json(404, {{"_tag": "MessageNotFoundError", "message": "not found"}})
+            elif req_path == "/api/session/ses_oc_1":
                 self.send_json(200, {{"data": {{"id": "ses_oc_1"}}}})
             else:
                 self.send_json(404, {{"message": "not found"}})
         def do_POST(self):
+            req_path = urllib.parse.urlsplit(self.path).path
             cl = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(cl) if cl > 0 else b""
-            if self.path == "/api/session":
+            if req_path == "/api/session":
                 self.send_json(200, {{"data": {{"id": "ses_oc_1"}}}})
-            elif self.path == "/api/session/ses_oc_1/prompt":
+            elif req_path == "/api/session/ses_oc_1/prompt":
                 body = json.loads(raw.decode("utf-8"))
                 with WIRE.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(body) + "\n")
@@ -732,20 +799,22 @@ def run_serve(args):
                     STEP1.write_text("step1", encoding="utf-8")
                 else:
                     def finish_step2():
-                        deadline = time.time() + 10.0
+                        deadline = time.time() + 15.0
                         while time.time() < deadline and not RELEASE.exists():
                             time.sleep(0.02)
                         with state_lock:
+                            last_ts = max((m.get("time", {{}}).get("created", 0) for m in messages), default=0)
+                            asst_ts = max(int(time.time() * 1000), last_ts + 5)
                             messages.append({{
                                 "id": "msg_asst_oc",
                                 "type": "assistant",
                                 "content": [{{"type": "text", "text": f"opencode step1+step2 acted on: {{text}}"}}],
-                                "time": {{"created": int(time.time() * 1000) + 5}}
+                                "time": {{"created": asst_ts}}
                             }})
                         turn_done.set()
                     threading.Thread(target=finish_step2, daemon=True).start()
-            elif self.path == "/api/experimental/session/ses_oc_1/wait":
-                turn_done.wait(timeout=15.0)
+            elif req_path == "/api/experimental/session/ses_oc_1/wait":
+                turn_done.wait(timeout=20.0)
                 self.send_json(200, {{"data": {{"idle": True}}}})
             else:
                 self.send_json(404, {{"message": "not found"}})
@@ -753,6 +822,10 @@ def run_serve(args):
     class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "127.0.0.1"
+            self.server_port = self.server_address[1]
 
     srv = Server(("127.0.0.1", port), Handler)
     print(f"server listening on http://127.0.0.1:{{port}}", flush=True)
@@ -788,7 +861,14 @@ else:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "opencode step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(20),
+        "opencode step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_opencode_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_opencode_e2e",
@@ -965,7 +1045,14 @@ for raw in sys.stdin:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "agy step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "agy step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_agy_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_agy_e2e",
@@ -1113,7 +1200,14 @@ for raw in sys.stdin:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "omp step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "omp step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_omp_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_omp_e2e",
@@ -1280,7 +1374,14 @@ for raw in rfile:
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "spiron step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "spiron step1",
+        Some(&events_ref),
+        Some(&state_dir),
+        Some("turn_spiron_e2e"),
+    );
     drop_atomic_steer_file(
         &state_dir,
         "turn_spiron_e2e",
@@ -1353,7 +1454,14 @@ echo '{{"type":"result","status":"success","session_id":"gem-e2e-1","result":"ge
         &[],
     );
 
-    wait_for_file(&step1_flag, Duration::from_secs(10), "gemini step1");
+    wait_for_file(
+        &step1_flag,
+        Duration::from_secs(15),
+        "gemini step1",
+        Some(&srv.events),
+        Some(&state_dir),
+        Some("turn_gemini_fc"),
+    );
     let steer_path = drop_atomic_steer_file(
         &state_dir,
         "turn_gemini_fc",

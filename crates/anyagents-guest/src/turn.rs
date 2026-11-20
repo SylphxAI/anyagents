@@ -15,9 +15,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[path = "turn_watchdog.rs"]
+mod watchdog;
+pub(crate) use watchdog::TurnWatchdog;
+#[cfg(test)]
+use watchdog::resolve_timeout_secs_from;
+use watchdog::{STATE_DIR_PROGRESS_PROBE_INTERVAL, StateDirProgressTracker};
 
 use anyagents_harness::{
     Context, DeliverOutcome, HarnessError, OutboundMessage, Proof, TurnState, TurnUsage,
@@ -41,10 +47,7 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 200;
 const CALLBACK_TIMEOUT_SECS: u64 = 15;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
-const DEFAULT_SILENT_PROGRESS_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 1_800;
-const SILENT_PROGRESS_TIMEOUT_ENV: &str = "ANYAGENTS_GUEST_SILENT_TIMEOUT_SECS";
-const MAX_TURN_DURATION_ENV: &str = "ANYAGENTS_GUEST_MAX_TURN_SECS";
+const OPENCODE_DELTA_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Allowlisted native-harness OAuth credential files relative to `state_dir`.
 ///
@@ -304,85 +307,6 @@ fn spawn_detached_turn(
         .flush()
         .map_err(|e| format!("stdout flush failed: {e}"))?;
     Ok(())
-}
-
-fn resolve_timeout_secs_from(raw: Option<&str>, default_secs: u64) -> Option<Duration> {
-    let secs = raw
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(default_secs);
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
-
-fn resolve_timeout_secs(env_key: &str, default_secs: u64) -> Option<Duration> {
-    resolve_timeout_secs_from(std::env::var(env_key).ok().as_deref(), default_secs)
-}
-
-/// Bounded deadlock and max-duration watchdog shared between the foreground
-/// turn loop and [`HeartbeatGuard`].
-///
-/// Prevents a deadlocked inner harness (0 stdout/stderr/activity progress) from
-/// being masked indefinitely by background heartbeats.
-#[derive(Clone)]
-pub(crate) struct TurnWatchdog {
-    started_at: Instant,
-    last_activity_ms: Arc<AtomicU64>,
-    silent_timeout: Option<Duration>,
-    max_duration: Option<Duration>,
-}
-
-impl TurnWatchdog {
-    fn new(silent_timeout: Option<Duration>, max_duration: Option<Duration>) -> Self {
-        Self {
-            started_at: Instant::now(),
-            last_activity_ms: Arc::new(AtomicU64::new(0)),
-            silent_timeout,
-            max_duration,
-        }
-    }
-
-    fn from_env() -> Self {
-        Self::new(
-            resolve_timeout_secs(
-                SILENT_PROGRESS_TIMEOUT_ENV,
-                DEFAULT_SILENT_PROGRESS_TIMEOUT_SECS,
-            ),
-            resolve_timeout_secs(MAX_TURN_DURATION_ENV, DEFAULT_MAX_TURN_DURATION_SECS),
-        )
-    }
-
-    pub(crate) fn touch(&self) {
-        let elapsed = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
-    }
-
-    fn silent_elapsed(&self) -> Duration {
-        let now = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let last = self.last_activity_ms.load(Ordering::Relaxed);
-        Duration::from_millis(now.saturating_sub(last))
-    }
-
-    fn expired_reason(&self, in_turn: bool, harness: &str) -> Option<String> {
-        if let Some(max_d) = self.max_duration
-            && self.started_at.elapsed() >= max_d
-        {
-            return Some(format!(
-                "guest harness `{harness}` exceeded max turn duration ({}s)",
-                max_d.as_secs()
-            ));
-        }
-        if in_turn
-            && let Some(silent_d) = self.silent_timeout
-            && self.silent_elapsed() >= silent_d
-        {
-            return Some(format!(
-                "guest harness `{harness}` produced no output or progress for {}s (deadlock watchdog)",
-                silent_d.as_secs()
-            ));
-        }
-        None
-    }
 }
 
 /// RAII background heartbeat ticker that keeps the coordinator's remote-turn
@@ -738,6 +662,11 @@ fn execute_turn_foreground(
     let mut sent_text_len = 0usize;
     let mut delta_seq = 0u64;
     let mut err_override: Option<String> = None;
+    let mut turn_finished_cleanly = delivered_done;
+    let mut last_persisted_sid: Option<String> = None;
+    let mut last_opencode_delta_poll = Instant::now() - OPENCODE_DELTA_POLL_INTERVAL;
+    let mut progress_tracker =
+        StateDirProgressTracker::new(state_dir, STATE_DIR_PROGRESS_PROBE_INTERVAL);
     let mut steer_pump = crate::steer::SteerPump::new(
         turns_dir,
         &args.turn_id,
@@ -749,18 +678,24 @@ fn execute_turn_foreground(
 
     if !delivered_done {
         loop {
-            steer_pump.tick(
+            if steer_pump.tick(
                 adapter.as_mut(),
                 state_dir,
                 &env,
                 file_cfg.as_ref(),
                 &watchdog,
-            );
+            ) {
+                watchdog.touch();
+            }
 
             let health = adapter.health();
             let live_sid = adapter.session_id();
-            if let Some(ref sid) = live_sid {
+            if let Some(ref sid) = live_sid
+                && last_persisted_sid.as_deref() != Some(sid.as_str())
+            {
                 let _ = persist_session(state_dir, &harness_name, sid);
+                last_persisted_sid = Some(sid.clone());
+                watchdog.touch();
             }
             hb_guard.set_phase(
                 live_sid.or_else(|| initial_sid.clone()),
@@ -768,9 +703,24 @@ fn execute_turn_foreground(
             );
 
             // Stream incremental deltas if harness accumulated new output.
-            let current_answer = steer_pump
-                .latest_answer(adapter.as_ref(), state_dir)
-                .or_else(|| adapter.answer_for(&delivery_id, state_dir));
+            // Throttle `opencode` delta polling because `answer_for` invokes `opencode api`.
+            let should_poll_delta = if harness_name == "opencode" {
+                if last_opencode_delta_poll.elapsed() >= OPENCODE_DELTA_POLL_INTERVAL {
+                    last_opencode_delta_poll = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            let current_answer = if should_poll_delta {
+                steer_pump
+                    .latest_answer(adapter.as_ref(), state_dir)
+                    .or_else(|| adapter.answer_for(&delivery_id, state_dir))
+            } else {
+                None
+            };
             if let Some(current_text) = current_answer
                 && current_text.len() > sent_text_len
                 && current_text.is_char_boundary(sent_text_len)
@@ -809,6 +759,9 @@ fn execute_turn_foreground(
                 last_usage_tokens = cur_tokens;
                 watchdog.touch();
             }
+            if progress_tracker.poll_changed() {
+                watchdog.touch();
+            }
 
             let proven = adapter.proven(&delivery_id);
             let steers_active = steer_pump.has_active_work(adapter.as_ref(), health.turn_state);
@@ -828,6 +781,7 @@ fn execute_turn_foreground(
                 .or_else(|| health.sign_in_fault.clone());
 
             if done_by_proof || done_by_turns || failure.is_some() || !health.process_alive {
+                turn_finished_cleanly = (done_by_proof || done_by_turns) && failure.is_none();
                 err_override = failure.or_else(|| {
                     (!health.process_alive && !done_by_proof && !done_by_turns).then(|| {
                         adapter
@@ -876,7 +830,11 @@ fn execute_turn_foreground(
         err_override = adapter
             .failure_for_id(&delivery_id)
             .or_else(|| steer_pump.first_failure(adapter.as_ref()))
-            .or_else(|| adapter.exit_diagnostic());
+            .or_else(|| {
+                (!turn_finished_cleanly)
+                    .then(|| adapter.exit_diagnostic())
+                    .flatten()
+            });
     }
 
     // Stop background heartbeat ticker before terminal snapshot/callbacks so no
@@ -1882,5 +1840,96 @@ mod tests {
             .expired_reason(true, "agy")
             .expect("max turn duration must trip even with fresh touches");
         assert!(max_reason.contains("max turn duration"), "{max_reason}");
+    }
+
+    #[test]
+    fn watchdog_resets_on_state_dir_tool_progress_and_expires_when_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        std::fs::create_dir_all(state_dir.join("turns")).unwrap();
+
+        let agy_transcript = state_dir
+            .join(".gemini/antigravity-cli/brain/cas_tool_loop/.system_generated/logs/transcript_full.jsonl");
+        std::fs::create_dir_all(agy_transcript.parent().unwrap()).unwrap();
+        std::fs::write(&agy_transcript, "{\"step\":1}\n").unwrap();
+
+        let oc_wal = state_dir.join("data-home/opencode/opencode.db-wal");
+        std::fs::create_dir_all(oc_wal.parent().unwrap()).unwrap();
+        std::fs::write(&oc_wal, b"wal-init").unwrap();
+
+        let mut tracker = StateDirProgressTracker::new(state_dir, Duration::from_millis(10));
+        let wd = TurnWatchdog::new(
+            Some(Duration::from_millis(110)),
+            Some(Duration::from_secs(30)),
+        );
+
+        // Guest bookkeeping writes (heartbeats, session-id, turn logs, atomic temp files)
+        // must NEVER look like harness tool progress.
+        std::thread::sleep(Duration::from_millis(15));
+        let snap = GuestActivitySnapshot::capture_current(
+            "agy",
+            Some("cas_tool_loop".into()),
+            "in_turn",
+            1,
+            0,
+        );
+        write_activity_snapshot(state_dir, &snap).unwrap();
+        std::fs::write(state_dir.join("agy-session-id"), "cas_tool_loop\n").unwrap();
+        std::fs::write(state_dir.join("turns/turn_1.log"), "guest log line\n").unwrap();
+        std::fs::write(
+            state_dir.join(".guest-activity.json.1.1.anyagents-tmp"),
+            b"tmp",
+        )
+        .unwrap();
+        assert!(
+            !tracker.poll_changed(),
+            "guest bookkeeping writes must not reset silent-deadlock watchdog"
+        );
+
+        // Active multi-step tool-calling writes to deep agy transcript & opencode WAL
+        // keep a healthy turn alive well past `silent_timeout` (110ms) with zero text/usage.
+        for step in 2..=6u32 {
+            std::thread::sleep(Duration::from_millis(35));
+            if step % 2 == 0 {
+                let mut f = OpenOptions::new()
+                    .append(true)
+                    .open(&agy_transcript)
+                    .unwrap();
+                writeln!(f, "{{\"step\":{step},\"tool\":\"run_command\"}}").unwrap();
+            } else {
+                let mut f = OpenOptions::new().append(true).open(&oc_wal).unwrap();
+                writeln!(f, "wal-frame-{step}").unwrap();
+            }
+            assert!(
+                tracker.poll_changed(),
+                "step {step} transcript/WAL progress must be observed"
+            );
+            wd.touch();
+            assert!(
+                wd.expired_reason(true, "agy").is_none(),
+                "healthy tool-calling progress at step {step} must keep watchdog alive"
+            );
+        }
+
+        // Once tool progress stops, even continued heartbeat snapshot rewrites must NOT
+        // prevent the silent-deadlock watchdog from expiring cleanly.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(35));
+            let hb = GuestActivitySnapshot::capture_current(
+                "agy",
+                Some("cas_tool_loop".into()),
+                "in_turn",
+                1,
+                0,
+            );
+            write_activity_snapshot(state_dir, &hb).unwrap();
+            if tracker.poll_changed() {
+                wd.touch();
+            }
+        }
+        let reason = wd
+            .expired_reason(true, "agy")
+            .expect("truly silent deadlock must still expire watchdog");
+        assert!(reason.contains("deadlock watchdog"), "{reason}");
     }
 }
