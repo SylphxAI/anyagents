@@ -357,7 +357,7 @@ fn contains_media(value: &Value) -> bool {
 
 fn maybe_offload_response(resp: &str, spill_dir: &Path, seq: &mut u64) -> String {
     let bytes = resp.as_bytes();
-    if bytes.len() + 1 <= PROXY_TEXT_SPILL_BYTES {
+    if bytes.len() < PROXY_TEXT_SPILL_BYTES {
         return resp.to_string();
     }
     let Ok(original) = serde_json::from_slice::<Value>(bytes) else {
@@ -404,7 +404,7 @@ fn maybe_offload_response(resp: &str, spill_dir: &Path, seq: &mut u64) -> String
         });
     }
     match serde_json::to_string(&replacement) {
-        Ok(compact) if compact.len() + 1 <= PROXY_TEXT_SPILL_BYTES => compact,
+        Ok(compact) if compact.len() < PROXY_TEXT_SPILL_BYTES => compact,
         _ => resp.to_string(),
     }
 }

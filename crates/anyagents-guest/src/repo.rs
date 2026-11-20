@@ -229,8 +229,9 @@ pub(crate) fn ensure_gh_auth_setup_git(state_dir: &Path, gh_token: Option<&str>)
     let Some(gh_bin) = resolve_gh_binary() else {
         return;
     };
-    if let Ok(mut cmd) = spawn_command(&gh_bin, &["auth", "setup-git"]) {
+    if let Ok(mut cmd) = spawn_command(&gh_bin, &[]) {
         let _ = cmd
+            .args(["auth", "setup-git"])
             .env("HOME", state_dir)
             .env("GH_TOKEN", tok)
             .env("GIT_TERMINAL_PROMPT", "0")
