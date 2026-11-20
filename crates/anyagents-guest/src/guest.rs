@@ -1177,20 +1177,21 @@ fn emit_turn_completion<W: Write>(
 
     let reply = adapter
         .answer_for(&turn.id, state_dir)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "completed".to_string());
+        .filter(|s| !s.trim().is_empty());
 
-    emit_line(
-        writer,
-        &json!({
-            "type": "assistant",
-            "session_id": sid,
-            "message": {
-                "role": "assistant",
-                "content": [{ "type": "text", "text": reply }]
-            }
-        }),
-    )?;
+    if let Some(ref reply_text) = reply {
+        emit_line(
+            writer,
+            &json!({
+                "type": "assistant",
+                "session_id": sid,
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": reply_text }]
+                }
+            }),
+        )?;
+    }
 
     emit_line(
         writer,
@@ -1200,7 +1201,7 @@ fn emit_turn_completion<W: Write>(
             "is_error": false,
             "session_id": sid,
             "user_message_uuids": [turn.uuid],
-            "result": reply,
+            "result": reply.unwrap_or_default(),
             "usage": usage_json(&usage),
             "total_cost_usd": cost_usd,
         }),

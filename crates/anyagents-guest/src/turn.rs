@@ -622,12 +622,13 @@ fn execute_turn_foreground(
         return Ok(());
     }
 
-    let reply = reply_opt
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "completed".to_string());
+    let reply = reply_opt.filter(|s| !s.trim().is_empty());
 
-    if reply.len() > sent_text_len && reply.is_char_boundary(sent_text_len) {
-        let chunk = &reply[sent_text_len..];
+    if let Some(ref reply_text) = reply
+        && reply_text.len() > sent_text_len
+        && reply_text.is_char_boundary(sent_text_len)
+    {
+        let chunk = &reply_text[sent_text_len..];
         if !chunk.is_empty() {
             delta_seq += 1;
             let _ = post_callback_with_retry(
