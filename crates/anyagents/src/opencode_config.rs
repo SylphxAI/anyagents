@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyagents_core::Error;
+use serde_json::{Map, Value};
 
 /// Write `opencode.json`, `opencode/opencode.json`, and `.config/opencode/opencode.json` in `dir`.
 ///
@@ -62,32 +63,27 @@ pub fn write(
         }
     }
 
-    let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
-
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        let normalized = normalize_model(raw_model, has_sylphx_provider);
-        let (base_model, variant) = match normalized.split_once('#') {
-            Some((b, v)) if !b.is_empty() && !v.is_empty() => (b.to_string(), Some(v.to_string())),
-            _ => (normalized, None),
-        };
-        root["model"] = serde_json::Value::String(base_model.clone());
-        let mut build_agent = serde_json::json!({
-            "model": base_model,
-        });
-        if let Some(v) = variant {
-            build_agent["variant"] = serde_json::Value::String(v);
-        }
-        root["agent"] = serde_json::json!({
-            "build": build_agent,
-        });
-    } else if root.get("model").is_none() && has_sylphx_provider {
-        root["model"] = serde_json::Value::String("sylphx/openai/gpt-6.1-sol".to_string());
-        root["agent"] = serde_json::json!({
-            "build": {
-                "model": "sylphx/openai/gpt-6.1-sol",
-                "variant": "xhigh",
+        let (base_model, variant) = match raw_model.split_once('#') {
+            Some((model, variant)) if !variant.is_empty() && !variant.contains('#') => {
+                (model, Some(variant))
             }
-        });
+            Some(_) => return Err(Error::Message("invalid OpenCode model variant".into())),
+            None => (raw_model, None),
+        };
+        register_model(&mut root, base_model)?;
+        let agent = object_entry(
+            root.as_object_mut().expect("config root is an object"),
+            "agent",
+        )?;
+        let build = object_entry(agent, "build")?;
+        build.insert("model".to_string(), Value::String(base_model.to_string()));
+        if let Some(variant) = variant {
+            build.insert("variant".to_string(), Value::String(variant.to_string()));
+        } else {
+            build.remove("variant");
+        }
+        root["model"] = Value::String(base_model.to_string());
     }
     if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
         if !root.get("tools").is_some_and(|v| v.is_object()) {
@@ -135,6 +131,74 @@ pub fn write(
     std::fs::create_dir_all(&home_opencode_dir)?;
     write_atomic(&home_opencode_dir.join("opencode.json"), &bytes)?;
     Ok(())
+}
+
+// OpenCode splits at the first slash. A gateway's model ID can itself
+// include slashes, and the agent variant is not part of the model ID.
+fn register_model(root: &mut Value, selector: &str) -> Result<(), Error> {
+    let (provider_id, model_id) = selector
+        .split_once('/')
+        .filter(|(provider, model)| {
+            !provider.is_empty() && !model.is_empty() && !selector.contains(char::is_whitespace)
+        })
+        .ok_or_else(|| Error::Message("OpenCode model must be <provider>/<model>".into()))?;
+    let root = root.as_object_mut().expect("config root is an object");
+    if !allowed(root, "disabled_providers", "enabled_providers", provider_id)? {
+        return Err(Error::Message(format!(
+            "OpenCode provider {provider_id:?} is excluded by config; refusing to select {selector:?}"
+        )));
+    }
+    let providers = object_entry(root, "provider")?;
+    let provider = object_entry(providers, provider_id)?;
+    if !allowed(provider, "blacklist", "whitelist", model_id)? {
+        return Err(Error::Message(format!(
+            "OpenCode model {selector:?} is excluded by provider config"
+        )));
+    }
+    let models = object_entry(provider, "models")?;
+    let model = object_entry(models, model_id)?;
+    if model.get("status").and_then(Value::as_str) == Some("deprecated") {
+        return Err(Error::Message(format!(
+            "OpenCode model {selector:?} is deprecated"
+        )));
+    }
+    Ok(())
+}
+
+fn object_entry<'a>(
+    object: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>, Error> {
+    object
+        .entry(key)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| Error::Message(format!("OpenCode config entry {key:?} must be an object")))
+}
+
+fn allowed(
+    object: &Map<String, Value>,
+    deny: &str,
+    allow: &str,
+    value: &str,
+) -> Result<bool, Error> {
+    let contains = |key| -> Result<Option<bool>, Error> {
+        object
+            .get(key)
+            .map(|entry| {
+                entry
+                    .as_array()
+                    .filter(|items| items.iter().all(Value::is_string))
+                    .map(|items| items.iter().any(|item| item.as_str() == Some(value)))
+                    .ok_or_else(|| {
+                        Error::Message(format!(
+                            "OpenCode config entry {key:?} must be a string array"
+                        ))
+                    })
+            })
+            .transpose()
+    };
+    Ok(!contains(deny)?.unwrap_or(false) && contains(allow)?.unwrap_or(true))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -264,33 +328,6 @@ fn synthesize_provider_from_profile_mapping(
     }))
 }
 
-fn normalize_model(raw: &str, has_sylphx_provider: bool) -> String {
-    if !has_sylphx_provider {
-        return raw.to_string();
-    }
-    if raw.starts_with("sylphx/")
-        || raw.starts_with("minimax-code-plan/")
-        || raw.starts_with("kimi-code-plan/")
-        || raw.starts_with("glm-code-plan/")
-        || raw.starts_with("qwen-token-plan/")
-    {
-        return raw.to_string();
-    }
-    if raw.starts_with("openai/")
-        || raw.starts_with("anthropic/")
-        || raw.starts_with("google/")
-        || raw.starts_with("deepseek/")
-        || raw.starts_with("x-ai/")
-        || raw.starts_with("xiaomi/")
-    {
-        return format!("sylphx/{raw}");
-    }
-    if raw.starts_with("gpt-") {
-        return format!("sylphx/openai/{raw}");
-    }
-    raw.to_string()
-}
-
 fn command_args(command: &Path, args: &[String]) -> Vec<String> {
     let mut all = Vec::with_capacity(args.len() + 1);
     all.push(command.display().to_string());
@@ -349,6 +386,92 @@ mod tests {
             ] {
                 assert!(tools.get(tool).is_none(), "{tool}: {tools}");
             }
+        }
+    }
+
+    #[test]
+    fn registers_exact_build_model_without_disturbing_existing_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let original = serde_json::json!({
+            "provider": {"example-gateway": {
+                "name": "Configured gateway",
+                "models": {"lab/old": {"name": "Original model", "reasoning": true}}
+            }},
+            "agent": {"build": {"description": "retain me"}, "plan": {"description": "retain me too"}}
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+        write(
+            dir.path(),
+            Some("example-gateway/lab/new#high"),
+            Path::new("/bin/anyagents"),
+            &[],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["model"], "example-gateway/lab/new");
+        assert_eq!(parsed["agent"]["build"]["model"], parsed["model"]);
+        assert_eq!(parsed["agent"]["build"]["variant"], "high");
+        let models = &parsed["provider"]["example-gateway"]["models"];
+        assert_eq!(models["lab/new"], serde_json::json!({}));
+        assert_eq!(
+            models["lab/old"],
+            original["provider"]["example-gateway"]["models"]["lab/old"]
+        );
+        assert_eq!(parsed["agent"]["plan"], original["agent"]["plan"]);
+        assert_eq!(parsed["agent"]["build"]["description"], "retain me");
+        for alias in ["opencode/opencode.json", ".config/opencode/opencode.json"] {
+            assert_eq!(
+                std::fs::read(dir.path().join(alias)).unwrap(),
+                std::fs::read(&path).unwrap()
+            );
+        }
+
+        write(
+            dir.path(),
+            Some("example-gateway/lab/old"),
+            Path::new("/bin/anyagents"),
+            &[],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(parsed["provider"]["example-gateway"]["models"], *models);
+        assert_eq!(parsed["agent"]["build"]["model"], "example-gateway/lab/old");
+        assert!(parsed["agent"]["build"].get("variant").is_none());
+    }
+
+    #[test]
+    fn refuses_a_selection_that_would_be_unregistered_or_excluded() {
+        for (seed, model) in [
+            (serde_json::json!({}), "unqualified"),
+            (
+                serde_json::json!({"disabled_providers": ["gateway"]}),
+                "gateway/model",
+            ),
+            (
+                serde_json::json!({"enabled_providers": ["other"]}),
+                "gateway/model",
+            ),
+            (
+                serde_json::json!({"provider": {"gateway": {"models": []}}}),
+                "gateway/model",
+            ),
+            (
+                serde_json::json!({"provider": {"gateway": {"whitelist": ["other"]}}}),
+                "gateway/model",
+            ),
+            (
+                serde_json::json!({"provider": {"gateway": {"blacklist": ["model"]}}}),
+                "gateway/model",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.json");
+            let original = seed.to_string();
+            std::fs::write(&path, &original).unwrap();
+            assert!(write(dir.path(), Some(model), Path::new("/bin/anyagents"), &[]).is_err());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+            assert!(!dir.path().join("opencode/opencode.json").exists());
         }
     }
 

@@ -653,8 +653,28 @@ missing fields from YAML frontmatter (`description`/`summary`, `scope`,
 invalid scopes, malformed or unclosed frontmatter and
 symlinks in any template path are validation errors, including implicit lookup;
 lookup never silently falls through after a refusal. Scope validation happens
-before agent persistence. Without a template, omitted HTTP harness retains
-`claude-code`; an explicit empty harness or `inherit` selects child defaults.
+before agent persistence.
+
+Spawn selects harness, model and profile in this order: explicit request → role
+frontmatter → compatible parent values (children only) → deployment default.
+An empty field is omitted; an explicit `inherit` selects only that parent field.
+If a caller changes the role's harness, the role's model and profile do not
+carry across. An inherited model requires the same harness, and an inherited
+profile must match the selected provider. A root needs a harness from its
+request, role or deployment; AnyAgents supplies no built-in harness or model.
+
+The deployment fallback is the `default` entry of `<data>/subagent-defaults.json`,
+also accessible via `anyagents subagents default`. Its model and profile apply to the configured
+harness, after parent inheritance. Legacy `mode` and `agents` entries round-trip
+for migration but do not affect selection. Move per-parent policies into role
+frontmatter and clear old entries with `--agent <name> --clear`. Per-harness model environment
+variables and model values in credentials profiles no longer pick the agent's
+model: declare the model in the role, request or deployment default instead.
+
+For OpenCode, use a qualified selector `<provider>/<model>` (optionally followed by `#<variant>`).
+AnyAgents adds the exact model ID to that OpenCode provider's models while
+preserving existing metadata, and rejects explicit selections excluded by the
+config instead of emitting a dangling build-agent model.
 
 MCP agent lists first apply visibility, parent and state scope. `summary.total`
 and health/state counts describe that full population, before `query` or

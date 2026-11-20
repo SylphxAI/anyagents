@@ -43,9 +43,7 @@ pub(crate) use credentials::{
     sync_fresher_bound_agent_credentials, sync_fresher_bound_agent_credentials_in,
     write_profile_marker,
 };
-pub(crate) use model_defaults::{
-    persist_spawned_agent_config_to_store, resolve_default_model_for_harness,
-};
+pub(crate) use model_defaults::persist_spawned_agent_config_to_store;
 pub(crate) use profile_identity::{extract_profile_account_identity, update_profile_json_identity};
 pub(crate) use profile_rotation::{force_refresh_provider_profiles, try_rotate_exhausted_profile};
 pub(crate) use profiles::{

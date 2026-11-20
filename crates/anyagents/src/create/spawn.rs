@@ -245,6 +245,12 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         } else {
             ExecutionRuntime::Local
         };
+    if request.harness.trim().is_empty() {
+        return Err(Error::Message(
+            "no harness selected; set a harness in the request, role template, or deployment default"
+                .into(),
+        ));
+    }
     let resolved = resolve_harness_and_runtime(
         &request.harness,
         request.runtime.as_deref(),
@@ -275,22 +281,10 @@ pub(super) fn create_with_seat_and_sandbox_mode(
             .unwrap_or(DEFAULT_AGENT_ROLE)
             .to_string(),
     );
-    let parent_for_model = request
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok());
     new.model = request
         .model
         .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
-        .or_else(|| {
-            super::resolve_default_model_for_harness(
-                data,
-                &normalized_harness,
-                request.profile.as_deref(),
-                parent_for_model.as_ref(),
-            )
-        });
+        .filter(|m| !m.is_empty());
     new.description = request
         .description
         .as_deref()

@@ -4559,7 +4559,7 @@ fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
         agents_dir.join("writer.md"),
-        "---\ndescription: Ephemeral isolated-worktree sole writer\nscope: isolated\nworkdir: private\nharness: opencode\nmodel: gpt-5.4-mini\n---\nAlways run cargo test before opening a PR.",
+        "---\ndescription: Ephemeral isolated-worktree sole writer\nscope: isolated\nworkdir: private\nharness: opencode\nmodel: example/model\n---\nAlways run cargo test before opening a PR.",
     )
     .unwrap();
     std::fs::write(
@@ -4620,7 +4620,7 @@ fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
         );
         assert_eq!(created.scope, "isolated");
         assert_eq!(created.harness, "opencode");
-        assert_eq!(created.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(created.model.as_deref(), Some("example/model"));
         let stored = store.agent_by_name("writer-sub-1").unwrap();
         assert_eq!(stored.instructions.as_deref(), Some("Fix issue #42."));
         assert_eq!(

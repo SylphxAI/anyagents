@@ -12,7 +12,7 @@ use super::{
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SubagentDefaultSpec {
-    /// `"inherit"` or `"preset"`.
+    /// Legacy wire field, preserved for existing files and clients.
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
@@ -25,6 +25,7 @@ pub(crate) struct SubagentDefaultSpec {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SubagentDefaultsConfig {
     pub default: SubagentDefaultSpec,
+    /// Legacy overrides are read and preserved for migration; never used to spawn.
     #[serde(default)]
     pub agents: std::collections::BTreeMap<String, SubagentDefaultSpec>,
 }
@@ -1150,73 +1151,52 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    let caller_harness = body
-        .harness
-        .as_deref()
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-        .map(|h| {
-            if h.eq_ignore_ascii_case("inherit") {
-                resolve_subagent_defaults(data_dir, parent, "inherit", None, None).0
-            } else {
-                normalize_harness_name(h).to_string()
-            }
-        });
-    let tpl_harness = tpl
-        .harness
-        .as_deref()
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-        .map(|h| normalize_harness_name(h).to_string());
+    // Resolve the role and caller harness choices against the same parent before
+    // deciding whether the template's harness-specific fields still apply.
+    let parent_harness = parent.map(|agent| agent.harness.as_str());
+    let caller_harness = selection(body.harness.as_deref());
+    let template_harness = selection(tpl.harness.as_deref());
     let harness_overridden = caller_harness
-        .as_deref()
-        .is_some_and(|ch| tpl_harness.as_deref().is_some_and(|th| ch != th));
-    if caller_harness.is_none()
-        && let Some(h) = tpl.harness
-    {
-        body.harness = Some(h);
+        .zip(template_harness)
+        .is_some_and(|(caller, role)| {
+            harness_identity(inherit(caller, parent_harness))
+                != harness_identity(inherit(role, parent_harness))
+        });
+    // Always forward the selection (including absence) to the shared resolver.
+    body.harness = Some(
+        caller_harness
+            .or(template_harness)
+            .unwrap_or_default()
+            .to_string(),
+    );
+    if selection(body.model.as_deref()).is_none() && !harness_overridden {
+        body.model = tpl.model;
     }
-    if body
-        .model
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty)
+    if selection(body.profile.as_deref()).is_none()
         && !harness_overridden
-        && let Some(m) = tpl.model
+        && let Some(p) = selection(tpl.profile.as_deref())
     {
-        body.model = Some(m);
-    }
-    if body
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty)
-        && !harness_overridden
-        && let Some(p) = tpl.profile
-    {
-        let (effective_harness, effective_model, _) = resolve_subagent_defaults(
-            data_dir,
-            parent,
-            body.harness.as_deref().unwrap_or("claude-code"),
-            body.model.clone(),
-            None,
-        );
-        let expected_provider =
-            upstream_provider_of(&effective_harness, effective_model.as_deref());
-        let tpl_provider = p
-            .split_once('/')
-            .map(|(prov, _)| prov.trim())
-            .unwrap_or(expected_provider.as_str());
-        if tpl_provider == expected_provider
-            && ensure_harness_runs_profile(
+        // An explicit inherit token is a selection, not a profile name. The
+        // shared resolver handles compatibility with the selected harness/model.
+        if p.eq_ignore_ascii_case("inherit") {
+            body.profile = Some(p.to_string());
+        } else {
+            let (harness, model, _) = resolve_subagent_defaults(
                 data_dir,
-                &effective_harness,
-                Some(&p),
-                effective_model.as_deref(),
-            )
-            .is_ok()
-        {
-            body.profile = Some(p);
+                parent,
+                body.harness.as_deref().unwrap_or_default(),
+                body.model.clone(),
+                None,
+            );
+            let identity = harness_identity(Some(&harness));
+            let harness = identity.as_deref().unwrap_or(&harness);
+            let provider = upstream_provider_of(harness, model.as_deref());
+            if p.split_once('/')
+                .is_none_or(|(prefix, _)| prefix == provider)
+                && ensure_harness_runs_profile(data_dir, harness, Some(p), model.as_deref()).is_ok()
+            {
+                body.profile = Some(p.to_string());
+            }
         }
     }
     let canonical_role = tpl
@@ -1271,7 +1251,32 @@ pub(crate) fn valid_template_stem(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
-/// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
+fn selection(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn literal(raw: Option<&str>) -> Option<&str> {
+    selection(raw).filter(|value| !value.eq_ignore_ascii_case("inherit"))
+}
+
+fn inherit<'a>(value: &'a str, parent: Option<&'a str>) -> Option<&'a str> {
+    if value.eq_ignore_ascii_case("inherit") {
+        parent
+    } else {
+        Some(value)
+    }
+}
+
+fn harness_identity(selector: Option<&str>) -> Option<String> {
+    selector.and_then(|h| {
+        anyagents_harness::decompose_harness_selector(h)
+            .ok()
+            .map(|(harness, _)| harness)
+    })
+}
+
+/// Resolve the caller/role selections, then compatible parent fields, then
+/// the deployment default. Explicit `inherit` selects only the parent field.
 pub(crate) fn resolve_subagent_defaults(
     data: &Path,
     parent: Option<&Agent>,
@@ -1279,148 +1284,43 @@ pub(crate) fn resolve_subagent_defaults(
     raw_model: Option<String>,
     raw_profile: Option<String>,
 ) -> (String, Option<String>, Option<String>) {
-    let h_trim = normalize_harness_name(raw_harness);
-    let m_trim = raw_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let p_trim = raw_profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let Some(parent_agent) = parent else {
-        let harness = if h_trim.is_empty() || h_trim.eq_ignore_ascii_case("inherit") {
-            "claude-code".to_string()
-        } else {
-            h_trim.to_string()
-        };
-        let model = m_trim
-            .filter(|m| !m.eq_ignore_ascii_case("inherit"))
-            .map(str::to_string)
-            .or_else(|| super::resolve_default_model_for_harness(data, &harness, p_trim, None));
-        let profile = p_trim
-            .filter(|p| !p.eq_ignore_ascii_case("inherit"))
-            .map(str::to_string);
-        return (harness, model, profile);
-    };
-
     let cfg = load_subagent_defaults(data);
-    let spec = cfg.agents.get(&parent_agent.name).unwrap_or(&cfg.default);
-    let parent_cfg_dir = agent_config_dir(data, &parent_agent.id);
-    let parent_bound_profile = bound_profile_name(&parent_cfg_dir);
-
-    let inherit_harness = || {
-        if parent_agent.harness == "agy" {
-            "spiron".to_string()
-        } else {
-            normalize_harness_name(&parent_agent.harness).to_string()
-        }
+    let spec = &cfg.default;
+    let parent_harness = parent.and_then(|agent| literal(Some(&agent.harness)));
+    let deployment_harness = literal(spec.harness.as_deref());
+    let harness = match selection(Some(raw_harness)) {
+        Some(value) => inherit(value, parent_harness),
+        None => parent_harness.or(deployment_harness),
+    };
+    let identity = harness_identity(harness);
+    let parent_model = parent
+        .filter(|_| identity.is_some() && identity == harness_identity(parent_harness))
+        .and_then(|agent| literal(agent.model.as_deref()));
+    let deployment = identity.is_some() && identity == harness_identity(deployment_harness);
+    let model = match selection(raw_model.as_deref()) {
+        Some(value) => inherit(value, parent_model),
+        None => parent_model.or(literal(spec.model.as_deref()).filter(|_| deployment)),
+    };
+    let harness = harness.map(normalize_harness_name).unwrap_or_default();
+    let provider = upstream_provider_of(identity.as_deref().unwrap_or(harness), model);
+    let parent_profile =
+        parent.and_then(|agent| bound_profile_name(&agent_config_dir(data, &agent.id)));
+    let compatible_profile = |value: &str| {
+        value
+            .split_once('/')
+            .is_none_or(|(prefix, _)| prefix == provider)
+    };
+    let parent_profile = literal(parent_profile.as_deref()).filter(|p| compatible_profile(p));
+    let deployment_profile =
+        literal(spec.profile.as_deref()).filter(|p| deployment && compatible_profile(p));
+    let profile = match selection(raw_profile.as_deref()) {
+        Some(value) => inherit(value, parent_profile),
+        None => parent_profile.or(deployment_profile),
     };
 
-    let explicit_inherit = h_trim.eq_ignore_ascii_case("inherit")
-        || m_trim.is_some_and(|m| m.eq_ignore_ascii_case("inherit"))
-        || p_trim.is_some_and(|p| p.eq_ignore_ascii_case("inherit"));
-
-    let use_inherit = explicit_inherit || spec.mode.eq_ignore_ascii_case("inherit");
-
-    let resolved_harness = if !h_trim.is_empty() && !h_trim.eq_ignore_ascii_case("inherit") {
-        h_trim.to_string()
-    } else if h_trim.eq_ignore_ascii_case("inherit") || use_inherit {
-        inherit_harness()
-    } else {
-        spec.harness
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"))
-            .map(str::to_string)
-            .unwrap_or_else(inherit_harness)
-    };
-
-    let resolved_model = if let Some(m) = m_trim {
-        if m.eq_ignore_ascii_case("inherit") {
-            parent_agent.model.clone()
-        } else {
-            Some(m.to_string())
-        }
-    } else if use_inherit {
-        if resolved_harness == parent_agent.harness {
-            parent_agent.model.clone()
-        } else {
-            None
-        }
-    } else if h_trim.is_empty() || spec.harness.as_deref() == Some(resolved_harness.as_str()) {
-        spec.model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|m| {
-                if m.eq_ignore_ascii_case("inherit") {
-                    parent_agent.model.clone()
-                } else {
-                    Some(m.to_string())
-                }
-            })
-    } else {
-        None
-    }
-    .or_else(|| {
-        if resolved_harness == "spiron" || resolved_harness == "spiron-local" {
-            Some(
-                spec.model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| m.starts_with("sylphx/"))
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string()),
-            )
-        } else {
-            super::resolve_default_model_for_harness(
-                data,
-                &resolved_harness,
-                p_trim.or(parent_bound_profile.as_deref()),
-                Some(parent_agent),
-            )
-        }
-    });
-
-    let target_provider = upstream_provider_of(&resolved_harness, resolved_model.as_deref());
-    let inherit_profile_if_compatible = || {
-        parent_bound_profile.as_ref().and_then(|prof| {
-            let prov = prof
-                .split_once('/')
-                .map(|(p, _)| p)
-                .unwrap_or(prof.as_str());
-            (prov == target_provider).then(|| prof.clone())
-        })
-    };
-
-    let resolved_profile = if let Some(p) = p_trim {
-        if p.eq_ignore_ascii_case("inherit") {
-            inherit_profile_if_compatible()
-        } else {
-            Some(p.to_string())
-        }
-    } else if use_inherit {
-        inherit_profile_if_compatible()
-    } else {
-        spec.profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|p| {
-                if p.eq_ignore_ascii_case("inherit") {
-                    inherit_profile_if_compatible()
-                } else {
-                    let prov = p
-                        .split_once('/')
-                        .map(|(pr, _)| pr)
-                        .unwrap_or(&target_provider);
-                    (prov == target_provider).then(|| p.to_string())
-                }
-            })
-            .or_else(inherit_profile_if_compatible)
-    };
-
-    (resolved_harness, resolved_model, resolved_profile)
+    (
+        harness.to_string(),
+        model.map(str::to_string),
+        profile.map(str::to_string),
+    )
 }

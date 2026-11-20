@@ -9,8 +9,6 @@ use std::path::Path;
 
 use anyagents_core::Error;
 
-/// The default model retained for existing `sylphx` agent records.
-pub const DEFAULT_SPIRON_MODEL: &str = "sylphx/openai/gpt-6.1-sol#medium";
 /// Compatibility value used by the managed-worktree marker consumed by Spiron.
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user";
 
