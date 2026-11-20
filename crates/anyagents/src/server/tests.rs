@@ -6298,10 +6298,12 @@ async fn persistent_webhook_schedules_through_http_and_mcp() {
     assert_eq!(inbox.len(), 3);
     assert!(inbox[1].text.contains("\"value\": 3"));
     assert!(inbox[2].text.contains("\"value\": 4"));
-    state
-        .store
-        .note_delivered(&watcher.id, inbox[2].seq)
-        .unwrap();
+    for message in &inbox {
+        state
+            .store
+            .note_delivered(&watcher.id, message.seq)
+            .unwrap();
+    }
     assert_eq!(accepted("second", 9).await, 1);
     assert_eq!(state.store.inbox(&watcher.id, None).unwrap().len(), 3);
     assert_eq!(

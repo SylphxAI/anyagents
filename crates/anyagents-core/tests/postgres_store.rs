@@ -76,7 +76,9 @@ fn postgres_persistent_webhook_wakes_serialize_retries_and_survive_reopen() {
         inbox.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
         ["first payload", "second payload"]
     );
-    first.note_delivered(&agent.id, inbox[1].seq).unwrap();
+    for message in &inbox {
+        first.note_delivered(&agent.id, message.seq).unwrap();
+    }
     drop(first);
     drop(peer);
     let reopened = Store::open_postgres(&url, dir.path()).unwrap();
