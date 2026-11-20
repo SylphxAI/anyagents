@@ -5,7 +5,6 @@ import json
 import os
 import pty
 import select
-import shutil
 import signal
 import socket
 import struct
@@ -34,8 +33,7 @@ def run(harness, artifact, binary, args):
                AGY_CONFIG_DIR=home + '/.gemini/antigravity-cli', CODEX_HOME=home + '/.codex',
                BROWSER='true', NO_BROWSER='1', DISABLE_AUTOUPDATER='1', NO_COLOR='1',
                TERM='xterm' if harness == 'agy' else 'dumb', LANG='C.UTF-8')
-    program = shutil.which(binary, path=env.get('PATH'))
-    if program is None:
+    if not os.path.isabs(binary):
         return 127
     with socket.socket(socket.AF_UNIX) as listener, open('output', 'wb', buffering=0) as log:
         # Relative socket path avoids sockaddr_un length limits on sandbox mounts.
@@ -49,7 +47,7 @@ def run(harness, artifact, binary, args):
                 termios.tcsetattr(0, termios.TCSANOW, settings)
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 160, 0, 0))
                 os.chdir(home)
-                os.execve(program, [binary] + args, env)
+                os.execve(binary, [binary] + args, env)
             finally:
                 os._exit(126)
         deadline = time.monotonic() + 240
