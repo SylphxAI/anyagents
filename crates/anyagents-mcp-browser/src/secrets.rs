@@ -33,7 +33,7 @@ fn res_err(m: impl Into<String>) -> BrowserError {
 
 pub fn parse_secret_ref(raw: &str) -> Result<SecretSource, BrowserError> {
     let s = raw.trim();
-    if s.is_empty() || s.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')) {
+    if s.is_empty() || raw.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')) {
         return Err(BrowserError::invalid_input("invalid `secret_ref`"));
     }
     if let Some(rest) = s.strip_prefix("op://") {
