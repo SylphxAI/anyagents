@@ -51,7 +51,9 @@ pub const DATABASE_URL_POINTER_FILE: &str = "database-url";
 pub const PG_INIT_SQL: &str = include_str!("../migrations_pg/001_init.sql");
 pub const PG_STATELESS_SQL: &str = include_str!("../migrations_pg/002_stateless_coordinator.sql");
 pub const PG_SERVERLESS_TURNS_SQL: &str = include_str!("../migrations_pg/003_serverless_turns.sql");
-pub const PG_LATEST_VERSION: i64 = 3;
+pub const PG_DEPLOYMENT_SECRETS_SQL: &str =
+    include_str!("../migrations_pg/004_deployment_secrets.sql");
+pub const PG_LATEST_VERSION: i64 = 4;
 const PG_MIGRATION_LOCK_KEY: i64 = 0x616e_7961_676e_7473_u64 as i64; // "anyagnts"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,7 +421,11 @@ impl PgHandle {
                     .execute(&mut *conn)
                     .await?;
                 }
-                for (ver, sql) in [(2, PG_STATELESS_SQL), (3, PG_SERVERLESS_TURNS_SQL)] {
+                for &(ver, sql) in &[
+                    (2_i64, PG_STATELESS_SQL),
+                    (3_i64, PG_SERVERLESS_TURNS_SQL),
+                    (4_i64, PG_DEPLOYMENT_SECRETS_SQL),
+                ] {
                     if current < ver {
                         sqlx::raw_sql(sql).execute(&mut *conn).await?;
                         sqlx::query(

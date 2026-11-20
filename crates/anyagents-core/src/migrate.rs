@@ -77,6 +77,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (36, include_str!("../migrations/037_turn_events.sql")),
     (37, include_str!("../migrations/038_task_turn_sends.sql")),
+    (38, include_str!("../migrations/039_deployment_secrets.sql")),
 ];
 
 /// The version that moves the mailbox search index out of the state

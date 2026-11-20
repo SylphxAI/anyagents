@@ -321,25 +321,15 @@
   }
 
   function loadActiveTab() {
-    switch (state.activeTab) {
-      case "fleet":
-        loadFleet();
-        break;
-      case "profiles":
-        loadProfiles(false);
-        break;
-      case "telemetry":
-        loadTelemetry();
-        break;
-      case "automations":
-        loadAutomations();
-        break;
-      case "channels":
-        loadChannelsAndGroups();
-        break;
-      default:
-        break;
-    }
+    const loaders = {
+      fleet: loadFleet,
+      profiles: () => loadProfiles(false),
+      telemetry: loadTelemetry,
+      automations: loadAutomations,
+      channels: loadChannelsAndGroups,
+    };
+    if (loaders[state.activeTab]) loaders[state.activeTab]();
+    window.dispatchEvent(new CustomEvent("anyagents:tab", { detail: state.activeTab }));
   }
 
   // ---------- Tab 1: Fleet Tree & Inspector ----------
@@ -606,6 +596,7 @@
         )
       );
     }
+    window.dispatchEvent(new CustomEvent("anyagents:agent", { detail: agent }));
   }
 
   async function loadConversation(agentName) {
@@ -1644,6 +1635,7 @@
     });
     $("logout-btn").addEventListener("click", doLogout);
 
+    window.AnyAgentsAdmin = { api, el, clearNode, pill, toast, fmtTime, state, switchTab, loadFleet };
     checkAuth();
   }
 

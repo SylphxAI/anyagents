@@ -2310,20 +2310,17 @@ fn run_provider_sandbox<R: BufRead + Send + 'static>(
         .unwrap_or(default_remote_program(harness));
 
     if oneshot {
-        let argv = if extra_args.is_empty() {
-            vec![program.to_string()]
-        } else {
-            let mut v = vec![program.to_string()];
-            v.extend(extra_args.iter().cloned());
-            v
-        };
-        let req = ExecRequest::argv(argv)
-            .with_cwd(&handle.workdir)
-            .with_env("HOME", &handle.state_dir)
-            .with_env("ANYAGENTS_GUEST_STATE_DIR", &handle.state_dir)
-            .with_env("ANYAGENTS_GUEST_WORKDIR", &handle.workdir)
-            .with_timeout_ms(300_000);
-        let out = block_on_provider(provider.exec(&handle, &req)).map_err(Error::Message)?;
+        let mut argv = vec![program.to_string()];
+        argv.extend(extra_args.iter().cloned());
+        let (req, secret_values) = crate::server::secrets::prepare_sandbox_exec_request(
+            ExecRequest::argv(argv),
+            &handle,
+            store,
+            agent_id_str,
+        )
+        .map_err(Error::Message)?;
+        let mut out = block_on_provider(provider.exec(&handle, &req)).map_err(Error::Message)?;
+        crate::server::secrets::mask_exec_output(&mut out, &secret_values);
         if !out.stdout.is_empty() {
             let mut guard = out_writer.lock().unwrap_or_else(|e| e.into_inner());
             write!(guard, "{}", out.stdout)?;
@@ -2383,14 +2380,16 @@ fn run_provider_sandbox<R: BufRead + Send + 'static>(
             &prompt_text,
             extra_args,
         );
-        let req = ExecRequest::shell(cmd_str)
-            .with_cwd(&handle.workdir)
-            .with_env("HOME", &handle.state_dir)
-            .with_env("ANYAGENTS_GUEST_STATE_DIR", &handle.state_dir)
-            .with_env("ANYAGENTS_GUEST_WORKDIR", &handle.workdir)
-            .with_timeout_ms(300_000);
+        let (req, secret_values) = crate::server::secrets::prepare_sandbox_exec_request(
+            ExecRequest::shell(cmd_str),
+            &handle,
+            store,
+            agent_id_str,
+        )
+        .map_err(Error::Message)?;
         match block_on_provider(provider.exec(&handle, &req)) {
-            Ok(out) => {
+            Ok(mut out) => {
+                crate::server::secrets::mask_exec_output(&mut out, &secret_values);
                 let outcome = parse_remote_exec_output(
                     harness,
                     session_id.as_deref(),

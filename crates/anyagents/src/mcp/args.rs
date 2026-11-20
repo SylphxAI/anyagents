@@ -338,6 +338,11 @@ pub(super) struct AgentsArgs {
     /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
     #[serde(default)]
     pub(super) group_by: Option<String>,
+    /// Optional list of named deployment secret bundles to grant when `action` is
+    /// `"spawn"`, `"create"`, `"update"`, or `"secrets"`. Defaults to `[]` on
+    /// create/spawn. Non-admin parents may only grant secrets they themselves hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -404,6 +409,10 @@ pub(super) struct SpawnArgs {
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
     pub(super) prompt: Option<String>,
+    /// Optional list of named deployment secret bundles to grant to the spawned agent.
+    /// Defaults to `[]` when omitted. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -545,6 +554,10 @@ pub(super) struct SubagentsArgs {
     /// For `list`: include all causal descendants of `parent` (children, grandchildren, ...; alias `subtree`).
     #[serde(default, alias = "subtree")]
     pub(super) include_descendants: Option<bool>,
+    /// Optional list of named deployment secret bundles when `action` is `"spawn"`,
+    /// `"update"`, or `"secrets"`. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

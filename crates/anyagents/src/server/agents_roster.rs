@@ -131,6 +131,7 @@ impl<'a> RosterCaller<'a> {
             || (self.caller.is_admin && self.caller.parent_id.is_none());
         if !reads_private {
             view.instructions = None;
+            view.secrets.clear();
         }
     }
 }
@@ -378,9 +379,10 @@ pub(crate) fn roster_views(
             .or_default()
             .push(unsettled_view(&held));
     }
+    let mut secrets_by_agent = store.all_agent_secret_grants().unwrap_or_default();
     let mut agents = Vec::with_capacity(selected_agents.len());
     for agent in selected_agents {
-        let view = agent_view_preloaded(
+        let mut view = agent_view_preloaded(
             store,
             health,
             agent,
@@ -388,6 +390,9 @@ pub(crate) fn roster_views(
             &seats,
             Some(&unsettled_by_agent),
         )?;
+        view.secrets = secrets_by_agent
+            .remove(agent.id.as_str())
+            .unwrap_or_default();
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -576,6 +581,7 @@ pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
         schedules: Vec::new(),
         turn_errors: None,
         unsettled_outbound: Vec::new(),
+        secrets: Vec::new(),
         retry_at_ms: None,
     }
 }
@@ -627,6 +633,7 @@ fn agent_view_preloaded(
             view.instructions = None;
         } else {
             view.aliases = store.agent_aliases(&agent.id).unwrap_or_default();
+            view.secrets = store.list_agent_secrets(&agent.id).unwrap_or_default();
             view.instructions =
                 create::effective_agent_instructions(Some(store), store.data_dir(), agent);
         }
@@ -896,6 +903,11 @@ fn agent_view_preloaded(
                 .filter(|held| held.agent_id == agent.id)
                 .map(unsettled_view)
                 .collect(),
+        },
+        secrets: if metadata.is_none() {
+            store.list_agent_secrets(&agent.id).unwrap_or_default()
+        } else {
+            Vec::new()
         },
         retry_at_ms,
     })

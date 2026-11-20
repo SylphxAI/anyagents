@@ -1021,3 +1021,33 @@ tr:last-child td {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+/* Secrets (Write-Only) */
+.secret-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.secret-writeonly {
+  -webkit-text-security: disc;
+  font-family: var(--font-mono);
+}
+
+.secret-grant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.secret-grant-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
