@@ -1195,7 +1195,7 @@ fn download_inbound_media(
             continue;
         };
         let url = format!("{}/file/bot{token}/{remote_path}", api_base());
-        if let Some(line) = crate::server::s3_media_profiles::download_and_persist_telegram_media(
+        if let Some(line) = anyagents_core::s3_media::download_and_persist_telegram_media(
             store,
             agent_id,
             &att.kind,

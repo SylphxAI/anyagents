@@ -24,6 +24,7 @@ mod migrate;
 pub mod quote;
 pub mod raw_segment;
 pub mod redaction;
+pub mod s3_media;
 pub mod s3_store;
 mod secret;
 pub mod stateless;
