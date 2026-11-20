@@ -886,7 +886,7 @@ mod spawn_args_tests {
                 let path = line.split_whitespace().nth(1).unwrap();
                 let body = if path.contains("/conversation") {
                     &conv_body
-                } else if path.starts_with("/v1/agents/") {
+                } else if path.contains("/v1/agents/") {
                     &single_agent_body
                 } else {
                     &agents_body
