@@ -29,6 +29,12 @@
     return results;
   }
 
+  function quotaLevel(leftPct) {
+    if (leftPct <= 15) return "crit";
+    if (leftPct <= 35) return "warn";
+    return "healthy";
+  }
+
   async function loadProfiles(fresh) {
     const ui = bridge();
     const grid = $("profiles-grid");
@@ -47,13 +53,60 @@
     }
   }
 
+  function renderProfilesSummary(ui, list) {
+    const summaryEl = $("profiles-summary");
+    if (!summaryEl) return;
+    ui.clearNode(summaryEl);
+    if (list.length === 0) {
+      summaryEl.classList.add("hidden");
+      return;
+    }
+    summaryEl.classList.remove("hidden");
+
+    let subs = 0;
+    let healthy = 0;
+    let constrained = 0;
+    for (const p of list) {
+      if (p.kind === "subscription") subs += 1;
+      const segs = parseQuotaSegments(p.usage);
+      if (segs.length === 0) {
+        healthy += 1;
+      } else {
+        const minLeft = Math.min(...segs.map((s) => s.leftPct));
+        if (minLeft <= 35) constrained += 1;
+        else healthy += 1;
+      }
+    }
+
+    const kpis = [
+      ["Configured Profiles", String(list.length), `${subs} subscription · ${list.length - subs} api key`],
+      ["Healthy Pool", String(healthy), "> 35% remaining quota"],
+      ["Constrained / Low", String(constrained), "<= 35% remaining quota"],
+    ];
+    for (const [label, value, sub] of kpis) {
+      summaryEl.appendChild(
+        ui.el(
+          "div",
+          { class: "kpi-card" },
+          ui.el("div", { class: "kpi-label", text: label }),
+          ui.el("div", { class: "kpi-value mono tabular", text: value }),
+          ui.el("div", { class: "kpi-sub", text: sub })
+        )
+      );
+    }
+  }
+
   function renderProfiles() {
     const ui = bridge();
     const grid = $("profiles-grid");
     if (!ui || !grid) return;
     ui.clearNode(grid);
-    if (profilesState.profiles.length === 0) {
-      $("profiles-age").textContent = "";
+
+    const list = profilesState.profiles;
+    renderProfilesSummary(ui, list);
+
+    if (list.length === 0) {
+      $("profiles-age").textContent = "0 profiles";
       grid.appendChild(
         ui.el("div", {
           class: "empty-state",
@@ -63,41 +116,49 @@
       return;
     }
 
-    const firstAge = profilesState.profiles[0].usage_age_ms;
+    const firstAge = list[0].usage_age_ms;
     $("profiles-age").textContent =
       firstAge !== undefined && firstAge !== null
-        ? `snapshot age: ${ui.fmtRelativeMs(firstAge)}`
-        : "";
+        ? `snapshot ${ui.fmtRelativeMs(firstAge)} ago`
+        : `${list.length} profile${list.length === 1 ? "" : "s"}`;
 
-    for (const p of profilesState.profiles) {
+    for (const p of list) {
       const card = ui.el("article", { class: "profile-card" });
+      const segments = parseQuotaSegments(p.usage);
+      const minLeft = segments.length > 0 ? Math.min(...segments.map((s) => s.leftPct)) : null;
+      const healthTone =
+        minLeft === null ? "muted" : minLeft <= 15 ? "danger" : minLeft <= 35 ? "warning" : "success";
+      const healthLabel =
+        minLeft === null ? "metered" : minLeft <= 15 ? "exhausted" : minLeft <= 35 ? "low" : "healthy";
+
       card.appendChild(
         ui.el(
           "div",
           { class: "profile-card-head" },
           ui.el(
             "div",
-            {},
-            ui.el("div", { class: "profile-title mono", text: `${p.provider}/${p.profile}` }),
+            { class: "profile-head-meta" },
+            ui.el("div", { class: "profile-title mono", title: `${p.provider}/${p.profile}`, text: `${p.provider}/${p.profile}` }),
             ui.el("div", {
               class: "muted text-sm",
-              text: p.account ? `Account: ${p.account}` : "No account label",
+              text: p.account ? p.account : "No account label",
             })
           ),
           ui.el(
             "div",
             { class: "badge-row" },
-            ui.pill(p.kind || "unknown", p.kind === "subscription" ? "purple" : "accent")
+            ui.pill(p.kind || "unknown", p.kind === "subscription" ? "sky" : "muted"),
+            ui.pill(healthLabel, healthTone)
           )
         )
       );
 
-      const segments = parseQuotaSegments(p.usage);
       if (segments.length > 0) {
         const bars = ui.el("div", { class: "quota-bars" });
         for (const seg of segments) {
-          const toneClass = seg.leftPct <= 15 ? "crit" : seg.leftPct <= 35 ? "warn" : "";
-          const fill = ui.el("div", { class: `quota-fill ${toneClass}` });
+          const level = quotaLevel(seg.leftPct);
+          const fillClass = level === "healthy" ? "quota-fill" : `quota-fill ${level}`;
+          const fill = ui.el("div", { class: fillClass });
           fill.style.width = `${seg.leftPct}%`;
           bars.appendChild(
             ui.el(
@@ -106,33 +167,44 @@
               ui.el(
                 "div",
                 { class: "quota-row-head mono" },
-                ui.el("span", { text: `${seg.label}: ${seg.leftPct}% left` }),
-                ui.el("span", { class: "muted", text: seg.detail || "" })
+                ui.el(
+                  "span",
+                  {},
+                  ui.el("span", { class: "muted", text: `${seg.label} ` }),
+                  ui.el("span", { class: `quota-pct ${level}`, text: `${seg.leftPct}% left` })
+                ),
+                seg.detail ? ui.el("span", { class: "muted tabular", text: seg.detail }) : null
               ),
               ui.el("div", { class: "quota-track" }, fill)
             )
           );
         }
         card.appendChild(bars);
-      }
-
-      if (p.usage) {
+      } else if (p.usage) {
         card.appendChild(ui.el("div", { class: "text-sm mono muted", text: p.usage }));
       }
 
+      const harnesses = [...(p.compatible_harnesses || [])].sort((a, b) => a.localeCompare(b));
+      const harnessChips =
+        harnesses.length > 0
+          ? ui.el(
+              "div",
+              { class: "badge-row" },
+              ...harnesses.map((h) => ui.el("span", { class: "spec-chip", text: h }))
+            )
+          : ui.el("span", { class: "muted text-sm", text: "No harness bindings" });
+
       const assigned =
-        p.assigned_agents && p.assigned_agents.length > 0
-          ? p.assigned_agents.join(", ")
-          : "unassigned";
-      const harnesses = (p.compatible_harnesses || []).join(", ") || "-";
+        p.assigned_agents && p.assigned_agents.length > 0 ? p.assigned_agents.join(", ") : "unassigned";
 
       card.appendChild(
         ui.el(
           "div",
-          { class: "text-sm muted" },
-          ui.el("div", { text: `Harnesses: ${harnesses}` }),
+          { class: "profile-footer" },
+          harnessChips,
           ui.el("div", {
-            text: `Assigned roots: ${assigned} • Subagents: ${p.subagent_count || 0}`,
+            class: "text-sm muted tabular",
+            text: `Assigned roots: ${assigned} · Subagents: ${p.subagent_count || 0}`,
           })
         )
       );
@@ -339,14 +411,7 @@
                     class: "btn btn-secondary btn-sm",
                     type: "button",
                     text: "Copy Code",
-                    onClick: async () => {
-                      try {
-                        await navigator.clipboard.writeText(codeVal);
-                        ui.toast("Copied device code", "success");
-                      } catch {
-                        ui.toast("Copy manually from the highlighted box", "error");
-                      }
-                    },
+                    onClick: () => ui.copyText(codeVal, "device code"),
                   })
                 )
               );
@@ -375,9 +440,7 @@
               handleLine(line);
             }
           }
-          if (buffer.trim()) {
-            handleLine(buffer);
-          }
+          if (buffer.trim()) handleLine(buffer);
         } catch (err) {
           if (err.name !== "AbortError") {
             statusEl.textContent = `Sign-in failed: ${err.message}`;
@@ -391,15 +454,11 @@
     }
 
     window.addEventListener("anyagents:tab", (evt) => {
-      if (evt.detail === "profiles") {
-        loadProfiles(false);
-      }
+      if (evt.detail === "profiles") loadProfiles(false);
     });
 
     window.addEventListener("anyagents:modal-close", (evt) => {
-      if (evt.detail === "modal-profile") {
-        cancelNativeSignIn();
-      }
+      if (evt.detail === "modal-profile") cancelNativeSignIn();
     });
   }
 

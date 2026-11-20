@@ -63,14 +63,14 @@
     if (!ui || !wrap) return;
     const list = secretsState.secrets;
     if (count) {
-      count.textContent = `${list.length} secret bundle(s)`;
+      count.textContent = `${list.length} bundle${list.length === 1 ? "" : "s"}`;
     }
     ui.clearNode(wrap);
     if (list.length === 0) {
       wrap.appendChild(
         ui.el("div", {
           class: "empty-state",
-          text: "No encrypted deployment secrets configured yet. Use the write-only form below to add one.",
+          text: "No encrypted deployment secrets configured yet. Use the write-only form below to seal a bundle.",
         })
       );
       return;
@@ -83,7 +83,7 @@
         const keyPills = ui.el(
           "div",
           { class: "badge-row" },
-          ...(sec.env_keys || []).map((k) => ui.pill(k, "accent"))
+          ...(sec.env_keys || []).map((k) => ui.el("span", { class: "spec-chip", text: k }))
         );
         const grantedNames =
           sec.granted_agents && sec.granted_agents.length > 0
@@ -124,7 +124,7 @@
           {},
           ui.el("td", { class: "mono", text: sec.name }),
           ui.el("td", {}, keyPills),
-          ui.el("td", { class: "mono text-sm", text: ui.fmtTime(sec.updated_at_ms) }),
+          ui.el("td", { class: "mono text-sm tabular", text: ui.fmtTime(sec.updated_at_ms) }),
           ui.el("td", {}, grantedEl),
           ui.el("td", {}, ui.el("div", { class: "toolbar-group" }, rotateBtn, delBtn))
         );
@@ -155,11 +155,7 @@
   async function deleteSecret(name) {
     const ui = bridge();
     if (!ui) return;
-    if (
-      !window.confirm(
-        `Delete secret "${name}"? This also revokes it from all granted agents.`
-      )
-    ) {
+    if (!window.confirm(`Delete secret "${name}"? This also revokes it from all granted agents.`)) {
       return;
     }
     try {
@@ -204,9 +200,7 @@
       return;
     }
     try {
-      const resp = await ui.api(
-        `/v1/agents/${encodeURIComponent(agentName)}/secrets`
-      );
+      const resp = await ui.api(`/v1/agents/${encodeURIComponent(agentName)}/secrets`);
       secretsState.selectedGrantSecrets = new Set((resp && resp.secrets) || []);
     } catch (err) {
       secretsState.selectedGrantSecrets = new Set();
@@ -221,17 +215,12 @@
     if (!ui || !wrap) return;
     ui.clearNode(wrap);
     if (!secretsState.selectedGrantAgent) {
-      wrap.appendChild(
-        ui.el("div", { class: "muted text-sm", text: "Select an agent to edit grants." })
-      );
+      wrap.appendChild(ui.el("div", { class: "muted text-sm", text: "Select an agent to edit grants." }));
       return;
     }
     if (secretsState.secrets.length === 0) {
       wrap.appendChild(
-        ui.el("div", {
-          class: "muted text-sm",
-          text: "Create at least one deployment secret first.",
-        })
+        ui.el("div", { class: "muted text-sm", text: "Create at least one deployment secret first." })
       );
       return;
     }
@@ -242,11 +231,8 @@
         value: sec.name,
         checked,
         onChange: (evt) => {
-          if (evt.target.checked) {
-            secretsState.selectedGrantSecrets.add(sec.name);
-          } else {
-            secretsState.selectedGrantSecrets.delete(sec.name);
-          }
+          if (evt.target.checked) secretsState.selectedGrantSecrets.add(sec.name);
+          else secretsState.selectedGrantSecrets.delete(sec.name);
         },
       });
       const label = ui.el(
@@ -254,10 +240,7 @@
         { class: "checkbox-label secret-grant-item" },
         cb,
         ui.el("span", { class: "mono", text: sec.name }),
-        ui.el("span", {
-          class: "muted text-sm",
-          text: `(${(sec.env_keys || []).join(", ")})`,
-        })
+        ui.el("span", { class: "muted text-sm", text: `(${(sec.env_keys || []).join(", ")})` })
       );
       wrap.appendChild(label);
     }
@@ -270,25 +253,17 @@
     ui.clearNode(container);
     const grants = (agent && agent.secrets) || [];
     if (grants.length === 0) {
-      container.appendChild(
-        ui.el("span", { class: "muted text-sm", text: "No secrets granted." })
-      );
+      container.appendChild(ui.el("span", { class: "muted text-sm", text: "No secrets granted." }));
     } else {
-      for (const name of grants) {
-        container.appendChild(ui.pill(name, "accent"));
-      }
+      for (const name of grants) container.appendChild(ui.pill(name, "sky"));
     }
     const editBtn = $("btn-manage-agent-secrets");
-    if (editBtn && agent) {
-      editBtn.dataset.agentName = agent.name;
-    }
+    if (editBtn && agent) editBtn.dataset.agentName = agent.name;
   }
 
   function initSecretsUI() {
     const refreshBtn = $("secrets-refresh-btn");
-    if (refreshBtn) {
-      refreshBtn.addEventListener("click", loadSecretsTab);
-    }
+    if (refreshBtn) refreshBtn.addEventListener("click", loadSecretsTab);
 
     const maskToggle = $("secret-mask-toggle");
     const envTextarea = $("secret-env-lines");
@@ -311,9 +286,7 @@
         let env;
         try {
           if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name)) {
-            throw new Error(
-              "Secret name must match ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
-            );
+            throw new Error("Secret name must match ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$");
           }
           env = parseKeyValueLines(rawLines);
         } catch (err) {
@@ -321,17 +294,10 @@
           return;
         }
         // Write-only: clear plaintext input immediately before awaiting network response.
-        if (linesInput) {
-          linesInput.value = "";
-        }
+        if (linesInput) linesInput.value = "";
         try {
-          await ui.api(`/v1/secrets/${encodeURIComponent(name)}`, {
-            method: "PUT",
-            body: { env },
-          });
-          if (nameInput) {
-            nameInput.value = "";
-          }
+          await ui.api(`/v1/secrets/${encodeURIComponent(name)}`, { method: "PUT", body: { env } });
+          if (nameInput) nameInput.value = "";
           ui.toast(`Encrypted & saved secret "${name}"`, "success");
           await loadSecretsTab();
         } catch (err) {
@@ -375,17 +341,13 @@
         const ui = bridge();
         if (!ui) return;
         const target = manageBtn.dataset.agentName || "";
-        if (target) {
-          secretsState.selectedGrantAgent = target;
-        }
+        if (target) secretsState.selectedGrantAgent = target;
         ui.switchTab("secrets");
       });
     }
 
     window.addEventListener("anyagents:tab", (evt) => {
-      if (evt.detail === "secrets") {
-        loadSecretsTab();
-      }
+      if (evt.detail === "secrets") loadSecretsTab();
     });
 
     window.addEventListener("anyagents:agent", (evt) => {
