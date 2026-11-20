@@ -1,10 +1,7 @@
 //! Interactive message actions and agent, group, operator, and Telegram delivery.
 
-use std::sync::Arc;
-
 use anyagents_core::{Address, Agent, Incoming, ReceiveOutcome, Store};
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 
 use crate::api::{Delivery, InteractRequest, InteractResponse, SendRequest};
@@ -12,32 +9,14 @@ use crate::auth::Principal;
 
 use super::agents_lifecycle::is_explicitly_archived;
 use super::messaging::{Actor, SendPlan, can_actor_message_agent, own_message};
-use super::types::{ApiError, AppState, resolve_remote_sandbox_workdir, spawn_store};
+use super::types::{ApiError, resolve_remote_sandbox_workdir};
 
-pub(super) async fn interact_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<InteractRequest>,
-) -> Result<Json<InteractResponse>, ApiError> {
-    let actor_name = match &principal {
-        Principal::Agent { name, .. } => name.clone(),
-        Principal::Operator => {
-            let sender = body.sender.as_deref().ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "an operator interact call needs an explicit sender",
-                )
-            })?;
-            sender
-                .trim()
-                .strip_prefix("agent:")
-                .unwrap_or(sender.trim())
-                .to_string()
-        }
-    };
-    let store = Arc::clone(&state.store);
-    spawn_store(move || interact_sync(&store, &principal, &actor_name, body)).await
-}
+#[path = "messaging_delivery/chat_admin.rs"]
+mod chat_admin;
+
+#[path = "messaging_delivery/interact_route.rs"]
+mod interact_route;
+pub(super) use interact_route::interact_route;
 
 fn interact_sync(
     store: &Store,
@@ -46,6 +25,9 @@ fn interact_sync(
     body: InteractRequest,
 ) -> Result<Json<InteractResponse>, ApiError> {
     let action = body.action.trim().to_ascii_lowercase();
+    if crate::api::is_telegram_chat_admin_action(&action) {
+        return chat_admin::apply(store, principal, action, body).map(Json);
+    }
     let raw_target = body.target.trim();
     if raw_target.is_empty() {
         return Err(ApiError::new(
@@ -54,9 +36,7 @@ fn interact_sync(
         ));
     }
     let actor = Actor::Agent(actor_name.to_string());
-    let bot = body.bot.clone();
-    let bot = bot.as_deref();
-    // Resolve target into optional (chat_id, message_id, thread_id, stored_message).
+    let bot = body.bot.as_deref();
     let mut tg_coords: Option<(i64, i64, Option<i64>)> = None;
     let mut stored_msg: Option<anyagents_core::Message> = None;
     if let Some(msg_id_str) = raw_target
@@ -369,7 +349,7 @@ fn interact_sync(
         other => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(
-                "unsupported interact action `{other}`; expected react, vote, check, uncheck, edit, delete, pin, unpin, or stop_poll"
+                "unsupported interact action `{other}`; expected react, vote, check, uncheck, edit, delete, pin, unpin, stop_poll, set_chat_title, set_chat_description, or set_chat_photo"
             ),
         )),
     }

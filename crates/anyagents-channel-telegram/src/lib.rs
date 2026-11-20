@@ -11,6 +11,11 @@
 //! The token never leaves the caller. This crate only sees update payloads and
 //! the calls the server should make.
 
+mod chat;
+pub use chat::{
+    pin_chat_message, set_chat_description, set_chat_title, stop_poll, unpin_chat_message,
+};
+
 use anyagents_core::{Quote, QuoteRef};
 use serde::{Deserialize, Serialize};
 
@@ -1908,47 +1913,6 @@ fn extract_rich_message_mentions(val: &serde_json::Value, out: &mut Vec<String>)
 pub fn delete_message(chat_id: i64, message_id: i64) -> BotCall {
     BotCall {
         method: "deleteMessage".to_string(),
-        body: serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-        }),
-    }
-}
-
-/// `pinChatMessage` to pin a message in a chat.
-pub fn pin_chat_message(
-    chat_id: i64,
-    message_id: i64,
-    disable_notification: Option<bool>,
-) -> BotCall {
-    let mut body = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-    });
-    if let Some(silent) = disable_notification {
-        body["disable_notification"] = serde_json::json!(silent);
-    }
-    BotCall {
-        method: "pinChatMessage".to_string(),
-        body,
-    }
-}
-
-/// `unpinChatMessage` to unpin a message in a chat.
-pub fn unpin_chat_message(chat_id: i64, message_id: i64) -> BotCall {
-    BotCall {
-        method: "unpinChatMessage".to_string(),
-        body: serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-        }),
-    }
-}
-
-/// `stopPoll` to close an active poll message.
-pub fn stop_poll(chat_id: i64, message_id: i64) -> BotCall {
-    BotCall {
-        method: "stopPoll".to_string(),
         body: serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
