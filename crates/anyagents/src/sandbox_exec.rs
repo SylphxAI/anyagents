@@ -1901,17 +1901,10 @@ pub(crate) fn filter_sandbox_launch_env(raw: &[(String, String)]) -> Vec<(String
         if matches!(
             upper.as_str(),
             "HOME"
-                | "ANYAGENTS_OPERATOR_TOKEN"
-                | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                 | "ANYAGENTS_DATABASE_URL"
                 | "ANYAGENTS_DIRECT_DATABASE_URL"
                 | "ANYAGENTS_MASTER_KEY"
                 | "ANYAGENTS_CAPABILITY_KEY"
-                | "ANYAGENTS_TICK_TOKEN"
-                | "ANYAGENTS_TICK_AUD"
-                | "ANYAGENTS_TICK_ISS"
-                | "ANYAGENTS_TICK_JWKS_URL"
-                | "ANYAGENTS_TICK_SIGNATURE_HEADER"
                 | "ANYAGENTS_SANDBOX_TOKEN"
                 | "ANYAGENTS_SYLPHX_TOKEN"
                 | "ANYAGENTS_CLOUD_WEBHOOK_SECRET"
@@ -1924,6 +1917,7 @@ pub(crate) fn filter_sandbox_launch_env(raw: &[(String, String)]) -> Vec<(String
                 | "ANYAGENTS_GATEWAY_TOKEN"
         ) || upper.starts_with("ANYAGENTS_OPERATOR_")
             || upper.starts_with("ANYAGENTS_TICK_")
+            || upper.starts_with("ANYAGENTS_S3_")
         {
             continue;
         }

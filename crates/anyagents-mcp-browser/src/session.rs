@@ -13,6 +13,10 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::chromium::{discover_chromium, is_headless_shell_binary};
 use crate::config::BrowserServerConfig;
+use crate::profile_sync::{
+    RemoteProfileSync, resolve_sync_config, sync_down_profile, sync_up_profile,
+    validate_profile_name,
+};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
@@ -87,7 +91,19 @@ pub struct BrowserInstance {
     pub ws_endpoint: String,
     pub web: Web,
     pub persistent_profile: bool,
+    pub active_profile: Option<String>,
+    pub user_data_dir: PathBuf,
+    pub remote_sync: Option<RemoteProfileSync>,
     _ephemeral_dir: Option<tempfile::TempDir>,
+}
+
+/// Result of closing a live browser session, including remote profile sync status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseSessionOutcome {
+    pub was_running: bool,
+    pub profile_preserved: bool,
+    pub profile_synced: bool,
+    pub sync_error: Option<String>,
 }
 
 /// Exclusive lease over a live Chromium CDP controller.
@@ -130,34 +146,80 @@ impl BrowserSession {
     /// Acquire exclusive access to the live `Web` CDP client, launching Chromium
     /// lazily if not yet running (or if the previous process exited).
     pub async fn acquire(&self) -> Result<LiveWebGuard<'_>, BrowserError> {
+        self.acquire_with_profile(None).await
+    }
+
+    /// Acquire exclusive access to a live Chromium session, optionally selecting
+    /// a named persistent browser profile synced via the AnyAgents coordinator.
+    ///
+    /// If a live session is running under a different named profile, it is closed
+    /// and synced up first before syncing down and launching the requested profile.
+    pub async fn acquire_with_profile(
+        &self,
+        requested_profile: Option<&str>,
+    ) -> Result<LiveWebGuard<'_>, BrowserError> {
+        let normalized_req = requested_profile
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(validate_profile_name)
+            .transpose()
+            .map_err(BrowserError::invalid_input)?;
+
         let mut guard = self.inner.lock().await;
         let alive = guard
             .as_mut()
             .is_some_and(|inst| matches!(inst.child.try_wait(), Ok(None)));
-        if !alive {
-            if let Some(mut dead) = guard.take() {
-                let _ = dead.child.kill().await;
+        let profile_mismatch = alive
+            && normalized_req.is_some()
+            && guard
+                .as_ref()
+                .and_then(|inst| inst.active_profile.as_deref())
+                != normalized_req.as_deref();
+
+        if !alive || profile_mismatch {
+            if let Some(mut old) = guard.take() {
+                drop(guard);
+                finalize_instance(&mut old).await;
+                guard = self.inner.lock().await;
             }
-            let launched = launch_instance(&self.config).await?;
+            let launched = launch_instance(&self.config, normalized_req.as_deref()).await?;
             *guard = Some(launched);
         }
         Ok(LiveWebGuard { guard })
+    }
+
+    /// Gracefully stop the running Chromium instance, flushing profile data to
+    /// disk and syncing any active named profile archive back to the coordinator.
+    pub async fn close_with_sync(&self) -> CloseSessionOutcome {
+        let persistent_configured =
+            self.config.profile_dir.is_some() || self.config.profile.is_some();
+        let taken = {
+            let mut guard = self.inner.lock().await;
+            guard.take()
+        };
+        let Some(mut inst) = taken else {
+            return CloseSessionOutcome {
+                was_running: false,
+                profile_preserved: persistent_configured,
+                profile_synced: false,
+                sync_error: None,
+            };
+        };
+        let (profile_synced, sync_error) = finalize_instance(&mut inst).await;
+        CloseSessionOutcome {
+            was_running: true,
+            profile_preserved: inst.persistent_profile,
+            profile_synced,
+            sync_error,
+        }
     }
 
     /// Gracefully stop the running Chromium instance, flushing profile data to disk.
     ///
     /// Returns `(was_running, profile_preserved)`.
     pub async fn close(&self) -> (bool, bool) {
-        let persistent_configured = self.config.profile_dir.is_some();
-        let taken = {
-            let mut guard = self.inner.lock().await;
-            guard.take()
-        };
-        let Some(mut inst) = taken else {
-            return (false, persistent_configured);
-        };
-        shutdown_instance(&mut inst).await;
-        (true, inst.persistent_profile)
+        let outcome = self.close_with_sync().await;
+        (outcome.was_running, outcome.profile_preserved)
     }
 }
 
@@ -276,7 +338,25 @@ pub fn parse_devtools_stderr_url(log_text: &str) -> Option<(u16, String)> {
     None
 }
 
-async fn launch_instance(config: &BrowserServerConfig) -> Result<BrowserInstance, BrowserError> {
+async fn launch_instance(
+    config: &BrowserServerConfig,
+    requested_profile: Option<&str>,
+) -> Result<BrowserInstance, BrowserError> {
+    let remote_sync = resolve_sync_config(config, requested_profile)?;
+    let active_profile = remote_sync
+        .as_ref()
+        .map(|s| s.profile_name.clone())
+        .or_else(|| {
+            requested_profile
+                .or(config.profile.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    if let Some(ref name) = active_profile {
+        validate_profile_name(name).map_err(BrowserError::invalid_input)?;
+    }
+
     let binary = discover_chromium(config.chromium_bin.as_deref())
         .map_err(BrowserError::browser_not_found)?;
 
@@ -284,9 +364,10 @@ async fn launch_instance(config: &BrowserServerConfig) -> Result<BrowserInstance
         PathBuf,
         bool,
         Option<tempfile::TempDir>,
-    ) = match &config.profile_dir {
-        Some(dir) => (dir.join("user-data"), true, None),
-        None => {
+    ) = match (&config.profile_dir, &active_profile) {
+        (Some(dir), Some(name)) => (dir.join(name).join("user-data"), true, None),
+        (Some(dir), None) => (dir.join("user-data"), true, None),
+        (None, _) => {
             let tmp = tempfile::Builder::new()
                 .prefix("anyagents-mcp-browser-")
                 .tempdir()
@@ -297,9 +378,22 @@ async fn launch_instance(config: &BrowserServerConfig) -> Result<BrowserInstance
                     )
                 })?;
             let ud = tmp.path().join("user-data");
-            (ud, false, Some(tmp))
+            (ud, remote_sync.is_some(), Some(tmp))
         }
     };
+
+    if let Some(ref sync) = remote_sync {
+        let sync_c = sync.clone();
+        let ud_c = user_data_dir.clone();
+        tokio::task::spawn_blocking(move || sync_down_profile(&sync_c, &ud_c))
+            .await
+            .map_err(|e| {
+                BrowserError::new(
+                    "PROFILE_SYNC_ERROR",
+                    format!("profile sync-down task failed: {e}"),
+                )
+            })??;
+    }
 
     std::fs::create_dir_all(&user_data_dir).map_err(|e| {
         BrowserError::new(
@@ -369,8 +463,31 @@ async fn launch_instance(config: &BrowserServerConfig) -> Result<BrowserInstance
         ws_endpoint,
         web,
         persistent_profile,
+        active_profile,
+        user_data_dir,
+        remote_sync,
         _ephemeral_dir: ephemeral_dir,
     })
+}
+
+async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
+    shutdown_instance(inst).await;
+    let Some(sync) = inst.remote_sync.take() else {
+        return (false, None);
+    };
+    let ud = inst.user_data_dir.clone();
+    match tokio::task::spawn_blocking(move || sync_up_profile(&sync, &ud)).await {
+        Ok(Ok(_)) => (true, None),
+        Ok(Err(err)) => {
+            eprintln!("anyagents-mcp-browser profile sync-up failed: {err}");
+            (false, Some(err.to_string()))
+        }
+        Err(err) => {
+            let msg = format!("profile sync-up task failed: {err}");
+            eprintln!("anyagents-mcp-browser {msg}");
+            (false, Some(msg))
+        }
+    }
 }
 
 async fn wait_for_devtools(

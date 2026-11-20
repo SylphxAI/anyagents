@@ -958,15 +958,21 @@ fn ingest_updates(
                 continue;
             }
             if !inbound.media.is_empty() {
-                let downloaded = download_inbound_media(store, token, &channel.id, &inbound.media);
+                let downloaded =
+                    download_inbound_media(store, token, &channel.id, agent_id, &inbound.media);
                 if !downloaded.is_empty() {
                     inbound.text.push('\n');
                     inbound.text.push_str(&downloaded.join("\n"));
                 }
             }
             if !inbound.quoted_media.is_empty() {
-                let downloaded =
-                    download_inbound_media(store, token, &channel.id, &inbound.quoted_media);
+                let downloaded = download_inbound_media(
+                    store,
+                    token,
+                    &channel.id,
+                    agent_id,
+                    &inbound.quoted_media,
+                );
                 if !downloaded.is_empty()
                     && let Some(ref mut quote) = inbound.quote
                 {
@@ -1169,25 +1175,12 @@ fn download_inbound_media(
     store: &Store,
     token: &str,
     channel_id: &anyagents_core::ChannelId,
+    agent_id: &anyagents_core::AgentId,
     media: &[MediaAttachment],
 ) -> Vec<String> {
-    let data_dir = store.data_dir();
-    let media_dir = data_dir.join(anyagents_harness::media::MEDIA_DIR);
-    let _ = std::fs::create_dir_all(&media_dir);
-    // An agent's seat reads a file it was told about by name; none lists the
-    // files every chat received.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&media_dir, std::fs::Permissions::from_mode(0o711));
-    }
     let mut notes = Vec::new();
     for att in media {
-        if att.kind == "sticker" {
-            continue;
-        }
-        // Telegram Bot API `getFile` supports files up to 20 MB.
-        if att.file_size.is_some_and(|sz| sz > 20 * 1024 * 1024) {
+        if att.kind == "sticker" || att.file_size.is_some_and(|sz| sz > 20 * 1024 * 1024) {
             continue;
         }
         let Ok(resp) = call_api(
@@ -1201,69 +1194,21 @@ fn download_inbound_media(
         let Ok(remote_path) = file_path_of(&resp) else {
             continue;
         };
-        let ext = std::path::Path::new(&remote_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .filter(|e| !e.is_empty())
-            .unwrap_or(match att.kind.as_str() {
-                "photo" => "jpg",
-                "video" | "video_note" | "animation" => "mp4",
-                "voice" => "ogg",
-                "audio" => "mp3",
-                _ => "bin",
-            });
-        let base_id: String = att
-            .file_unique_id
-            .as_deref()
-            .unwrap_or(&att.file_id)
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(32)
-            .collect();
-        let file_name = match &att.file_name {
-            Some(orig) => {
-                let sanitized: String = orig
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .take(64)
-                    .collect();
-                format!("{base_id}_{sanitized}")
-            }
-            None => format!("{}_{base_id}.{ext}", att.kind),
-        };
-        let dest = media_dir.join(format!("complete_{file_name}"));
-        if !dest.is_file() {
-            let url = format!("{}/file/bot{token}/{remote_path}", api_base());
-            let agent = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(SHORT_TIMEOUT_S)))
-                .max_redirects(0)
-                .build()
-                .new_agent();
-            if let Ok(response) = agent.get(&url).call()
-                && response.status().as_u16() == 200
-            {
-                let mut reader = response.into_body().into_reader();
-                if persist_media(&mut reader, &dest, att.file_size).is_err() {
-                    eprintln!("Telegram media transfer incomplete; attachment not cached");
-                }
-            }
-        }
-        if dest.is_file() {
-            if store.is_postgres()
-                && let Some(blob_name) = dest.file_name().and_then(|n| n.to_str())
-                && let Ok(bytes) = std::fs::read(&dest)
-            {
-                let _ = store
-                    .blob_store()
-                    .put_deployment_blob("media", blob_name, &bytes, false);
-            }
-            notes.push(anyagents_harness::media::local_media_line(&att.kind, &dest));
+        let url = format!("{}/file/bot{token}/{remote_path}", api_base());
+        if let Some(line) = anyagents_core::s3_media::download_and_persist_telegram_media(
+            store,
+            agent_id,
+            &att.kind,
+            &att.file_id,
+            att.file_unique_id.as_deref(),
+            att.file_name.as_deref(),
+            att.file_size,
+            &remote_path,
+            &url,
+            SHORT_TIMEOUT_S,
+            |reader, dest, expected| persist_media(reader, dest, expected),
+        ) {
+            notes.push(line);
         }
     }
     notes
@@ -1271,7 +1216,7 @@ fn download_inbound_media(
 
 /// A failed read/write never publishes a path that a subsequent call can reuse.
 fn persist_media(
-    reader: &mut impl std::io::Read,
+    reader: &mut (impl std::io::Read + ?Sized),
     dest: &std::path::Path,
     expected: Option<i64>,
 ) -> std::io::Result<()> {

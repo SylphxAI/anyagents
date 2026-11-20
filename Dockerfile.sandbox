@@ -109,6 +109,7 @@ RUN apt-get update \
         unzip \
         wayvnc \
         xz-utils \
+        zstd \
     && mkdir -p /etc/apt/keyrings /etc/anyagents /var/lib/anyagents \
     && CHROMIUM_PATH="$(readlink -f /usr/bin/chromium)" \
     && CHROMIUM_SHA="$(sha256sum "$CHROMIUM_PATH" | awk '{print $1}')" \

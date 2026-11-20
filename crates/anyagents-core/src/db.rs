@@ -53,7 +53,9 @@ pub const PG_STATELESS_SQL: &str = include_str!("../migrations_pg/002_stateless_
 pub const PG_SERVERLESS_TURNS_SQL: &str = include_str!("../migrations_pg/003_serverless_turns.sql");
 pub const PG_DEPLOYMENT_SECRETS_SQL: &str =
     include_str!("../migrations_pg/004_deployment_secrets.sql");
-pub const PG_LATEST_VERSION: i64 = 4;
+pub const PG_BROWSER_PROFILE_GRANTS_SQL: &str =
+    include_str!("../migrations_pg/005_browser_profile_grants.sql");
+pub const PG_LATEST_VERSION: i64 = 5;
 const PG_MIGRATION_LOCK_KEY: i64 = 0x616e_7961_676e_7473_u64 as i64; // "anyagnts"
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,42 +400,37 @@ impl PgHandle {
                 } else {
                     0
                 };
-                if current < 1 {
-                    sqlx::raw_sql(PG_INIT_SQL).execute(&mut *conn).await?;
+                for (ver, sql) in [
+                    (1i64, PG_INIT_SQL),
+                    (2, PG_STATELESS_SQL),
+                    (3, PG_SERVERLESS_TURNS_SQL),
+                    (4, PG_DEPLOYMENT_SECRETS_SQL),
+                    (5, PG_BROWSER_PROFILE_GRANTS_SQL),
+                ] {
+                    if current >= ver {
+                        continue;
+                    }
+                    sqlx::raw_sql(sql).execute(&mut *conn).await?;
                     let now = now_ms();
                     sqlx::query(
                         "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
-                         VALUES (1, $1) ON CONFLICT (version) DO NOTHING",
-                    )
-                    .bind(now)
-                    .execute(&mut *conn)
-                    .await?;
-                    let compat_ver = crate::migrate::MIGRATIONS
-                        .last()
-                        .map(|(v, _)| *v)
-                        .unwrap_or(37);
-                    sqlx::query(
-                        "INSERT INTO public.schema_migrations (version, applied_at_ms)
                          VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
                     )
-                    .bind(compat_ver)
+                    .bind(ver)
                     .bind(now)
                     .execute(&mut *conn)
                     .await?;
-                }
-                for &(ver, sql) in &[
-                    (2_i64, PG_STATELESS_SQL),
-                    (3_i64, PG_SERVERLESS_TURNS_SQL),
-                    (4_i64, PG_DEPLOYMENT_SECRETS_SQL),
-                ] {
-                    if current < ver {
-                        sqlx::raw_sql(sql).execute(&mut *conn).await?;
+                    if ver == 1 {
+                        let compat_ver = crate::migrate::MIGRATIONS
+                            .last()
+                            .map(|(v, _)| *v)
+                            .unwrap_or(39);
                         sqlx::query(
-                            "INSERT INTO public.pg_schema_migrations (version, applied_at_ms)
+                            "INSERT INTO public.schema_migrations (version, applied_at_ms)
                              VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
                         )
-                        .bind(ver)
-                        .bind(now_ms())
+                        .bind(compat_ver)
+                        .bind(now)
                         .execute(&mut *conn)
                         .await?;
                     }

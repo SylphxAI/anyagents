@@ -970,6 +970,12 @@ pub(super) async fn create_agent_route(
             anyagents_core::parse_agent_lifecycle(lifecycle).map_err(ApiError::from_store)?;
         }
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+        let granted_browser_profiles = super::s3_media_profiles::validate_create_browser_profiles(
+            &state.store,
+            &principal,
+            parent_id.as_ref(),
+            body.browser_profiles.as_deref(),
+        )?;
         let requested_secrets = super::secrets::validate_create_agent_secrets(
             &state.store,
             &principal,
@@ -1025,6 +1031,12 @@ pub(super) async fn create_agent_route(
             create::create(&state.store, state.store.data_dir(), request)
         }
         .map_err(ApiError::from_store)?;
+        super::s3_media_profiles::apply_create_browser_profiles(
+            &state.store,
+            &principal,
+            &agent.id,
+            &granted_browser_profiles,
+        )?;
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),

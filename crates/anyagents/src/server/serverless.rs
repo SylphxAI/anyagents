@@ -591,7 +591,7 @@ async fn dispatch_sandbox_turn(
                         .join(anyagents_harness::media::MEDIA_DIR),
                 );
             }
-            let rewritten_prompt = super::serverless_envelope::hydrate_prompt_media_for_sandbox(
+            let rewritten_prompt = super::s3_media_profiles::hydrate_prompt_media_for_sandbox(
                 &store_ensure,
                 &cfg_dir,
                 &ensured.handle.state_dir,

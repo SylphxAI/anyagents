@@ -526,6 +526,7 @@ impl AgentMcp {
                         lifecycle: args.lifecycle,
                         public: args.public,
                         secrets: args.secrets,
+                        browser_profiles: args.browser_profiles,
                     },
                 )
                 .await?;
@@ -537,6 +538,10 @@ impl AgentMcp {
                         .await?;
                 Ok(rmcp::handler::server::wrapper::Json(res))
             }
+            "browser_profiles" => {
+                self.handle_agents_browser_profiles(args.name.as_deref(), args.browser_profiles)
+                    .await
+            }
             "describe" => {
                 self.describe(Parameters(DescribeArgs {
                     agent: args.name,
@@ -547,6 +552,7 @@ impl AgentMcp {
                     lifecycle: args.lifecycle,
                     public: args.public,
                     clear: args.clear,
+                    browser_profiles: args.browser_profiles,
                 }))
                 .await
             }
@@ -978,6 +984,7 @@ impl AgentMcp {
                         lifecycle: args.lifecycle,
                         public: args.public,
                         secrets: args.secrets,
+                        browser_profiles: args.browser_profiles,
                     },
                 )
                 .await?;
@@ -988,6 +995,10 @@ impl AgentMcp {
                     agent_secrets::agent_secrets(&self.client, args.agent.as_deref(), args.secrets)
                         .await?;
                 Ok(rmcp::handler::server::wrapper::Json(res))
+            }
+            "browser_profiles" => {
+                self.handle_agents_browser_profiles(args.agent.as_deref(), args.browser_profiles)
+                    .await
             }
             "steer" | "send" => {
                 let target = args
@@ -1384,14 +1395,31 @@ impl AgentMcp {
                 "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
-            let updated: serde_json::Value = self
+            let mut updated: serde_json::Value = self
                 .client
                 .get(
                     &format!("/v1/agents/{resolved_target}/description"),
                     Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
                 )
                 .await?;
+            if let Some(profiles) = args.browser_profiles {
+                let bp = self
+                    .set_agent_browser_profiles(&resolved_target, profiles)
+                    .await?;
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert(
+                        "browser_profiles".to_string(),
+                        bp["browser_profiles"].clone(),
+                    );
+                }
+            }
             return Ok(rmcp::handler::server::wrapper::Json(updated));
+        }
+        if let Some(profiles) = args.browser_profiles {
+            let bp = self
+                .set_agent_browser_profiles(&resolved_target, profiles)
+                .await?;
+            return Ok(rmcp::handler::server::wrapper::Json(bp));
         }
         let current: serde_json::Value = self
             .client
