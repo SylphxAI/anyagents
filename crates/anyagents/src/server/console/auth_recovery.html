@@ -6,30 +6,49 @@
   <title>Sign-In Session Expired — AnyAgents</title>
   <style>
     :root {
-      color-scheme: dark light;
-      --bg: #0d1117;
-      --card: #161b22;
-      --subtle: #1c222b;
-      --border: #30363d;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --warn-bg: rgba(245, 158, 11, 0.14);
-      --warn-border: rgba(245, 158, 11, 0.4);
-      --warn-text: #f59e0b;
+      color-scheme: dark;
+      --bg: #090b10;
+      --surface-1: #0f131c;
+      --surface-2: #151a26;
+      --border: #1e2636;
+      --border-strong: #2f3b52;
+      --grid-line: rgba(148, 163, 184, 0.05);
+      --text: #edf1f7;
+      --text-secondary: #a1aec2;
+      --text-muted: #7a879c;
+      --cta-bg: #f1f5f9;
+      --cta-hover: #ffffff;
+      --cta-text: #090b10;
+      --mark-bg: #151a26;
+      --mark-border: #2c374c;
+      --mark-color: #38bdf8;
+      --warn-bg: rgba(245, 158, 11, 0.1);
+      --warn-border: rgba(245, 158, 11, 0.32);
+      --warn-text: #fbbf24;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
     }
     @media (prefers-color-scheme: light) {
       :root {
-        --bg: #f6f8fa;
-        --card: #ffffff;
-        --subtle: #eef2f6;
-        --border: #d0d7de;
-        --text: #1f2328;
-        --muted: #59636e;
-        --accent: #2563eb;
-        --accent-hover: #1d4ed8;
+        color-scheme: light;
+        --bg: #f8f9fb;
+        --surface-1: #ffffff;
+        --surface-2: #f1f4f8;
+        --border: #dde3ec;
+        --border-strong: #bfc8d6;
+        --grid-line: rgba(15, 23, 42, 0.045);
+        --text: #0f172a;
+        --text-secondary: #475569;
+        --text-muted: #64748b;
+        --cta-bg: #0f172a;
+        --cta-hover: #1e293b;
+        --cta-text: #f8fafc;
+        --mark-bg: #f1f4f8;
+        --mark-border: #cbd5e1;
+        --mark-color: #0284c7;
+        --warn-bg: rgba(245, 158, 11, 0.1);
+        --warn-border: rgba(217, 119, 6, 0.35);
         --warn-text: #b45309;
+        --shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
       }
     }
     * { box-sizing: border-box; }
@@ -40,68 +59,98 @@
       align-items: center;
       justify-content: center;
       padding: 24px 16px;
-      background: var(--bg);
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+        linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+      background-size: 32px 32px;
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 14px;
       line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
     .recovery-card {
       width: 100%;
       max-width: 460px;
-      background: var(--card);
+      background: var(--surface-1);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 12px;
       padding: 28px;
-      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
+      box-shadow: var(--shadow);
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 10px;
-      margin-bottom: 18px;
+      gap: 12px;
+      padding-bottom: 20px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border);
     }
     .brand-mark {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 8px;
-      background: var(--accent);
-      color: #ffffff;
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: 0.04em;
+      width: 36px;
+      height: 36px;
+      border-radius: 9px;
+      background: var(--mark-bg);
+      border: 1px solid var(--mark-border);
+      color: var(--mark-color);
+      flex-shrink: 0;
     }
     .brand-title {
       margin: 0;
       font-size: 16px;
       font-weight: 650;
-      line-height: 1.15;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
     }
     .brand-subtitle {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .status-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       font-size: 11px;
-      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--warn-text);
+      margin-bottom: 8px;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--warn-text);
     }
     h2 {
-      margin: 0 0 10px;
-      font-size: 19px;
+      margin: 0 0 12px;
+      font-size: 20px;
       font-weight: 650;
+      letter-spacing: -0.02em;
+      line-height: 1.25;
     }
     .notice {
       margin: 0 0 14px;
-      padding: 10px 12px;
-      border-radius: 6px;
+      padding: 11px 13px;
+      border-radius: 8px;
       background: var(--warn-bg);
       border: 1px solid var(--warn-border);
       color: var(--warn-text);
-      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      word-break: break-word;
     }
     .detail {
       margin: 0 0 22px;
-      color: var(--muted);
+      color: var(--text-secondary);
       font-size: 13px;
+      line-height: 1.55;
     }
     .actions {
       display: flex;
@@ -112,38 +161,57 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 8px;
       padding: 10px 16px;
-      border-radius: 6px;
+      border-radius: 8px;
       font-size: 14px;
       font-weight: 600;
       text-decoration: none;
       border: 1px solid var(--border);
       cursor: pointer;
+      transition: background-color 0.14s ease, border-color 0.14s ease;
     }
     .btn-primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #ffffff;
+      background: var(--cta-bg);
+      border-color: var(--cta-bg);
+      color: var(--cta-text);
     }
     .btn-primary:hover {
-      background: var(--accent-hover);
+      background: var(--cta-hover);
     }
     .btn-secondary {
-      background: var(--subtle);
+      background: var(--surface-2);
+      border-color: var(--border);
       color: var(--text);
+    }
+    .btn-secondary:hover {
+      border-color: var(--border-strong);
+    }
+    .btn:focus-visible {
+      outline: 2px solid var(--mark-color);
+      outline-offset: 2px;
     }
   </style>
 </head>
 <body>
   <main class="recovery-card" role="main" aria-labelledby="recovery-heading">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">AA</span>
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 28 28" width="22" height="22" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M14 2.5L24 8.25V19.75L14 25.5L4 19.75V8.25L14 2.5Z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" />
+          <path d="M14 8.2L8.8 18.2M14 8.2L19.2 18.2M10.4 15.2H17.6" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="14" cy="8.2" r="1.9" fill="currentColor" />
+          <circle cx="8.8" cy="18.2" r="1.75" fill="currentColor" />
+          <circle cx="19.2" cy="18.2" r="1.75" fill="currentColor" />
+        </svg>
+      </span>
       <div>
         <h1 class="brand-title">AnyAgents</h1>
         <span class="brand-subtitle">Control Plane Console</span>
       </div>
     </div>
 
+    <div class="status-eyebrow"><span class="status-dot" aria-hidden="true"></span>Callback Recovery</div>
     <h2 id="recovery-heading">Sign-in session expired</h2>
     <p class="notice">{{REASON}}</p>
     <p class="detail">
@@ -151,7 +219,12 @@
     </p>
 
     <div class="actions">
-      <a class="btn btn-primary" href="{{LOGIN_URL}}">Sign in again</a>
+      <a class="btn btn-primary" href="{{LOGIN_URL}}">
+        <span>Sign in again</span>
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
+          <path d="M3.5 8H12.5M9 4.5L12.5 8L9 11.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </a>
       <a class="btn btn-secondary" href="{{HOME_URL}}">Return to AnyAgents</a>
     </div>
   </main>
