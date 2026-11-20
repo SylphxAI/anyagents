@@ -9,6 +9,10 @@ use anyagents_harness::normalize_harness_name;
 /// profile default, or `agy` parent model is configured.
 pub(crate) const DEFAULT_AGY_MODEL: &str = "gemini-4-argon-high";
 
+/// Fallback default model for `codex` when no explicit model, env override,
+/// profile default, or `codex` parent model is configured.
+pub(crate) const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+
 /// Resolve a non-null default model for `harness` when a caller omits `model`.
 ///
 /// Precedence:
@@ -63,6 +67,7 @@ pub(crate) fn resolve_default_model_for_harness(
     match norm {
         "spiron" | "spiron-local" => Some(crate::spiron::DEFAULT_SPIRON_MODEL.to_string()),
         "agy" => Some(DEFAULT_AGY_MODEL.to_string()),
+        "codex" => Some(DEFAULT_CODEX_MODEL.to_string()),
         _ => None,
     }
 }
@@ -97,6 +102,17 @@ fn profile_configured_default_model(
     }
 
     for dir in candidate_dirs {
+        if norm_harness == "codex"
+            && let Ok(raw) = std::fs::read_to_string(dir.join("config.toml"))
+            && let Ok(val) = toml::from_str::<toml::Value>(&raw)
+            && let Some(m) = val
+                .get("model")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Some(m.to_string());
+        }
         for rel in [
             "profile.json",
             ".gemini/antigravity-cli/settings.json",
@@ -141,6 +157,10 @@ pub(crate) fn persist_spawned_agent_config_to_store(
         "AGENTS.md",
         "CLAUDE.md",
         ".claude/CLAUDE.md",
+        ".claude.json",
+        "settings.json",
+        "config.toml",
+        "spiron-mcp.json",
         ".gemini/config/GEMINI.md",
         ".gemini/antigravity-cli/settings.json",
         "opencode/AGENTS.md",
@@ -177,6 +197,7 @@ fn collect_spawned_secret_rels(config_dir: &Path) -> Vec<String> {
     let mut rels: Vec<String> = [
         ".gemini/antigravity-cli/antigravity-oauth-token",
         ".claude/.credentials.json",
+        ".claude/.claude.json",
         ".credentials.json",
         ".codex/auth.json",
         "auth.json",
@@ -256,6 +277,9 @@ mod tests {
             agent.model.as_deref().is_some_and(|m| !m.is_empty()),
             "persisted agy agent must have a non-null default model"
         );
+        let (codex_h, codex_m, _) = resolve_subagent_defaults(data, None, "codex", None, None);
+        assert_eq!(codex_h, "codex");
+        assert_eq!(codex_m.as_deref(), Some(DEFAULT_CODEX_MODEL));
     }
 
     #[test]

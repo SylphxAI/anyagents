@@ -214,8 +214,9 @@ pub(super) fn post_anthropic_oauth_refresh(
 }
 
 fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8> {
-    if crate::sandbox::is_isolated_test_env()
-        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
+    if crate::server::serverless::is_serverless_mode()
+        || (crate::sandbox::is_isolated_test_env()
+            && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none())
     {
         return src_bytes.to_vec();
     }
@@ -450,13 +451,19 @@ pub(crate) fn seed_harness_credentials(
     agent: &Agent,
     target_config: &Path,
 ) -> Result<(), Error> {
+    super::profiles::hydrate_profiles_from_store_if_postgres(store, data);
     let mut all_agents = store.list_agents()?;
     if all_agents.len() > 32 {
         all_agents.retain(|a| a.state != "archived");
     }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let static_rel_paths: &[&str] = match normalize_harness_name(&agent.harness) {
-        "claude-code" | "claude-cloud" => &[".credentials.json", ".claude/.credentials.json"],
+        "claude-code" | "claude-cloud" => &[
+            ".credentials.json",
+            ".claude/.credentials.json",
+            ".claude.json",
+            ".claude/.claude.json",
+        ],
         "codex" | "openai-cloud" if provider == "openai" => &[
             "auth.json",
             ".codex/auth.json",
@@ -807,6 +814,9 @@ pub(crate) fn seed_harness_credentials(
     if crate::vendor::is_spiron_harness(&agent.harness) {
         crate::spiron::ensure_spiron_seat_auth_for_model(target_config, agent.model.as_deref());
     }
+    if store.is_postgres() {
+        seed_missing_credentials_from_pg(store, &all_agents, agent, target_config);
+    }
     if let Some(ref bound) = current_bound {
         write_profile_marker(
             target_config,
@@ -823,6 +833,146 @@ pub(crate) fn seed_harness_credentials(
         }
     }
     Ok(())
+}
+
+/// Stateless PostgreSQL fallback when local profile seeding left Claude Code or
+/// Codex without credentials: consults `credential_bindings` -> `deployment_blobs("profiles")`
+/// and parent/live-sibling `agent_files(namespace = 'secrets')` (plus safe Claude
+/// `.claude.json` onboarding/account metadata, never copying another agent's `mcpServers`).
+fn seed_missing_credentials_from_pg(
+    store: &Store,
+    all_agents: &[Agent],
+    agent: &Agent,
+    target_config: &Path,
+) {
+    let norm = normalize_harness_name(&agent.harness);
+    let cred_rels: &[&str] = match norm {
+        "claude-code" | "claude-cloud" => &[".credentials.json", ".claude/.credentials.json"],
+        "codex" | "openai-cloud" => &["auth.json", ".codex/auth.json"],
+        _ => return,
+    };
+    let has_cred = |dir: &Path| {
+        cred_rels
+            .iter()
+            .any(|rel| dir.join(rel).metadata().is_ok_and(|m| m.len() > 2))
+    };
+    let blobs = store.blob_store();
+    let write_all = |bytes: &[u8]| {
+        for rel in cred_rels {
+            let _ = write_seat_shared_file(&target_config.join(rel), bytes, 0o600);
+        }
+    };
+    if !has_cred(target_config) {
+        // 1. Explicit credential bindings on this agent or its parent.
+        let mut binding_owners = vec![agent.id.clone()];
+        if let Some(ref pid) = agent.parent_id {
+            binding_owners.push(pid.clone());
+        }
+        'bind: for owner in binding_owners {
+            if let Ok(bindings) = store.credential_bindings_of(&owner) {
+                for b in bindings {
+                    if let anyagents_core::CredentialTarget::Record { provider, name, .. } =
+                        b.target
+                    {
+                        for rel in cred_rels {
+                            let path = format!("{provider}/{name}/{rel}");
+                            if let Ok(Some(entry)) = blobs.get_deployment_blob("profiles", &path)
+                                && !entry.content.is_empty()
+                            {
+                                write_all(&entry.content);
+                                break 'bind;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. Parent / compatible live sibling `agent_files(namespace = 'secrets')`.
+    let mut donors: Vec<&Agent> = Vec::new();
+    if let Some(ref pid) = agent.parent_id
+        && let Some(p) = all_agents.iter().find(|a| &a.id == pid)
+        && normalize_harness_name(&p.harness) == norm
+    {
+        donors.push(p);
+    }
+    for other in all_agents {
+        if other.id != agent.id
+            && other.state != "archived"
+            && normalize_harness_name(&other.harness) == norm
+            && !donors.iter().any(|d| d.id == other.id)
+        {
+            donors.push(other);
+        }
+    }
+    for donor in donors {
+        if !has_cred(target_config) {
+            for rel in cred_rels {
+                if let Ok(Some(entry)) = blobs.get_agent_file(&donor.id, "secrets", rel)
+                    && !entry.content.is_empty()
+                {
+                    write_all(&entry.content);
+                    break;
+                }
+            }
+        }
+        if matches!(norm, "claude-code" | "claude-cloud") {
+            merge_donor_claude_account_meta(blobs.as_ref(), &donor.id, target_config);
+        }
+        if has_cred(target_config) {
+            break;
+        }
+    }
+}
+
+fn merge_donor_claude_account_meta(
+    blobs: &dyn anyagents_core::StateBlobStore,
+    donor_id: &anyagents_core::AgentId,
+    target_config: &Path,
+) {
+    let dst_path = target_config.join(".claude.json");
+    let mut dst_val = std::fs::read_to_string(&dst_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if dst_val.get("oauthAccount").is_some() {
+        return;
+    }
+    let donor_bytes = blobs
+        .get_agent_file(donor_id, "secrets", ".claude/.claude.json")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            blobs
+                .get_agent_file(donor_id, "config", ".claude.json")
+                .ok()
+                .flatten()
+        })
+        .map(|e| e.content);
+    let Some(bytes) = donor_bytes else {
+        return;
+    };
+    let Ok(src_val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    if let Some(dst_obj) = dst_val.as_object_mut() {
+        let mut changed = false;
+        if let Some(acct) = src_val.get("oauthAccount") {
+            dst_obj.insert("oauthAccount".into(), acct.clone());
+            changed = true;
+        }
+        if dst_obj.get("hasCompletedOnboarding") != Some(&serde_json::Value::Bool(true)) {
+            dst_obj.insert(
+                "hasCompletedOnboarding".into(),
+                serde_json::Value::Bool(true),
+            );
+            changed = true;
+        }
+        if changed && let Ok(out) = serde_json::to_vec_pretty(&dst_val) {
+            let _ = write_seat_shared_file(&dst_path, &out, 0o600);
+        }
+    }
 }
 
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)

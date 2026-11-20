@@ -172,7 +172,9 @@ RUN groupadd --gid "${USER_GID}" user \
     && mkdir -p \
         /home/user/agent-data/state \
         /home/user/agent-data/workspace \
+        /home/user/agent-data/media \
         /home/user/agent-data/tmp \
+        /home/user/agent-data/tmp/screenshots \
         /home/user/.config/opencode \
         /home/user/.cache \
         /home/user/.local/bin \
@@ -335,7 +337,16 @@ LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
 USER root
 
 COPY --from=guest-builder /src/target/release/anyagents-mcp-browser /usr/local/bin/anyagents-mcp-browser
-RUN chmod 0755 /usr/local/bin/anyagents-mcp-browser
+RUN chmod 0755 /usr/local/bin/anyagents-mcp-browser \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        default-mysql-client \
+        python3-jwt \
+        redis-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && mysql --version \
+    && redis-cli --version \
+    && python3 -c "import jwt; print('PyJWT', jwt.__version__)"
 
 RUN set -eu; \
     raw="$(printf '%s' "${INSTALL_HARNESSES}" | tr ',' ' ')"; \
@@ -398,7 +409,7 @@ RUN set -eu; \
         fi; \
     done; \
     cp /var/lib/anyagents/toolchain.toml /etc/anyagents/toolchain.toml; \
-    mkdir -p /home/user/.config/opencode /home/user/.cache /home/user/.local/bin /home/user/agent-data/tmp; \
+    mkdir -p /home/user/.config/opencode /home/user/.cache /home/user/.local/bin /home/user/agent-data/media /home/user/agent-data/tmp/screenshots; \
     chown -R "${USER_UID}:${USER_GID}" /home/user
 
 WORKDIR /home/user/agent-data/workspace

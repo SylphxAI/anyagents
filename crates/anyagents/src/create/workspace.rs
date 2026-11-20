@@ -831,3 +831,61 @@ pub(crate) fn write_seat_shared_file(dst: &Path, bytes: &[u8], mode: u32) -> boo
         }
     }
 }
+
+/// Return `true` when `custom` already contains at least two matching markdown
+/// `## ...` section headings from `role_body` (even if minor prose wording
+/// drifted), so `SYSTEM_PROMPT.md` never doubles role instructions.
+pub(crate) fn instructions_overlap_role_headings(custom: &str, role_body: &str) -> bool {
+    let headings = |text: &str| -> std::collections::HashSet<String> {
+        text.lines()
+            .filter_map(|line| {
+                let h = line.trim().strip_prefix("## ")?.trim();
+                (!h.is_empty()).then(|| h.to_ascii_lowercase())
+            })
+            .collect()
+    };
+    let role_h = headings(role_body);
+    if role_h.len() < 2 {
+        return false;
+    }
+    let custom_h = headings(custom);
+    role_h.intersection(&custom_h).count() >= 2
+}
+
+#[cfg(test)]
+mod heading_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn skips_duplicate_role_template_when_headings_overlap_with_minor_prose_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let role_dir = tmp.path().join("roles");
+        std::fs::create_dir_all(&role_dir).unwrap();
+        std::fs::write(
+            role_dir.join("engineer.md"),
+            "---\nname: engineer\n---\n## Mindset & Heuristics\nShip clean code.\n\n## Responsibilities\nMaintain tests.\n",
+        )
+        .unwrap();
+        let custom = "## Mindset & Heuristics\nShip clean, well-tested code.\n\n## Responsibilities\nMaintain tests and docs.\n";
+        assert!(instructions_overlap_role_headings(
+            custom,
+            "## Mindset & Heuristics\nShip clean code.\n\n## Responsibilities\nMaintain tests."
+        ));
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        let mut new_agent = anyagents_core::NewAgent::new("dev-1", "claude-code");
+        new_agent.role = Some("engineer".into());
+        new_agent.instructions = Some(custom.into());
+        let agent = store.create_agent(new_agent).unwrap();
+        let effective = effective_agent_instructions(Some(&store), tmp.path(), &agent).unwrap();
+        assert_eq!(
+            effective.matches("## Mindset & Heuristics").count(),
+            1,
+            "{effective}"
+        );
+        assert_eq!(
+            effective.matches("## Responsibilities").count(),
+            1,
+            "{effective}"
+        );
+    }
+}

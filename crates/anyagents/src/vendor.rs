@@ -2001,18 +2001,10 @@ pub(crate) fn ensure_agy_steering_settings(
                 *allow = serde_json::json!([]);
                 changed = true;
             }
-            let mcp_schema_grant = format!(
-                "read_file({})",
-                config_dir
-                    .join(".gemini")
-                    .join("antigravity-cli")
-                    .join("mcp")
-                    .display()
-            );
             if let Some(allow_arr) = allow.as_array_mut() {
-                for grant in ["mcp(anyagents/*)", mcp_schema_grant.as_str()] {
-                    if !allow_arr.iter().any(|v| v.as_str() == Some(grant)) {
-                        allow_arr.push(serde_json::Value::String(grant.to_string()));
+                for grant in anyagents_guest::mcp_bootstrap::agy_allow_grants(config_dir) {
+                    if !allow_arr.iter().any(|v| v.as_str() == Some(grant.as_str())) {
+                        allow_arr.push(serde_json::Value::String(grant));
                         changed = true;
                     }
                 }

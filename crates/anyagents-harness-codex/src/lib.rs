@@ -102,13 +102,22 @@ pub const DELIVERY: Delivery = Delivery {
     peer: None,
 };
 
+mod diagnostics;
+
+use diagnostics::{
+    StderrBuf, extract_agent_message_text, extract_turn_error, persist_codex_fault_error,
+    usage_from_codex,
+};
+
 /// One long-lived Codex app-server child.
 pub struct CodexHarness {
     environment: Vec<(String, String)>,
     shared: Arc<Mutex<State>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
+    stderr: StderrBuf,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -175,6 +184,9 @@ struct State {
     quota_reset_at_ms: Option<i64>,
     pending_turn_error: Option<String>,
     fault_error: Option<String>,
+    turn_replies: HashMap<String, String>,
+    failures: HashMap<String, String>,
+    exit_status: Option<std::process::ExitStatus>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -500,6 +512,25 @@ impl State {
                     }
                     let id = id.to_owned();
                     self.consume(&id, turn);
+                } else if method == "item/completed"
+                    && let Some(item) = params.get("item")
+                    && let Some(text) = extract_agent_message_text(item)
+                    && let Some(t) = turn.or(self.turn.as_deref()).map(str::to_owned)
+                {
+                    self.turn_replies.insert(t, text);
+                    self.touch();
+                }
+            }
+            "item/agentMessage/delta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str)
+                    && let Some(t) = params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .or(self.turn.as_deref())
+                        .map(str::to_owned)
+                {
+                    self.turn_replies.entry(t).or_default().push_str(delta);
+                    self.touch();
                 }
             }
             "turn/started" => {
@@ -569,10 +600,14 @@ impl State {
                     // The quota notice already set the wait.
                 } else {
                     self.fault_error = Some(message.clone());
+                    for id in &members {
+                        self.failures.insert(id.clone(), message.clone());
+                    }
                     persist_codex_fault_error(self.config_dir.as_deref(), Some(&message));
                     if is_unrecoverable_thread_error(params) {
                         self.invalidate_thread();
                     }
+                    self.touch();
                 }
             }
         }
@@ -801,6 +836,11 @@ impl CodexHarness {
         lock(&self.shared).thread_invalidated
     }
 
+    /// Turn-level error reported for `id`, if any.
+    pub fn failure_for(&self, id: &str) -> Option<String> {
+        lock(&self.shared).failures.get(id).cloned()
+    }
+
     /// Usage of the completed turn that consumed `id`.
     pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
         let state = lock(&self.shared);
@@ -880,7 +920,7 @@ impl CodexHarness {
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = work_dir {
             cmd.current_dir(dir);
         }
@@ -891,6 +931,8 @@ impl CodexHarness {
             let _ = child.wait();
             return Err(HarnessError::Failed("child pipes missing".into()));
         };
+        let stderr_buf = StderrBuf::default();
+        let stderr_reader = child.stderr.take().and_then(|err| stderr_buf.spawn(err));
         let config_dir = env_pairs
             .iter()
             .find(|(k, _)| k == "CODEX_HOME")
@@ -910,7 +952,9 @@ impl CodexHarness {
             shared: Arc::clone(&shared),
             stdin: Arc::clone(&stdin),
             wake: Arc::clone(&wake),
+            stderr: stderr_buf,
             reader: None,
+            stderr_reader,
         };
         // A reader that cannot start leaves the child to `Drop`.
         harness.reader = Some(
@@ -1110,6 +1154,9 @@ impl CodexHarness {
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
+        }
         // Without a reader (it never started), nothing else says it is gone.
         let mut state = lock(&self.shared);
         if state.alive {
@@ -1277,9 +1324,10 @@ impl Harness for CodexHarness {
         if state.alive {
             if state.exited_at.is_none()
                 && let Some(child) = state.child.as_mut()
-                && let Ok(Some(_)) = child.try_wait()
+                && let Ok(Some(st)) = child.try_wait()
             {
                 state.exited_at = Some(Instant::now());
+                state.exit_status = Some(st);
             }
             if state
                 .exited_at
@@ -1335,6 +1383,30 @@ impl Harness for CodexHarness {
 
     fn process_id(&self) -> Option<u32> {
         lock(&self.shared).child.as_ref().map(Child::id)
+    }
+
+    fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        let state = lock(&self.shared);
+        let turn = state.consumed.get(input_id)?.as_ref()?;
+        let text = state.turn_replies.get(turn)?.clone();
+        Some((state.thread_id.clone().unwrap_or_default(), text))
+    }
+
+    fn exit_diagnostic(&self) -> Option<String> {
+        let mut state = lock(&self.shared);
+        if state.exit_status.is_none()
+            && let Some(child) = state.child.as_mut()
+            && let Ok(Some(st)) = child.try_wait()
+        {
+            state.exit_status = Some(st);
+        }
+        let tail = self.stderr.tail();
+        match (state.exit_status, tail.as_deref()) {
+            (Some(st), Some(err)) => Some(format!("codex app-server exited with {st}: {err}")),
+            (Some(st), None) => Some(format!("codex app-server exited with {st}")),
+            (None, Some(err)) if !state.alive => Some(format!("codex app-server exited: {err}")),
+            _ => state.fault_error.clone(),
+        }
     }
 
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -1581,84 +1653,6 @@ fn is_unrecoverable_thread_error(params: &Value) -> bool {
         || raw.contains("payload too large")
         || raw.contains("exceeds the maximum accepted size")
         || raw.contains("\"http_status_code\":413")
-}
-
-fn extract_turn_error(params: &Value) -> Option<String> {
-    for ptr in [
-        "/turn/error/message",
-        "/error/message",
-        "/turn/error",
-        "/error",
-        "/message",
-    ] {
-        if let Some(s) = params
-            .pointer(ptr)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return Some(s.to_string());
-        }
-    }
-    for ptr in ["/turn/error", "/error"] {
-        if let Some(obj) = params.pointer(ptr).filter(|v| v.is_object()) {
-            let raw = obj.to_string();
-            if raw != "{}" {
-                return Some(raw);
-            }
-        }
-    }
-    None
-}
-
-fn persist_codex_fault_error(config_dir: Option<&Path>, err: Option<&str>) {
-    let Some(dir) = config_dir else {
-        return;
-    };
-    let path = dir.join(".anyagents-last-error.json");
-    match err.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(msg) => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                .unwrap_or(0);
-            let payload = json!({
-                "error": msg,
-                "quota_reset_at_ms": null,
-                "timestamp_ms": ts,
-            });
-            if let Err(err) = anyagents_harness::atomic_write_in_existing_dir(
-                &path,
-                payload.to_string().as_bytes(),
-                0o664,
-            ) {
-                eprintln!("cannot persist {}: {err}", path.display());
-            }
-        }
-        None => {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
-
-fn usage_from_codex(params: &Value) -> TurnUsage {
-    let last = params
-        .pointer("/tokenUsage/last")
-        .or_else(|| params.pointer("/tokenUsage/total"));
-    TurnUsage {
-        input_tokens: u64_field(last, "inputTokens"),
-        output_tokens: u64_field(last, "outputTokens"),
-        cache_read_tokens: u64_field(last, "cachedInputTokens"),
-        cache_write_tokens: u64_field(last, "cacheWriteInputTokens"),
-        reported_cost_micros: None,
-    }
-}
-
-fn u64_field(value: Option<&Value>, key: &str) -> u64 {
-    value
-        .and_then(|item| item.get(key))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
 }
 
 fn quota_from_limits(params: &Value) -> Option<i64> {
@@ -1926,7 +1920,9 @@ mod tests {
             shared,
             stdin,
             wake,
+            stderr: StderrBuf::default(),
             reader: Some(reader),
+            stderr_reader: None,
         }
     }
 
@@ -2080,5 +2076,39 @@ mod tests {
             })
         );
         assert_eq!(harness.proven("m2"), None);
+    }
+
+    #[test]
+    fn failed_turn_and_agent_message_reply_are_captured_per_input() {
+        let mut s = State {
+            alive: true,
+            thread_id: Some("th-1".into()),
+            ..State::default()
+        };
+        s.on_notification("turn/started", &json!({"turn": {"id": "t1"}}));
+        s.consume("m1", Some("t1"));
+        s.on_notification(
+            "item/agentMessage/delta",
+            &json!({"turnId": "t1", "delta": "hello "}),
+        );
+        s.on_notification(
+            "item/completed",
+            &json!({"turnId": "t1", "item": {"type": "agentMessage", "text": "hello world"}}),
+        );
+        assert_eq!(
+            s.turn_replies.get("t1").map(String::as_str),
+            Some("hello world")
+        );
+
+        s.on_notification("turn/started", &json!({"turn": {"id": "t2"}}));
+        s.consume("m2", Some("t2"));
+        s.on_notification(
+            "turn/completed",
+            &json!({"turn": {"id": "t2", "status": "failed", "error": {"message": "invalid api key"}}}),
+        );
+        assert_eq!(
+            s.failures.get("m2").map(String::as_str),
+            Some("invalid api key")
+        );
     }
 }
