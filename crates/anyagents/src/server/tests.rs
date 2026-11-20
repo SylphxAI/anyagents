@@ -4722,18 +4722,34 @@ fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() 
             assert_eq!(created.scope, "siblings");
         }
         // An explicit unknown role must fail closed even when no custom catalog exists on disk.
+        let before_count = state.store.list_agents().unwrap().len();
         let unknown_body = serde_json::json!({
             "name": "unmatched-label",
             "parent": parent.id.as_str(),
             "role": "nonexistent-display-label-134",
             "workdir": dir.path().join("unmatched-label"),
         });
-        assert_archetype_create_refused(
-            &state,
-            unknown_body,
-            "unknown role 'nonexistent-display-label-134'",
+        let err = create_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(serde_json::from_value(unknown_body).unwrap()),
         )
-        .await;
+        .await
+        .expect_err("unknown explicit role must fail closed");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        assert!(
+            err.message
+                .contains("unknown role 'nonexistent-display-label-134'"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("available roles: [general]"),
+            "{}",
+            err.message
+        );
+        assert_eq!(state.store.list_agents().unwrap().len(), before_count);
     });
     unsafe {
         std::env::remove_var("ANYAGENTS_FAKE_MODE");

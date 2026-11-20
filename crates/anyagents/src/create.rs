@@ -111,32 +111,6 @@ pub(crate) use signin::finalize_profile_signin;
 #[allow(unused_imports)]
 pub(crate) use workspace::{data_dir_from_config, read_shared_agents_md};
 
-fn is_github_repo_shorthand(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.contains("://")
-        || trimmed.contains('@')
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('.')
-    {
-        return false;
-    }
-    let Some((owner, repo)) = trimmed.split_once('/') else {
-        return false;
-    };
-    if repo.contains('/') {
-        return false;
-    }
-    let valid_seg = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    valid_seg(owner) && valid_seg(repo)
-}
-
 fn is_git_repo_dir(path: &Path) -> bool {
     std::process::Command::new("git")
         .args([
@@ -279,9 +253,6 @@ fn provision_cloud_sandbox_worktree_marker(
                 resolved_repo = url;
             }
         }
-    } else if is_github_repo_shorthand(&resolved_repo) {
-        let trimmed = resolved_repo.trim_end_matches(".git");
-        resolved_repo = format!("https://github.com/{trimmed}.git");
     }
 
     let payload = serde_json::json!({
