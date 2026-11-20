@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod spiron_poll;
+
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_NEXT_POLL_MS: u64 = 5_000;
 
@@ -257,9 +259,9 @@ fn validate_path_segment(id: &str, label: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn build_http_agent(timeout_secs: u64) -> ureq::Agent {
+fn build_http_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(timeout_secs.max(1))))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .build()
         .into()
@@ -272,7 +274,7 @@ fn http_json(
     body: Option<&Value>,
     timeout_secs: u64,
 ) -> Result<(u16, Value), String> {
-    let agent = build_http_agent(timeout_secs);
+    let agent = build_http_agent(Duration::from_secs(timeout_secs.max(1)));
     let mut resp = match method {
         "GET" => {
             let mut req = agent.get(url);
@@ -753,80 +755,30 @@ impl CloudTurnDriver for SpironServerlessDriver {
                 ));
             }
 
-            // Pull incremental events from `GET /v1/message-receipts/{task_id}/events` on tick fallback.
-            let mut events_url =
-                format!("{}/v1/message-receipts/{task_id}/events", driver.base_url);
-            if let Some(ref after) = cursor_owned
-                && !after.trim().is_empty()
+            let durable_state = map_status_str(receipt.get("status").and_then(Value::as_str));
+            let mut result_text = spiron_poll::reply_text(&receipt);
+            let mut error_text = spiron_poll::error_text(&receipt);
+            let has_durable_failure = matches!(
+                durable_state,
+                CloudTurnState::Failed | CloudTurnState::Cancelled
+            );
+            let mut events = spiron_poll::PollEvents::new(cursor_owned);
+            if !(has_durable_failure
+                || durable_state == CloudTurnState::Completed && result_text.is_some())
             {
-                events_url.push_str("?after=");
-                events_url.push_str(after.trim());
+                let events_url = format!("{receipt_url}/events");
+                events.read(&events_url, &headers);
             }
-            let mut next_cursor = cursor_owned.clone();
-            let mut deltas = Vec::new();
-            let mut events_reply: Option<String> = None;
-            let mut events_usage: Option<Value> = None;
-
-            if let Ok((ev_status, ev_doc)) =
-                http_json("GET", &events_url, &headers, None, driver.timeout_secs)
-                && (200..300).contains(&ev_status)
-            {
-                if let Some(c) = ev_doc
-                    .get("next_cursor")
-                    .or_else(|| ev_doc.get("cursor"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    next_cursor = Some(c.to_string());
-                }
-                let arr_opt = ev_doc
-                    .get("events")
-                    .or_else(|| ev_doc.get("items"))
-                    .and_then(Value::as_array)
-                    .or_else(|| ev_doc.as_array());
-                if let Some(items) = arr_opt {
-                    for item in items {
-                        if let Some(cid) = item
-                            .get("id")
-                            .or_else(|| item.get("cursor"))
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            next_cursor = Some(cid.to_string());
-                        }
-                        if let Some(d) = item
-                            .get("delta")
-                            .or_else(|| item.get("text"))
-                            .or_else(|| item.pointer("/data/delta"))
-                            .or_else(|| item.pointer("/data/text"))
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            deltas.push(d.to_string());
-                        }
-                        if let Some(r) = item
-                            .get("reply")
-                            .or_else(|| item.get("result"))
-                            .or_else(|| item.pointer("/data/reply"))
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.trim().is_empty())
-                        {
-                            events_reply = Some(r.to_string());
-                        }
-                        if let Some(u) = item.get("usage").or_else(|| item.pointer("/data/usage")) {
-                            events_usage = Some(u.clone());
-                        }
-                    }
-                }
+            let mut state = if durable_state.is_terminal() {
+                durable_state
+            } else {
+                events.terminal.unwrap_or(durable_state)
+            };
+            result_text = result_text.or(events.reply);
+            if !durable_state.is_terminal() && events.terminal.is_some() {
+                error_text = events.error;
             }
-
-            let state = map_status_str(receipt.get("status").and_then(Value::as_str));
-            let mut result_text = extract_result_string(&receipt)
-                .or(events_reply)
-                .or_else(|| (!deltas.is_empty()).then(|| deltas.join("")));
-            let error_text = extract_error_string(&receipt);
-            let usage = receipt.get("usage").cloned().or(events_usage);
+            let usage = receipt.get("usage").cloned().or(events.usage);
 
             // If completed without inline reply/events reply, check agent conversation projection.
             if state == CloudTurnState::Completed
@@ -845,17 +797,22 @@ impl CloudTurnDriver for SpironServerlessDriver {
                 );
                 if let Ok((200..=299, conv)) =
                     http_json("GET", &conv_url, &headers, None, driver.timeout_secs)
-                    && let Some(items) = conv.get("items").and_then(Value::as_array)
+                    && let Some(items) = conv
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .or_else(|| conv.get("items").and_then(Value::as_array))
                 {
                     let found = items.iter().rev().find_map(|item| {
                         let matches_task = item.get("task_id").and_then(Value::as_str)
                             == Some(task_id.as_str())
                             || item.get("receipt_id").and_then(Value::as_str)
                                 == Some(task_id.as_str());
-                        let is_assistant =
-                            item.get("role").and_then(Value::as_str) == Some("assistant");
+                        let is_assistant = matches!(
+                            item.get("role").and_then(Value::as_str),
+                            Some("agent" | "assistant")
+                        );
                         if is_assistant && matches_task {
-                            extract_result_string(item)
+                            spiron_poll::reply_text(item)
                         } else {
                             None
                         }
@@ -866,14 +823,30 @@ impl CloudTurnDriver for SpironServerlessDriver {
                 }
             }
 
+            if state == CloudTurnState::Completed && result_text.is_none() {
+                // A finite legacy snapshot may contain the complete reply as deltas.
+                // SSE replay may be partial, so never publish just its last window.
+                result_text =
+                    (events.snapshot && !events.deltas.is_empty()).then(|| events.deltas.concat());
+                if result_text.is_none() {
+                    state = CloudTurnState::Failed;
+                    error_text =
+                        Some("Spiron completed the receipt without an assistant reply".into());
+                }
+            }
+            if matches!(state, CloudTurnState::Failed | CloudTurnState::Cancelled) {
+                result_text = None;
+                error_text
+                    .get_or_insert_with(|| format!("Spiron task {task_id} {}", state.as_str()));
+            }
             Ok(CloudTurnPollResult {
                 remote_run_id: task_id,
                 status: state,
                 result_text,
                 error_text,
                 usage,
-                cursor: next_cursor,
-                deltas,
+                cursor: events.cursor,
+                deltas: events.deltas,
                 next_poll_after_ms: (!state.is_terminal()).then_some(DEFAULT_NEXT_POLL_MS),
             })
         })

@@ -87,6 +87,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         41,
         include_str!("../migrations/042_schedule_external_timer.sql"),
     ),
+    (
+        42,
+        include_str!("../migrations/043_channel_identity_unique.sql"),
+    ),
 ];
 
 /// The version that moves the mailbox search index out of the state

@@ -405,13 +405,19 @@ impl SandboxProvider for SylphxProvider {
             dest_dir.trim().to_string()
         };
         let payload = tar_gz.to_vec();
+        let state_dir = handle.state_dir.trim_end_matches('/').to_string();
 
         run_blocking(move || {
             let seq = TAR_UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp_archive = format!("/tmp/.anyagents-bundle-{}-{seq}.tar.gz", std::process::id());
+            // Uploads may be owned by the guest service. A user-owned parent
+            // directory permits unlinking them, unlike sticky /tmp.
+            let tmp_archive = format!(
+                "{state_dir}/.anyagents-bundle-{}-{seq}.tar.gz",
+                std::process::id()
+            );
             client.write_file(&resource, &tmp_archive, &payload)?;
             let script = format!(
-                "set -e; mkdir -p {dst}; tar -xzf {tmp} -C {dst}; rm -f {tmp}",
+                "set -e; mkdir -p {dst}; tar -xzf {tmp} -C {dst}; rm -f {tmp} || true",
                 dst = shell_single_quote(&dest),
                 tmp = shell_single_quote(&tmp_archive),
             );
@@ -651,6 +657,70 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn sylphx_bundle_stages_in_state_and_only_ignores_cleanup_failure() {
+        let state = MockSylphxState::default();
+        let app = Router::new()
+            .fallback(mock_sylphx_handler)
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = SylphxConfig::new(PARENT);
+        cfg.endpoint = format!("http://{addr}");
+        let provider = SylphxProvider::new(cfg).unwrap();
+        let handle = SandboxHandle {
+            provider: ProviderKind::Sylphx,
+            sandbox_id: "sbx-bundle-test".into(),
+            volume_id: None,
+            mount_path: DEFAULT_MOUNT_PATH.into(),
+            state_dir: "/home/user/agent-data/state/".into(),
+            workdir: "/home/user/agent-data/workspace".into(),
+            transport_url: None,
+            transport_token: None,
+            expires_at: None,
+            metadata: BTreeMap::new(),
+        };
+        provider
+            .sync_bundle_tar(&handle, "/bundle dest", b"test archive")
+            .await
+            .unwrap();
+        server.abort();
+
+        let writes = state.write_files.lock().unwrap();
+        let [(path, payload)] = writes.as_slice() else {
+            panic!("expected one upload")
+        };
+        assert!(path.starts_with("/home/user/agent-data/state/.anyagents-bundle-"));
+        assert!(path.ends_with(".tar.gz"));
+        assert_eq!(payload, b"test archive");
+        let commands = state.exec_commands.lock().unwrap();
+        let [argv] = commands.as_slice() else {
+            panic!("expected one extraction")
+        };
+        assert_eq!(&argv[0..2], ["/bin/sh", "-lc"]);
+        assert_eq!(
+            argv[2],
+            format!(
+                "set -e; mkdir -p '/bundle dest'; tar -xzf '{path}' -C '/bundle dest'; rm -f '{path}' || true"
+            )
+        );
+        for (tar_status, expected) in [(0, 0), (7, 7)] {
+            let script = format!(
+                "mkdir() {{ :; }}; tar() {{ return {tar_status}; }}; rm() {{ return 1; }}; {}",
+                argv[2]
+            );
+            assert_eq!(
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", &script])
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(expected)
+            );
+        }
     }
 
     const PARENT: &str = "orgs/o/projects/p/envs/e";
