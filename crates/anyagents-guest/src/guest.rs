@@ -1393,80 +1393,9 @@ pub(crate) fn load_guest_config(state_dir: &Path) -> Option<GuestConfig> {
     serde_json::from_str(&raw).ok()
 }
 
-pub(crate) fn load_repo_spec(state_dir: &Path) -> Option<GuestRepoSpec> {
-    let raw = std::fs::read_to_string(state_dir.join(REPO_SPEC_FILE)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Ensure the repository described by `spec` is checked out inside `work_dir`
-/// when no `.git` metadata exists yet.
-pub(crate) fn ensure_repo_checked_out(
-    work_dir: &Path,
-    spec: &GuestRepoSpec,
-    git_override: Option<&Path>,
-) -> Result<(), String> {
-    let repo = spec.repo.trim();
-    if repo.is_empty() || work_dir.join(".git").exists() {
-        return Ok(());
-    }
-    let git_bin = match git_override {
-        Some(p) => p.to_path_buf(),
-        None => anyagents_toolchain::tool("git", "anyagents-guest.repo")
-            .map(|r| r.path)
-            .unwrap_or_else(|_| PathBuf::from("/usr/bin/git")),
-    };
-    let mut cmd = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let gh_token = std::env::var("GH_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if let Some(tok) = gh_token
-        && (repo.starts_with("https://github.com/") || repo.starts_with("https://www.github.com/"))
-    {
-        cmd.env("ANYAGENTS_GIT_TOKEN", tok);
-        cmd.arg("-c")
-            .arg("credential.helper=!f() { echo username=x-access-token; echo password=\"$ANYAGENTS_GIT_TOKEN\"; }; f");
-    }
-    cmd.arg("clone");
-    if let Some(branch) = spec
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        cmd.arg("--branch").arg(branch);
-    }
-    cmd.arg(repo).arg(work_dir);
-    let out = cmd.output().map_err(|e| format!("git clone failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git clone `{repo}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    if let Some(base) = spec
-        .base
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && spec.branch.as_deref().is_none_or(|b| b.trim().is_empty())
-    {
-        let mut co = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
-        co.current_dir(work_dir).args(["checkout", base]);
-        let co_out = co
-            .output()
-            .map_err(|e| format!("git checkout `{base}` failed: {e}"))?;
-        if !co_out.status.success() {
-            return Err(format!(
-                "git checkout `{base}` failed: {}",
-                String::from_utf8_lossy(&co_out.stderr).trim()
-            ));
-        }
-    }
-    Ok(())
-}
+#[path = "repo.rs"]
+mod repo;
+pub(crate) use repo::{ensure_repo_checked_out, load_repo_spec};
 
 pub(crate) fn read_persisted_session(state_dir: &Path, harness: &str) -> Option<String> {
     let raw = std::fs::read_to_string(state_dir.join(format!("{harness}-session-id"))).ok()?;

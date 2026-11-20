@@ -16,6 +16,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[path = "host_retrieval_batch.rs"]
+mod batch;
+
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
 
 /// Virtual segment prefix for PostgreSQL `public.agent_files` blobs indexed into `host_index`.
@@ -804,32 +807,17 @@ impl Store {
         if local_root_present {
             match class {
                 MemoryScope::Memory => {
-                    for path in memory_indexable_files(&mut walk, &root.join("memory"))? {
-                        if blocked(&path) {
-                            continue;
-                        }
-                        let id = format!(
-                            "memory:{}:{}",
-                            owner.id,
-                            sha256(path.as_os_str().as_encoded_bytes())
-                        );
-                        let metadata = memory_metadata(owner, Some(modified_ms(&path)?));
-                        let stats = retry_later(
-                            refresh_document_ctx(
-                                index,
-                                &id,
-                                &metadata,
-                                &path,
-                                budget,
-                                gate,
-                                || Ok(()),
-                            ),
-                            &path,
-                        )?;
-                        walk.note(&path, Some(stats.stamp.clone()));
-                        refresh.add(&stats);
-                        keep.insert(path.to_string_lossy().into_owned());
-                    }
+                    batch::refresh_local_memory_files(
+                        index,
+                        owner,
+                        &root,
+                        &blocked,
+                        &mut walk,
+                        &mut keep,
+                        &mut refresh,
+                        budget,
+                        gate,
+                    )?;
                 }
                 MemoryScope::Transcripts => {
                     for source in native_sources(&mut walk, &root)? {
@@ -900,89 +888,15 @@ impl Store {
         // `public.agent_files(namespace = 'memory')` so replicas with empty local
         // filesystems search and read learned memory directly from PostgreSQL.
         if self.is_postgres() && class == MemoryScope::Memory {
-            let blob_store = self.blob_store();
-            let metas = blob_store
-                .list_agent_files(&owner.id, "memory")
-                .map_err(store_error)?;
-            let visible_metas: Vec<_> = metas
-                .into_iter()
-                .filter(|m| !m.path.starts_with('.') && !m.path.contains("/."))
-                .collect();
-            let has_topic_files = visible_metas
-                .iter()
-                .any(|m| !m.path.eq_ignore_ascii_case("MEMORY.md") && m.path.ends_with(".md"));
-            for meta in visible_metas {
-                if has_topic_files && meta.path.eq_ignore_ascii_case("MEMORY.md") {
-                    continue;
-                }
-                let seg = pg_agent_file_segment(owner.id.as_str(), "memory", &meta.path);
-                if blocked(&seg) {
-                    continue;
-                }
-                let id = format!(
-                    "memory:{}:{}",
-                    owner.id,
-                    sha256(seg.as_os_str().as_encoded_bytes())
-                );
-                let metadata = memory_metadata(owner, Some(meta.updated_at_ms));
-                let stamp = FileStamp::virtual_blob(
-                    meta.size_bytes as u64,
-                    meta.version,
-                    meta.updated_at_ms,
-                );
-                let policy = serde_json::to_string(&metadata)?;
-                let unchanged = index
-                    .source_cursor(&metadata.agent_id, &seg)?
-                    .is_some_and(|old| old.stamp == stamp && old.policy == policy);
-                if !unchanged
-                    && let Some(entry) = blob_store
-                        .get_agent_file(&owner.id, "memory", &meta.path)
-                        .map_err(store_error)?
-                {
-                    let raw = crate::raw_segment::RawCoordinate {
-                        segment: seg.clone(),
-                        offset: 0,
-                        length: entry.content.len() as u64,
-                        sha256: entry.sha256.clone(),
-                        seq: 1,
-                    };
-                    let prepared = if index.is_current(&id, &metadata, &raw)? {
-                        None
-                    } else {
-                        Some(crate::host_index::prepare_document_from_bytes(
-                            &entry.content,
-                            &id,
-                            &metadata,
-                            &raw,
-                        )?)
-                    };
-                    if let Some(_guard) = gate()? {
-                        index.refresh_source(|index| {
-                            if let Some(doc) = &prepared {
-                                index.publish_document(doc)?;
-                            }
-                            index.save_source(
-                                &metadata.agent_id,
-                                &seg,
-                                &SourceCursor {
-                                    stamp: stamp.clone(),
-                                    policy,
-                                    end: raw.length,
-                                    next_seq: 2,
-                                    boundary_sha256: String::new(),
-                                    full_verified_ms: 0,
-                                    verification_attempt_ms: 0,
-                                    complete: true,
-                                    rebuilding: false,
-                                },
-                            )
-                        })?;
-                    } else {
-                        refresh.complete = false;
-                    }
-                }
-                keep.insert(seg.to_string_lossy().into_owned());
-            }
+            batch::refresh_pg_memory_blobs(
+                self,
+                index,
+                owner,
+                &blocked,
+                &mut keep,
+                &mut refresh,
+                gate,
+            )?;
         }
         let stale: Vec<String> = index
             .agent_sources(owner.id.as_str())?
@@ -5285,5 +5199,74 @@ mod tests {
         drop(second_lock);
         let hits = handle.join().unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn memory_refresh_batches_many_topic_files_under_one_gate() {
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("batch-mem", "spiron"))
+            .unwrap();
+        let mem_dir = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        for i in 0..40 {
+            let unique = if i == 37 {
+                "uniquetopicthirtyseven"
+            } else {
+                "sharedtopic"
+            };
+            fs::write(
+                mem_dir.join(format!("topic-{i:03}.md")),
+                format!("# Topic {i}\nKeyword {unique} and hypoidea.\n"),
+            )
+            .unwrap();
+        }
+        let mut index = store.open_host_index().unwrap();
+        let owner = Owner {
+            id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let agents = agents_identity(store.data_dir()).unwrap();
+        let mut budget = REQUEST_INDEX_BYTES;
+        let gate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate_counter = std::sync::Arc::clone(&gate_calls);
+        let mut gate = move || -> Result<Option<Box<dyn std::any::Any>>, IndexError> {
+            gate_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(Box::new(())))
+        };
+        let (_walk, refresh) = store
+            .refresh_class(
+                &mut index,
+                &owner,
+                MemoryScope::Memory,
+                &[],
+                agents,
+                crate::now_ms(),
+                &mut budget,
+                &mut gate,
+            )
+            .unwrap();
+        assert!(refresh.complete);
+        assert_eq!(
+            gate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "all 40 memory topic files should publish under a single gate lock"
+        );
+        let hits = index
+            .search(
+                &[agent.id.to_string()],
+                MemoryScope::Memory,
+                &HistorySearchQuery {
+                    query: Some("uniquetopicthirtyseven".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }
