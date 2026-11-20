@@ -107,16 +107,19 @@ async fn event_webhook(
     };
     if serverless::is_serverless_mode() {
         for agent_id in &dispatch.fired_agents {
-            if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
-                Arc::clone(&state.store),
-                agent_id,
-            )
-            .await
-            {
-                eprintln!(
-                    "anyagents-serverless: webhook schedule dispatch failed for {agent_id}: {err}"
-                );
-            }
+            let store_disp = Arc::clone(&state.store);
+            let aid = agent_id.clone();
+            let call = in_flight::carry();
+            tokio::spawn(async move {
+                let _call = call;
+                if let Err(err) =
+                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &aid).await
+                {
+                    eprintln!(
+                        "anyagents-serverless: webhook schedule dispatch failed for {aid}: {err}"
+                    );
+                }
+            });
         }
     }
     (

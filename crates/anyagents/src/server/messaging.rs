@@ -267,27 +267,44 @@ pub(super) async fn send(
     })
     .await?;
     if serverless::is_serverless_mode() {
-        let mut dispatched_agents = HashSet::new();
+        let mut recipient_names: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
         for delivery in &response.0.deliveries {
             if delivery.duplicate {
                 continue;
             }
-            let Some(agent_name) = delivery.to.strip_prefix("agent:") else {
-                continue;
-            };
-            if let Ok(agent) = dispatch_store.agent_by_name(agent_name)
-                && dispatched_agents.insert(agent.id.clone())
-                && let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
-                    Arc::clone(&dispatch_store),
-                    &agent.id,
-                )
-                .await
+            if let Some(agent_name) = delivery.to.strip_prefix("agent:")
+                && seen.insert(agent_name.to_string())
             {
-                eprintln!(
-                    "anyagents-serverless: /v1/send dispatch failed for {}: {err}",
-                    agent.name
-                );
+                recipient_names.push(agent_name.to_string());
             }
+        }
+        // Dispatch asynchronously with an `in_flight` guard so cold sandbox provisioning
+        // never blocks `/v1/send` (or group fanout) and client disconnects cannot cancel
+        // a dispatch mid-flight after recording `pending_remote_turns`.
+        for agent_name in recipient_names {
+            let store_disp = Arc::clone(&dispatch_store);
+            let call = super::in_flight::carry();
+            tokio::spawn(async move {
+                let _call = call;
+                let store_lookup = Arc::clone(&store_disp);
+                let lookup_name = agent_name.clone();
+                let Ok(Ok(agent)) =
+                    tokio::task::spawn_blocking(move || store_lookup.agent_by_name(&lookup_name))
+                        .await
+                else {
+                    return;
+                };
+                if let Err(err) =
+                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &agent.id)
+                        .await
+                {
+                    eprintln!(
+                        "anyagents-serverless: /v1/send dispatch failed for {}: {err}",
+                        agent.name
+                    );
+                }
+            });
         }
     }
     Ok(response)
