@@ -217,7 +217,11 @@ pub(crate) fn deduplicate_markdown_sections(raw: &str) -> String {
             kept_paras.push(para);
         }
         if !kept_paras.is_empty() {
-            kept_sections.push(kept_paras.join("\n\n"));
+            let joined = kept_paras.join("\n\n");
+            let trimmed = joined.trim_matches('\n');
+            if !trimmed.is_empty() {
+                kept_sections.push(trimmed.to_string());
+            }
         }
     }
     let mut out = kept_sections.join("\n\n");

@@ -1473,7 +1473,8 @@ mod tool_server_runtime_tests {
                     }
                 }
                 let line = std::str::from_utf8(&req).unwrap().lines().next().unwrap();
-                let path = line.split_whitespace().nth(1).unwrap();
+                let uri: hyper::Uri = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+                let path = uri.path();
                 let body = if path == "/v1/agents" {
                     &empty_live
                 } else if path == "/v1/agents/archived-worker" {
