@@ -39,7 +39,11 @@ impl RemoteSessionAdapter {
 
 impl Hosted for RemoteSessionAdapter {
     fn session_id(&self) -> Option<String> {
-        self.inner.session_id()
+        // Persist the durable remote agent handle when distinct from per-turn
+        // conversation session IDs so restarts resume `/v1/agents/{agent_id}/...`.
+        self.inner
+            .remote_agent_id()
+            .or_else(|| self.inner.session_id())
     }
 
     fn session_invalidated(&self) -> bool {
@@ -559,6 +563,208 @@ mod tests {
 
         adapter.stop_verified().unwrap();
         assert!(!adapter.health().process_alive);
+    }
+
+    #[test]
+    fn spiron_cloud_restart_preserves_remote_agent_id_across_distinct_conversation_session_id() {
+        const CONV_SESSION_ID: &str = "00000000-0000-4000-8000-000000000999";
+        let create_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let create_count_s = Arc::clone(&create_count);
+        let msg_agents = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let msg_agents_s = Arc::clone(&msg_agents);
+
+        let distinct_proof = |req_id: &str| {
+            json!({
+                "session_id": CONV_SESSION_ID,
+                "entry_id": req_id,
+                "turn_entry_id": req_id,
+                "recorded_at": "2026-04-20T00:00:00Z"
+            })
+        };
+
+        let server = MockServer::start(move |method, uri, key, _body| match (method, uri) {
+            ("GET", "/v1/openapi.json") => (
+                200,
+                json!({
+                    "openapi": "3.1.0",
+                    "x-spiron-input-delivery": {
+                        "protocol": "session-entry-v1",
+                        "level": "next-step",
+                        "idempotent": true,
+                        "proof": "input_delivery"
+                    }
+                }),
+            ),
+            ("POST", "/v1/agents") => {
+                create_count_s.fetch_add(1, Ordering::SeqCst);
+                (201, json!({"id": AGENT_ID, "status": "idle"}))
+            }
+            ("PUT", u) if u == format!("/v1/agents/{AGENT_ID}/mcp-servers") => {
+                (200, json!({"ok": true}))
+            }
+            ("GET", "/v1/spend-cap") => (
+                200,
+                json!({
+                    "reached": false,
+                    "used_micros": 100,
+                    "effective_cap_micros": 5_000_000,
+                    "plan_cap_micros": 5_000_000,
+                    "spend_cap_micros": 5_000_000
+                }),
+            ),
+            ("POST", u) if u.starts_with("/v1/agents/") && u.ends_with("/messages") => {
+                let target = u
+                    .trim_start_matches("/v1/agents/")
+                    .trim_end_matches("/messages")
+                    .to_string();
+                msg_agents_s.lock().unwrap().push(target.clone());
+                if target != AGENT_ID {
+                    return (
+                        404,
+                        json!({
+                            "type": "https://api.spiron.ai/errors/not-found",
+                            "title": "Not Found",
+                            "detail": "agent not found"
+                        }),
+                    );
+                }
+                match key {
+                    Some(REQ_1) => (
+                        202,
+                        json!({
+                            "id": RECEIPT_1,
+                            "agent_id": AGENT_ID,
+                            "provider_message_id": REQ_1,
+                            "status": "working",
+                            "input_delivery": distinct_proof(REQ_1)
+                        }),
+                    ),
+                    Some(REQ_2) => (
+                        202,
+                        json!({
+                            "id": RECEIPT_2,
+                            "agent_id": AGENT_ID,
+                            "provider_message_id": REQ_2,
+                            "status": "working",
+                            "input_delivery": distinct_proof(REQ_2)
+                        }),
+                    ),
+                    _ => (400, json!({"detail": "unexpected request id"})),
+                }
+            }
+            ("GET", u) if u == format!("/v1/message-receipts/{RECEIPT_1}") => (
+                200,
+                json!({
+                    "id": RECEIPT_1,
+                    "agent_id": AGENT_ID,
+                    "provider_message_id": REQ_1,
+                    "status": "completed",
+                    "reply": "turn 1 ok",
+                    "input_delivery": distinct_proof(REQ_1),
+                    "usage": {"input_tokens": 20, "output_tokens": 10, "cost_micros": 500}
+                }),
+            ),
+            ("GET", u) if u == format!("/v1/message-receipts/{RECEIPT_2}") => (
+                200,
+                json!({
+                    "id": RECEIPT_2,
+                    "agent_id": AGENT_ID,
+                    "provider_message_id": REQ_2,
+                    "status": "completed",
+                    "reply": "turn 2 resumed",
+                    "input_delivery": distinct_proof(REQ_2),
+                    "usage": {"input_tokens": 25, "output_tokens": 12, "cost_micros": 600}
+                }),
+            ),
+            _ => (404, json!({"detail": format!("unexpected {method} {uri}")})),
+        });
+
+        let dir = crate::test_tempdir();
+        let env = vec![
+            ("ANYAGENTS_SPIRON_CLOUD_URL".into(), server.base_url.clone()),
+            (
+                "ANYAGENTS_SPIRON_CLOUD_API_KEY".into(),
+                "spiron_sk_test_resume".into(),
+            ),
+        ];
+
+        // Turn 1: creates remote agent, receives distinct conversation session_id in input_delivery.
+        let mut adapter1 = start_remote_session(
+            "spiron",
+            dir.path(),
+            "agt_resume_1",
+            "resume-worker",
+            Some("z-ai/glm-5.3-flash"),
+            None,
+            Some(500_000),
+            &env,
+        )
+        .expect("start turn 1 session");
+        assert_eq!(adapter1.session_id().as_deref(), Some(AGENT_ID));
+
+        assert_eq!(
+            adapter1.deliver(&msg(REQ_1, 1, "turn 1")).unwrap(),
+            DeliverOutcome::Accepted {
+                turn_finished: false
+            }
+        );
+        wait_until(Duration::from_secs(3), || {
+            adapter1.proven(REQ_1)
+                == Some(Proof::Taken {
+                    turn_finished: true,
+                })
+        });
+        assert_eq!(adapter1.reply_for(REQ_1).as_deref(), Some("turn 1 ok"));
+        // Hosted::session_id MUST stay anchored to remote AGENT_ID, never CONV_SESSION_ID.
+        assert_eq!(
+            adapter1.session_id().as_deref(),
+            Some(AGENT_ID),
+            "Hosted::session_id must not be overwritten with conversation session_id"
+        );
+        // Mirror SessionPointer::sync_session writing adapter.session_id() to disk.
+        let persisted = adapter1.session_id().unwrap();
+        let ptr_path = dir.path().join("spiron-cloud-session-id");
+        std::fs::write(&ptr_path, format!("{persisted}\n")).unwrap();
+        adapter1.stop_verified().unwrap();
+
+        // Restart: pass persisted pointer as `session` (matching vendor.rs plan_adapter).
+        let resume_id = std::fs::read_to_string(&ptr_path).unwrap();
+        let mut adapter2 = start_remote_session(
+            "spiron",
+            dir.path(),
+            "agt_resume_1",
+            "resume-worker",
+            Some("z-ai/glm-5.3-flash"),
+            Some(resume_id.trim()),
+            Some(500_000),
+            &env,
+        )
+        .expect("restart session on persisted remote agent_id");
+        assert_eq!(adapter2.session_id().as_deref(), Some(AGENT_ID));
+
+        assert_eq!(
+            adapter2.deliver(&msg(REQ_2, 2, "turn 2")).unwrap(),
+            DeliverOutcome::Accepted {
+                turn_finished: false
+            }
+        );
+        wait_until(Duration::from_secs(3), || {
+            adapter2.proven(REQ_2)
+                == Some(Proof::Taken {
+                    turn_finished: true,
+                })
+        });
+        assert_eq!(adapter2.reply_for(REQ_2).as_deref(), Some("turn 2 resumed"));
+        assert_eq!(
+            create_count.load(Ordering::SeqCst),
+            1,
+            "must not create a second agent"
+        );
+        assert_eq!(
+            *msg_agents.lock().unwrap(),
+            vec![AGENT_ID.to_string(), AGENT_ID.to_string()]
+        );
+        adapter2.stop_verified().unwrap();
     }
 
     #[test]

@@ -351,7 +351,14 @@ impl SpironCloudProvider {
                 );
                 let limit_micros = ptr_micros(
                     &v,
-                    &["/limit_micros", "/cap_micros", "/monthly_limit_micros"],
+                    &[
+                        "/effective_cap_micros",
+                        "/spend_cap_micros",
+                        "/plan_cap_micros",
+                        "/limit_micros",
+                        "/cap_micros",
+                        "/monthly_limit_micros",
+                    ],
                     &["/limit_usd", "/cap_usd", "/monthly_limit_usd"],
                 );
                 self.spend_cap = Some(SpendCapStatus {

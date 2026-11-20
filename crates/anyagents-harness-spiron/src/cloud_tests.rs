@@ -1451,3 +1451,90 @@ fn auth_401_quota_429_retry_after_4xx_size_rejection_and_transient_5xx_tolerance
     assert!(provider.spend_cap_reached());
     provider.stop().unwrap();
 }
+
+#[test]
+fn probe_spend_cap_parses_effective_cap_fields_and_http_error_preserves_safe_detail() {
+    let server =
+        MockSpironServer::start(
+            move |req, _| match (req.method.as_str(), req.uri.as_str()) {
+                ("GET", "/v1/openapi.json") => MockResponse::json(200, strict_openapi()),
+                ("POST", "/v1/agents") => {
+                    MockResponse::json(201, json!({ "id": AGENT_ID, "status": "idle" }))
+                }
+                ("GET", "/v1/spend-cap") => MockResponse::json(
+                    200,
+                    json!({
+                        "object": "spend_cap",
+                        "reached": false,
+                        "used_micros": 125_000,
+                        "effective_cap_micros": 5_000_000,
+                        "plan_cap_micros": 5_000_000,
+                        "spend_cap_micros": 10_000_000
+                    }),
+                ),
+                _ => MockResponse::json(404, json!({})),
+            },
+        );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = SpironCloudProvider::new(test_config(dir.path(), &server.base_url));
+    provider.create(&sample_session_config(None)).unwrap();
+    let cap = provider.spend_cap_status().expect("spend cap parsed");
+    assert!(!cap.reached);
+    assert_eq!(cap.spent_micros, Some(125_000));
+    assert_eq!(cap.limit_micros, Some(5_000_000));
+    provider.stop().unwrap();
+
+    // RFC 9457 detail & type code are preserved on 400 errors, while secret-bearing details are scrubbed.
+    let err_server =
+        MockSpironServer::start(
+            move |req, _| match (req.method.as_str(), req.uri.as_str()) {
+                ("GET", "/v1/openapi.json") => MockResponse::json(200, strict_openapi()),
+                ("POST", "/v1/agents") => MockResponse::json(
+                    400,
+                    json!({
+                        "type": "https://api.spiron.ai/errors/invalid-model",
+                        "title": "Bad Request",
+                        "detail": "Unknown model identifier"
+                    }),
+                ),
+                _ => MockResponse::json(404, json!({})),
+            },
+        );
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut p2 = SpironCloudProvider::new(test_config(dir2.path(), &err_server.base_url));
+    let err = p2.create(&sample_session_config(None)).unwrap_err();
+    match err {
+        RemoteSessionError::Protocol(msg) => {
+            assert!(msg.contains("HTTP 400"), "got: {msg}");
+            assert!(msg.contains("invalid-model"), "got: {msg}");
+            assert!(msg.contains("Unknown model identifier"), "got: {msg}");
+        }
+        other => panic!("expected Protocol error, got {other:?}"),
+    }
+
+    let secret_server =
+        MockSpironServer::start(
+            move |req, _| match (req.method.as_str(), req.uri.as_str()) {
+                ("GET", "/v1/openapi.json") => MockResponse::json(200, strict_openapi()),
+                ("POST", "/v1/agents") => MockResponse::json(
+                    400,
+                    json!({
+                        "code": "bad_request",
+                        "detail": "rejected key spiron_sk_live_secret_12345"
+                    }),
+                ),
+                _ => MockResponse::json(404, json!({})),
+            },
+        );
+    let dir3 = tempfile::tempdir().unwrap();
+    let mut p3 = SpironCloudProvider::new(test_config(dir3.path(), &secret_server.base_url));
+    let err3 = p3.create(&sample_session_config(None)).unwrap_err();
+    match err3 {
+        RemoteSessionError::Protocol(msg) => {
+            assert!(msg.contains("HTTP 400 (bad_request)"), "got: {msg}");
+            assert!(!msg.contains("spiron_sk_"), "leaked key in error: {msg}");
+        }
+        other => panic!("expected Protocol error, got {other:?}"),
+    }
+}
