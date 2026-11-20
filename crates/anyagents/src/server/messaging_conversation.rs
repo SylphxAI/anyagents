@@ -937,10 +937,16 @@ pub(super) async fn conversation_route(
         } else {
             Some(state.store.agent_by_name(&name))
         };
-        // Narrow host-file authorization strictly to the target agent on single-agent
-        // queries (never enumerating all 10K+ agent IDs) and to live agents on PG
-        // fleet-wide queries.
-        let host_file_authorized: Vec<String> = if !is_all {
+        let should_search_host_files = should_search_host_files_for_request(
+            state.store.is_postgres(),
+            query.scope,
+            has_structured_search,
+            file_request.only_tools,
+            file_request.tool_name.is_some(),
+        );
+        let host_file_authorized: Vec<String> = if !should_search_host_files {
+            Vec::new()
+        } else if !is_all {
             match resolved_target.as_ref() {
                 Some(Ok(target))
                     if visible_agent_ids
@@ -976,9 +982,6 @@ pub(super) async fn conversation_route(
                 None => every_agent_id(&state.store)?,
             }
         };
-        let should_search_host_files = has_structured_search
-            || query.scope != anyagents_core::host_index::MemoryScope::All
-            || std::env::var_os("ANYAGENTS_TESTS").is_some();
         // A search indexes only a bounded amount of new history before it
         // answers; the background indexer takes the rest, and the response
         // says the history it searched was partial.
@@ -1237,4 +1240,45 @@ fn inbox_of(
         })
         .collect();
     Ok(Json(InboxResponse { messages }))
+}
+
+/// PostgreSQL serves `messages`/`outbound_messages` via GIN FTS and pattern indexes;
+/// only enter host-file search for `scope=memory` or explicit tool-history filters.
+fn should_search_host_files_for_request(
+    is_postgres: bool,
+    scope: anyagents_core::host_index::MemoryScope,
+    has_structured_search: bool,
+    only_tools: bool,
+    has_tool_name: bool,
+) -> bool {
+    use anyagents_core::host_index::MemoryScope;
+    if is_postgres {
+        return scope == MemoryScope::Memory || only_tools || has_tool_name;
+    }
+    has_structured_search
+        || scope != MemoryScope::All
+        || std::env::var_os("ANYAGENTS_TESTS").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use anyagents_core::host_index::MemoryScope as S;
+
+    #[test]
+    fn postgres_conversation_query_bypasses_host_file_scan_unless_memory_or_tool_filter() {
+        let cases = [
+            (true, S::All, true, false, false, false),
+            (true, S::Transcripts, true, false, false, false),
+            (true, S::Memory, true, false, false, true),
+            (true, S::All, true, true, false, true),
+            (true, S::All, true, false, true, true),
+            (false, S::All, true, false, false, true),
+        ];
+        for (pg, sc, st, ot, tn, want) in cases {
+            assert_eq!(
+                super::should_search_host_files_for_request(pg, sc, st, ot, tn),
+                want
+            );
+        }
+    }
 }

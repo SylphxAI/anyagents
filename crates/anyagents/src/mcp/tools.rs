@@ -298,35 +298,13 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models` | `usage`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role` defaulting to `\"general\"`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git repository; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `usage`, `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `update` | `secrets` | `describe` | `verdict` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models` | `usage`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`role` defaulting to `\"general\"`, `name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`, `secrets`) to launch a sub-agent with an isolated managed Git repository; use `update` or `secrets` (`name`, `secrets`: `[...]`) to grant/revoke held deployment secrets on descendants (`child ⊆ parent`); use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read role descriptions or update a target's `description`/`instructions`/`role` (updating `description`, `instructions`, `role`, or `rename` requires the target's Parent/Ancestor agent or an Admin); use `verdict` (`name`, `verdict`: `accepted` | `rework` | `rejected` | `abandoned`, `reason`) to judge a descendant's work; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed checkouts while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `usage`, `create`, `rename`, `role`, `harness`, `models`."
     )]
     pub(super) async fn agents(
         &self,
         Parameters(mut args): Parameters<AgentsArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let action = args
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| {
-                if args.new_name.is_some() {
-                    "rename".to_string()
-                } else if args.instructions.is_some()
-                    && args.prompt.is_none()
-                    && args.harness.is_none()
-                    && args.repo.is_none()
-                {
-                    "describe".to_string()
-                } else if args.prompt.is_some()
-                    && (args.repo.is_some() || args.workdir.is_some() || args.branch.is_some())
-                {
-                    "spawn".to_string()
-                } else {
-                    "list".to_string()
-                }
-            });
+        let action = agent_secrets::resolve_agents_action(&args);
         // `name` names the agent acted on, except where it names a new one.
         if !matches!(action.as_str(), "list" | "spawn" | "create")
             && let Some(raw) = args.name.as_deref()
@@ -334,6 +312,16 @@ impl AgentMcp {
             args.name = Some(self.resolve_agent_word(raw).await?);
         }
         match action.as_str() {
+            "verdict" => {
+                let response = agent_secrets::record_agent_verdict(
+                    &self.client,
+                    args.name.as_deref(),
+                    args.verdict.as_deref(),
+                    args.reason.as_deref(),
+                )
+                .await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
             "usage" => {
                 let mut qs = String::new();
                 let mut push = |k: &str, v: String| {
@@ -814,7 +802,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(res))
             }
             other => Err(format!(
-                "unknown agents action `{other}`; expected `list`, `inspect`, `spawn`, `create`, `update`, `secrets`, `describe`, `steer`, `wake`, `pause`, `archive`, `delete`, `rename`, `role`, `harness`, `transfer`, `telegram_bot`, `channels`, or `models`"
+                "unknown agents action `{other}`; expected `list`, `inspect`, `spawn`, `create`, `update`, `secrets`, `describe`, `verdict`, `redact`, `steer`, `wake`, `pause`, `archive`, `delete`, `rename`, `role`, `harness`, `transfer`, `telegram_bot`, `channels`, `usage`, or `models`"
             )),
         }
     }
@@ -1945,7 +1933,6 @@ impl AgentMcp {
                             "action": "search",
                             "agent": resp.0.agent,
                             "query": q,
-                            "turns": resp.0.turns,
                             "matches": resp.0.turns,
                             "count": count,
                         }))
@@ -1993,7 +1980,6 @@ impl AgentMcp {
                                 "action": "search",
                                 "agent": self.agent.name,
                                 "query": q,
-                                "turns": hits,
                                 "matches": hits,
                                 "count": count,
                             }));
@@ -2050,7 +2036,6 @@ impl AgentMcp {
                     "action": "recall",
                     "agent": resp.0.agent,
                     "query": q,
-                    "turns": resp.0.turns,
                     "matches": resp.0.turns,
                     "count": count,
                 }))

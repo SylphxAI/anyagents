@@ -9,7 +9,10 @@ use std::collections::HashSet;
 
 use super::Store;
 use super::helpers::agent_by_id;
-use super::history::{matches_conversation_peer, visible_agent_ids_sql};
+use super::history::{
+    PeerTarget, build_peer_sql, matches_conversation_peer, resolve_inbound_dest,
+    visible_agent_ids_sql,
+};
 use super::index_sync::tokenize_hybrid_search_tokens;
 use super::types::{ConversationTurn, HistorySearchQuery, HistorySort};
 use crate::db::{DbBackend, DbExec as _, DbExecExt as _, DbParam, ToDbParam};
@@ -32,7 +35,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_agent_received_desc \
 CREATE INDEX IF NOT EXISTS idx_outbound_messages_sent_at_desc \
     ON public.outbound_messages(sent_at_ms DESC, id DESC);\n\
 CREATE INDEX IF NOT EXISTS idx_outbound_messages_agent_sent_desc \
-    ON public.outbound_messages(agent_id, sent_at_ms DESC, id DESC);\n";
+    ON public.outbound_messages(agent_id, sent_at_ms DESC, id DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to_pattern \
+    ON public.messages(reply_to text_pattern_ops, received_at_ms DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_messages_sender_pattern \
+    ON public.messages(sender text_pattern_ops, received_at_ms DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_outbound_messages_dest_pattern \
+    ON public.outbound_messages(destination text_pattern_ops, sent_at_ms DESC);\n";
 
 /// Ensure the PostgreSQL direct-conversation GIN FTS and timestamp indexes exist.
 /// Uses a fast `pg_indexes` probe first so warm startups cost ~1ms and never
@@ -52,6 +61,10 @@ pub(crate) fn ensure_pg_conversation_indexes(
                  SELECT 1 FROM pg_indexes
                  WHERE schemaname = 'public'
                    AND indexname = 'idx_outbound_messages_body_fts'
+             ) AND EXISTS(
+                 SELECT 1 FROM pg_indexes
+                 WHERE schemaname = 'public'
+                   AND indexname = 'idx_outbound_messages_dest_pattern'
              )",
         )
         .fetch_one(pool)
@@ -126,6 +139,8 @@ pub(crate) fn build_direct_conversation_all_sql(
     fetch_limit: i64,
     ascending: bool,
     visible_agent_ids: Option<&[String]>,
+    peer_forms: &[String],
+    backend: DbBackend,
 ) -> (String, Vec<DbParam>) {
     let mut sp = SqlParams::new();
     let p_since = sp.push(since);
@@ -138,9 +153,22 @@ pub(crate) fn build_direct_conversation_all_sql(
             sp.push(id.as_str());
         }
     }
+    let self_expr = Some("'agent:' || a.name");
+    let peer_in = build_peer_sql(
+        peer_forms,
+        PeerTarget::Messages("m.", self_expr),
+        backend,
+        &mut sp.params,
+    );
+    let peer_out = build_peer_sql(
+        peer_forms,
+        PeerTarget::Outbound("o.", self_expr),
+        backend,
+        &mut sp.params,
+    );
     let dir_kw = if ascending { "ASC" } else { "DESC" };
     let sql = format!(
-        "SELECT id, direction, sender, destination, reply_to, body, timestamp_ms, seq
+        "SELECT id, direction, sender, destination, reply_to, body, timestamp_ms, seq, origin_raw
          FROM (
              SELECT * FROM (
                  SELECT m.id, 'in' AS direction, COALESCE(m.sender, 'unknown') AS sender,
@@ -149,20 +177,22 @@ pub(crate) fn build_direct_conversation_all_sql(
                                 THEN m.reply_to
                             ELSE 'agent:' || a.name
                         END AS destination,
-                        m.reply_to, m.body, m.received_at_ms AS timestamp_ms, m.seq
+                        m.reply_to, m.body, m.received_at_ms AS timestamp_ms, m.seq,
+                        m.origin AS origin_raw
                  FROM messages m
                  JOIN agents a ON a.id = m.agent_id
-                 WHERE m.received_at_ms > ?{p_since}{vis_in}
+                 WHERE m.received_at_ms > ?{p_since}{vis_in}{peer_in}
                  ORDER BY m.received_at_ms {dir_kw}, m.id {dir_kw}
                  LIMIT ?{p_limit}
              ) AS _in
              UNION ALL
              SELECT * FROM (
                  SELECT o.id, 'out' AS direction, 'agent:' || a.name AS sender,
-                        o.destination, o.reply_to, o.body, o.sent_at_ms AS timestamp_ms, o.seq
+                        o.destination, o.reply_to, o.body, o.sent_at_ms AS timestamp_ms, o.seq,
+                        NULL AS origin_raw
                  FROM outbound_messages o
                  JOIN agents a ON a.id = o.agent_id
-                 WHERE o.sent_at_ms > ?{p_since}{vis_out}
+                 WHERE o.sent_at_ms > ?{p_since}{vis_out}{peer_out}
                  ORDER BY o.sent_at_ms {dir_kw}, o.id {dir_kw}
                  LIMIT ?{p_limit}
              ) AS _out
@@ -190,8 +220,11 @@ pub(super) fn pg_conversation_all_scoped(
         .map(|n| i64::try_from(n.max(1)).unwrap_or(i64::MAX))
         .unwrap_or(500);
     let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
-    let fetch_limit = if peer_filter.is_some() {
-        lim.saturating_mul(4).min(2_000)
+    let peer_forms: Vec<String> = peer_filter
+        .map(|peer| store.conversation_peer_forms(peer))
+        .unwrap_or_default();
+    let fetch_limit = if !peer_forms.is_empty() {
+        lim.saturating_mul(2).min(2_000)
     } else {
         lim
     };
@@ -200,22 +233,30 @@ pub(super) fn pg_conversation_all_scoped(
         fetch_limit,
         since_ms.is_some(),
         visible_agent_ids,
+        &peer_forms,
+        conn.backend(),
     );
     let mut turns = conn.db_query_vec(&sql, &params, |row| {
+        let direction: String = row.get(1)?;
+        let origin_raw: Option<String> = row.get(8)?;
+        let to = resolve_inbound_dest(&direction, row.get(3)?, origin_raw.as_deref());
         Ok(ConversationTurn {
             id: row.get(0)?,
-            direction: row.get(1)?,
+            direction,
             from: row.get(2)?,
-            to: row.get(3)?,
+            to,
             reply_to: row.get(4)?,
             text: row.get(5)?,
             timestamp_ms: row.get(6)?,
             seq: row.get(7)?,
         })
     })?;
-    if let Some(peer) = peer_filter {
-        let peers = store.conversation_peer_forms(peer);
-        turns.retain(|turn| peers.iter().any(|p| matches_conversation_peer(turn, p)));
+    if !peer_forms.is_empty() {
+        turns.retain(|turn| {
+            peer_forms
+                .iter()
+                .any(|p| matches_conversation_peer(turn, p))
+        });
     }
     turns.sort_by(|a, b| {
         a.timestamp_ms
@@ -245,6 +286,7 @@ pub(crate) struct DirectSearchSpec<'a> {
     pub from_seq: Option<i64>,
     pub to_seq: Option<i64>,
     pub visible_agent_ids: Option<&'a [String]>,
+    pub peer_forms: &'a [String],
     pub queries: &'a [String],
     pub exclude: &'a [String],
     pub backend: DbBackend,
@@ -340,7 +382,13 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
             conds.push(format!("({})", query_preds_in.join(" OR ")));
         }
         conds.extend(excl_preds_in);
-        let where_clause = format!("{}{vis_in}", conds.join(" AND "));
+        let peer_in = build_peer_sql(
+            spec.peer_forms,
+            PeerTarget::Messages("m.", Some("'agent:' || a.name")),
+            spec.backend,
+            &mut sp.params,
+        );
+        let where_clause = format!("{}{vis_in}{peer_in}", conds.join(" AND "));
         arms.push(format!(
             "SELECT * FROM (
                  SELECT m.id, 'in' AS direction, COALESCE(m.sender, 'unknown') AS sender,
@@ -349,7 +397,8 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
                                 THEN m.reply_to
                             ELSE 'agent:' || a.name
                         END AS destination,
-                        m.reply_to, m.body, m.received_at_ms AS timestamp_ms, m.seq, a.name AS agent_name
+                        m.reply_to, m.body, m.received_at_ms AS timestamp_ms, m.seq, a.name AS agent_name,
+                        m.origin AS origin_raw
                  FROM messages m
                  JOIN agents a ON a.id = m.agent_id
                  WHERE {where_clause}
@@ -382,11 +431,18 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
             conds.push(format!("({})", query_preds_out.join(" OR ")));
         }
         conds.extend(excl_preds_out);
-        let where_clause = format!("{}{vis_out}", conds.join(" AND "));
+        let peer_out = build_peer_sql(
+            spec.peer_forms,
+            PeerTarget::Outbound("o.", Some("'agent:' || a.name")),
+            spec.backend,
+            &mut sp.params,
+        );
+        let where_clause = format!("{}{vis_out}{peer_out}", conds.join(" AND "));
         arms.push(format!(
             "SELECT * FROM (
                  SELECT o.id, 'out' AS direction, 'agent:' || a.name AS sender,
-                        o.destination, o.reply_to, o.body, o.sent_at_ms AS timestamp_ms, o.seq, a.name AS agent_name
+                        o.destination, o.reply_to, o.body, o.sent_at_ms AS timestamp_ms, o.seq, a.name AS agent_name,
+                        NULL AS origin_raw
                  FROM outbound_messages o
                  JOIN agents a ON a.id = o.agent_id
                  WHERE {where_clause}
@@ -398,7 +454,7 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
 
     let union_body = arms.join("\nUNION ALL\n");
     let sql = format!(
-        "SELECT id, direction, sender, destination, reply_to, body, timestamp_ms, seq, agent_name
+        "SELECT id, direction, sender, destination, reply_to, body, timestamp_ms, seq, agent_name, origin_raw
          FROM ({union_body}) AS combined
          ORDER BY timestamp_ms {dir_kw}, id {dir_kw}
          LIMIT ?{p_limit}"
@@ -501,11 +557,11 @@ pub(super) fn pg_search_history(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let peer_forms = peer_filter.map(|p| store.conversation_peer_forms(p));
+    let peer_forms: Vec<String> = peer_filter
+        .map(|p| store.conversation_peer_forms(p))
+        .unwrap_or_default();
 
-    let fetch_mult = if peer_filter.is_some() { 4 } else { 2 };
-    let fetch_limit =
-        i64::try_from(limit.saturating_mul(fetch_mult).clamp(40, 1_000)).unwrap_or(1_000);
+    let fetch_limit = i64::try_from(limit.saturating_mul(2).clamp(40, 1_000)).unwrap_or(1_000);
     let ascending = req.sort == HistorySort::Oldest;
 
     let (sql, params) = build_direct_search_sql(&DirectSearchSpec {
@@ -521,18 +577,22 @@ pub(super) fn pg_search_history(
         from_seq: req.from_seq,
         to_seq: req.to_seq,
         visible_agent_ids: req.visible_agent_ids.as_deref(),
+        peer_forms: &peer_forms,
         queries: &all_queries,
         exclude: &exclude,
         backend: conn.backend(),
     });
 
     let rows = conn.db_query_vec(&sql, &params, |row| {
+        let direction: String = row.get(1)?;
+        let origin_raw: Option<String> = row.get(9)?;
+        let to = resolve_inbound_dest(&direction, row.get(3)?, origin_raw.as_deref());
         Ok((
             ConversationTurn {
                 id: row.get(0)?,
-                direction: row.get(1)?,
+                direction,
                 from: row.get(2)?,
-                to: row.get(3)?,
+                to,
                 reply_to: row.get(4)?,
                 text: row.get(5)?,
                 timestamp_ms: row.get(6)?,
@@ -557,8 +617,10 @@ pub(super) fn pg_search_history(
 
     let mut scored: Vec<(f64, ConversationTurn, String)> = Vec::new();
     for (rank, (turn, aname)) in rows.into_iter().enumerate() {
-        if let Some(ref forms) = peer_forms
-            && !forms.iter().any(|p| matches_conversation_peer(&turn, p))
+        if !peer_forms.is_empty()
+            && !peer_forms
+                .iter()
+                .any(|p| matches_conversation_peer(&turn, p))
         {
             continue;
         }
@@ -662,6 +724,7 @@ mod tests {
             from_seq: None,
             to_seq: None,
             visible_agent_ids: None,
+            peer_forms: &[],
             queries: &ascii_q,
             exclude: &[],
             backend: DbBackend::Postgres,
@@ -686,6 +749,7 @@ mod tests {
             from_seq: None,
             to_seq: None,
             visible_agent_ids: None,
+            peer_forms: &[],
             queries: &cjk_q,
             exclude: &["noise".to_string()],
             backend: DbBackend::Postgres,
@@ -742,5 +806,82 @@ mod tests {
         // Empty visibility fails closed immediately.
         let empty = pg_conversation_all_scoped(&store, None, None, Some(10), Some(&[])).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn conversation_with_telegram_chat_matches_inbound_origin_topic_and_outbound_under_busy_fleet()
+    {
+        let dir = crate::test_tempdir();
+        let s = Store::open(dir.path().join("state.db")).unwrap();
+        let a = s.create_agent(NewAgent::new("alpha", "codex")).unwrap();
+        let b = s.create_agent(NewAgent::new("beta", "codex")).unwrap();
+        let (chat, topic) = ("telegram:chat:-100123", "telegram:chat:-100123:42");
+        let (other, t99) = ("telegram:chat:-1001234", "telegram:chat:-100123:99");
+        for (text, rt, cid, tid, mid) in [
+            ("tg root", Some(chat), -100123, None, 101),
+            ("tg topic 42", Some(topic), -100123, Some(42), 102),
+            ("tg origin 42", None, -100123, Some(42), 103),
+            ("other -1001234", Some(other), -1001234, None, 201),
+            ("topic 99", Some(t99), -100123, Some(99), 202),
+        ] {
+            let mut m = Incoming::new(text);
+            m.sender = Some(format!("telegram:user:777:{mid}"));
+            m.reply_to = rt.map(str::to_string);
+            let orig = crate::Origin {
+                chat_id: Some(cid),
+                thread_id: tid,
+                message_id: Some(mid),
+            };
+            m.origin = Some(orig);
+            s.receive(&a.id, m).unwrap();
+        }
+        s.record_outbound(&a.id, chat, None, "tg out root").unwrap();
+        let out_t = "telegram:chat:-100123:42:555";
+        s.record_outbound(&a.id, out_t, None, "tg out 42").unwrap();
+        for i in 0..60 {
+            let mut n = Incoming::new(format!("fleet heartbeat {i}"));
+            n.sender = Some("agent:beta".into());
+            s.receive(&b.id, n).unwrap();
+        }
+        let tq = HistorySearchQuery {
+            query: Some("42".into()),
+            with_peer: Some(topic.into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let chat_sets = [
+            s.conversation(&a.id, Some(chat), None, Some(10)).unwrap(),
+            s.conversation_all(Some(chat), None, Some(10)).unwrap(),
+            pg_conversation_all_scoped(&s, Some(chat), None, Some(10), None).unwrap(),
+        ];
+        for turns in chat_sets {
+            let txt: Vec<&str> = turns.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(turns.len(), 6, "{txt:?}");
+            assert!(!txt.iter().any(|t| t.contains("-1001234")));
+        }
+        let topic_sets = [
+            s.conversation(&a.id, Some(topic), None, Some(10)).unwrap(),
+            s.conversation_all(Some(topic), None, Some(10)).unwrap(),
+            pg_conversation_all_scoped(&s, Some(topic), None, Some(10), None).unwrap(),
+            s.search_history(&tq).unwrap(),
+            pg_search_history(&s, &tq).unwrap(),
+        ];
+        for turns in topic_sets {
+            let txt: Vec<&str> = turns.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(turns.len(), 3, "{txt:?}");
+            assert!(
+                ["tg topic 42", "tg origin 42", "tg out 42"]
+                    .iter()
+                    .all(|w| txt.contains(w))
+            );
+        }
+        let peers = vec![chat.to_string()];
+        let (sql, _) =
+            build_direct_conversation_all_sql(0, 40, false, None, &peers, DbBackend::Postgres);
+        assert!(
+            sql.contains("m.reply_to LIKE ?")
+                && sql.contains("o.destination LIKE ?")
+                && sql.contains("::jsonb->>'chat_id'")
+        );
     }
 }

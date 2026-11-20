@@ -8,6 +8,7 @@ use anyagents_supervisor::HealthBoard;
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
+use serde::Deserialize;
 
 use crate::api::AgentView;
 use crate::auth::Principal;
@@ -21,7 +22,7 @@ use super::types::{
     ApiError, AppState, is_self_or_ancestor, require_admin_or_operator,
     resolve_remote_sandbox_workdir, runs_off_host, spawn_store, via_http_mcp,
 };
-use super::{file_cache, reap_queue, serverless};
+use super::{file_cache, in_flight, reap_queue, serverless, serverless_failure};
 
 pub(crate) fn has_explicit_archive_marker(
     data_dir: &Path,
@@ -94,6 +95,7 @@ pub(super) fn mark_archive_generation_locked(store: &Store, data_dir: &Path, age
         }
     }
     let _ = super::serverless_watches::cancel_watches_targeting_agent(store, agent);
+    serverless_failure::cancel_active_remote_turns_for_archived_agent(store, &agent.id);
     crate::schedule::schedules_changed(store.data_dir());
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
 }
@@ -238,6 +240,72 @@ pub(super) async fn archive_agent_route(
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VerdictRequest {
+    pub(super) verdict: String,
+    #[serde(default, alias = "note")]
+    pub(super) reason: Option<String>,
+}
+
+/// `POST /v1/agents/{name}/verdict`: record a supervision verdict (strict ancestor, root admin, or operator).
+pub(super) async fn verdict_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<VerdictRequest>,
+) -> Result<Json<anyagents_core::Outcome>, ApiError> {
+    let dispatch_store = Arc::clone(&state.store);
+    let (outcome, rework_id) = spawn_store(move || {
+        let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "verdict must be accepted, rework, rejected or abandoned",
+            )
+        })?;
+        let s = &state.store;
+        let clean = name.trim().strip_prefix("agent:").unwrap_or(name.trim());
+        let target = s.agent_by_name(clean).map_err(ApiError::from_store)?;
+        let _lock = s
+            .lock_agent_lifecycle(&target.id)
+            .map_err(ApiError::from_store)?;
+        let cfg = anyagents_core::agent_config_dir(s.data_dir(), &target.id);
+        let actor = match &principal {
+            Principal::Operator => None,
+            Principal::Agent { agent_id, .. } => Some(agent_id),
+        };
+        let prof = create::bound_profile_name(&cfg);
+        let (outcome, changed) = s
+            .apply_verdict(actor, &target.id, kind, body.reason, prof)
+            .map_err(ApiError::from_store)?;
+        let mut rework_id = None;
+        if let Some(agent) = changed {
+            if agent.state == "archived" {
+                finish_agent_archive_locked(&state, &agent, false)?;
+            } else {
+                clear_explicitly_archived(s.data_dir(), &agent.id);
+                rework_id = Some(agent.id);
+            }
+        }
+        Ok((outcome, rework_id))
+    })
+    .await?;
+    if serverless::is_serverless_mode()
+        && let Some(id) = rework_id
+    {
+        let call = in_flight::carry();
+        tokio::spawn(async move {
+            let _call = call;
+            if let Err(err) =
+                serverless::dispatch_next_mailbox_message_if_serverless(dispatch_store, &id).await
+            {
+                eprintln!("anyagents-serverless: verdict rework dispatch failed for `{id}`: {err}");
+            }
+        });
+    }
+    Ok(Json(outcome))
 }
 
 fn finish_agent_archive_locked(

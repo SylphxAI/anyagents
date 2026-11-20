@@ -474,18 +474,45 @@ async fn capability_delegation_attenuation_self_mutation_deny_and_cascade_delete
         StatusCode::FORBIDDEN
     );
 
-    // Grandparent (non-direct parent) CANNOT directly mutate grandchild's secrets (403).
+    // Ancestor (grandparent holding s1, s2) CAN update grandchild's secrets within its own held
+    // set, and CANNOT grant unheld s3 (403); then restore ["s1"] for cascade-delete check below.
+    let gp = "/v1/agents/grandchild/secrets";
+    let (st, raw, body) = send_json(
+        &app,
+        "PUT",
+        gp,
+        parent_hdr,
+        Some(json!({ "secrets": ["s1", "s2"] })),
+    )
+    .await;
+    assert_eq!(
+        (st, &body["secrets"]),
+        (StatusCode::OK, &json!(["s1", "s2"])),
+        "{raw}"
+    );
     assert_eq!(
         send_json(
             &app,
             "PUT",
-            "/v1/agents/grandchild/secrets",
+            gp,
             parent_hdr,
-            Some(json!({ "secrets": [] })),
+            Some(json!({ "secrets": ["s3"] }))
         )
         .await
         .0,
         StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send_json(
+            &app,
+            "PUT",
+            gp,
+            parent_hdr,
+            Some(json!({ "secrets": ["s1"] }))
+        )
+        .await
+        .0,
+        StatusCode::OK
     );
 
     // 8. GET /v1/agents/{name}/secrets visibility: operator/self/ancestor OK, sibling 403.
@@ -774,4 +801,89 @@ async fn admin_ui_serves_secrets_tab_and_enforces_csrf_on_secret_mutations() {
         .await
         .unwrap();
     assert_eq!(grant_ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn parent_grants_secrets_to_existing_paused_child_and_enforces_subset_before_wake() {
+    let _env = crate::server::tests::env_lock();
+    let _r = EnvRestore::capture(&[MASTER_KEY_ENV, "ANYAGENTS_FAKE_MODE", "HOME"]);
+    let (dir, store, app) = make_confined_app();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    unsafe {
+        std::env::set_var(MASTER_KEY_ENV, TEST_MASTER_KEY);
+        std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        std::env::set_var("HOME", &home);
+    }
+    let op = Some((crate::operator::HEADER, TEST_OPERATOR_TOKEN));
+    for (p, b) in [
+        (
+            "/v1/secrets/gh-token",
+            json!({ "env": { "GH_TOKEN": "canary_gh_11" } }),
+        ),
+        (
+            "/v1/secrets/deploy-key",
+            json!({ "env": { "DEPLOY_KEY": "canary_dk_22" } }),
+        ),
+    ] {
+        assert_eq!(
+            send_json(&app, "PUT", p, op, Some(b)).await.0,
+            StatusCode::OK
+        );
+    }
+    let mk = |n: &str, p: Option<&anyagents_core::AgentId>, paused: bool, grant: bool| {
+        let mut a = NewAgent::new(n, "claude-code");
+        a.parent_id = p.cloned();
+        let ag = store.create_agent(a).unwrap();
+        if paused {
+            store.set_agent_state(&ag.id, "paused").unwrap();
+        }
+        if grant {
+            store
+                .set_agent_secrets(&ag.id, &["gh-token".into()], Some("operator"))
+                .unwrap();
+        }
+        (ag.id.clone(), store.issue_capability(&ag.id).unwrap())
+    };
+    let (pid, pcap) = mk("lead", None, false, true);
+    let (cid, _) = mk("paused-child", Some(&pid), true, false);
+    let _ = mk("paused-gc", Some(&cid), true, false);
+    let (_, scap) = mk("sibling-worker", Some(&pid), false, true);
+    let (_, ocap) = mk("unrelated-root", None, false, true);
+    fn hdr(c: &str) -> Option<(&'static str, &str)> {
+        Some((crate::operator::AGENT_HEADER, c))
+    }
+    let (ph, sh, oh) = (hdr(&pcap), hdr(&scap), hdr(&ocap));
+    let (ok, both) = (
+        json!({ "secrets": ["gh-token"] }),
+        json!({ "secrets": ["gh-token", "deploy-key"] }),
+    );
+    let (cp, ca) = ("/v1/agents/paused-child/secrets", "/v1/agents/paused-child");
+    for (m, p) in [("PUT", cp), ("PATCH", "/v1/agents/paused-gc")] {
+        let (st, raw, b) = send_json(&app, m, p, ph, Some(ok.clone())).await;
+        assert_eq!(st, StatusCode::OK, "{raw}");
+        assert_eq!(b["secrets"], json!(["gh-token"]));
+    }
+    for (h, b) in [(ph, &both), (sh, &ok), (oh, &ok)] {
+        for (m, p) in [("PUT", cp), ("PATCH", ca)] {
+            let r = send_json(&app, m, p, h, Some(b.clone())).await;
+            assert_eq!(r.0, StatusCode::FORBIDDEN);
+        }
+    }
+    let gc_bad = send_json(&app, "PUT", "/v1/agents/paused-gc/secrets", ph, Some(both)).await;
+    assert_eq!(gc_bad.0, StatusCode::FORBIDDEN);
+    let w = send_json(
+        &app,
+        "POST",
+        "/v1/agents/paused-child/wake",
+        ph,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(w.0, StatusCode::OK);
+    assert_eq!(
+        (&w.2["state"], &w.2["secrets"]),
+        (&json!("running"), &json!(["gh-token"]))
+    );
 }
