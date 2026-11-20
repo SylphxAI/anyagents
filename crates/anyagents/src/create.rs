@@ -78,8 +78,7 @@ pub(crate) use workspace::{
 
 #[cfg(test)]
 pub(crate) use archetypes::{
-    BUILTIN_GENERAL_ROLE_BODY, INSTRUCTIONS_ROTATED_MARKER, parse_archetype_markdown,
-    resolve_archetype_template,
+    BUILTIN_GENERAL_ROLE_BODY, INSTRUCTIONS_ROTATED_MARKER, resolve_archetype_template,
 };
 #[cfg(all(test, unix))]
 pub(crate) use archetypes::{archetype_search_roots, resolve_archetype_template_with_ancestors};
@@ -96,8 +95,7 @@ pub(crate) use workspace::write_agent_instructions_with_continuity;
 // their owning submodules.
 #[allow(unused_imports)]
 pub(crate) use archetypes::{
-    ArchetypeTemplate, archetype_search_roots_with_ancestors,
-    discover_available_archetype_slugs_with_ancestors,
+    archetype_search_roots_with_ancestors, discover_available_archetype_slugs_with_ancestors,
     has_configured_archetype_roots_with_ancestors, resolve_role_template_for_agent,
 };
 #[allow(unused_imports)]
