@@ -341,6 +341,11 @@ pub(super) struct AgentsArgs {
     /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
     #[serde(default)]
     pub(super) group_by: Option<String>,
+    /// Optional list of named deployment secret bundles to grant when `action` is
+    /// `"spawn"`, `"create"`, `"update"`, or `"secrets"`. Defaults to `[]` on
+    /// create/spawn. Non-admin parents may only grant secrets they themselves hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -410,6 +415,10 @@ pub(super) struct SpawnArgs {
     /// Optional persistent browser profile names to grant to the spawned child (`child ⊆ parent`).
     #[serde(default)]
     pub(super) browser_profiles: Option<Vec<String>>,
+    /// Optional list of named deployment secret bundles to grant to the spawned agent.
+    /// Defaults to `[]` when omitted. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -554,6 +563,10 @@ pub(super) struct SubagentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     pub(super) limit: Option<usize>,
+    /// Optional list of named deployment secret bundles when `action` is `"spawn"`,
+    /// `"update"`, or `"secrets"`. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

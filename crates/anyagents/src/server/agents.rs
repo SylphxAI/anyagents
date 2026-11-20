@@ -35,7 +35,9 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route(
             "/v1/agents/{name}",
-            get(get_agent).delete(delete_agent_route),
+            get(get_agent)
+                .patch(super::secrets::patch_agent_route)
+                .delete(delete_agent_route),
         )
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/rename", post(rename_agent_route))
@@ -879,6 +881,7 @@ pub(super) async fn get_agent(
             );
             if !can_actor_read_agent_private(&state.store, &principal, &agent) {
                 view.instructions = None;
+                view.secrets.clear();
             }
         }
         Ok(Json(view))
@@ -973,6 +976,12 @@ pub(super) async fn create_agent_route(
             parent_id.as_ref(),
             body.browser_profiles.as_deref(),
         )?;
+        let requested_secrets = super::secrets::validate_create_agent_secrets(
+            &state.store,
+            &principal,
+            parent_id.as_ref(),
+            body.secrets.as_deref(),
+        )?;
         let seat = crate::sandbox::RootSeatRequest {
             user: body.seat_user,
             uid: body.seat_uid,
@@ -1032,6 +1041,12 @@ pub(super) async fn create_agent_route(
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
+        super::secrets::apply_create_agent_secrets(
+            &state.store,
+            &agent.id,
+            &requested_secrets,
+            &actor,
+        )?;
         let finish = SpawnFinish {
             workdir: agent.workdir.clone(),
             actor,

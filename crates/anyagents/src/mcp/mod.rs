@@ -22,14 +22,15 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::api::{
-    AgentView, AgentsResponse, ConversationResponse, CreateAgentRequest, GroupActionRequest,
-    GroupView, GroupsResponse, InteractRequest, InteractResponse, SendArticle, SendChecklist,
-    SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
+    AgentView, AgentsResponse, ConversationResponse, GroupActionRequest, GroupView, GroupsResponse,
+    InteractRequest, InteractResponse, SendArticle, SendChecklist, SendLocation, SendMedia,
+    SendPoll, SendRequest, SendResponse,
 };
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
 mod agent_list;
+mod agent_secrets;
 mod args;
 mod browser_profiles;
 mod client;

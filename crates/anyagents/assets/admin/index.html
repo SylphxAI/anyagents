@@ -22,6 +22,7 @@
         <button class="nav-tab" data-tab="telemetry" type="button">Usage</button>
         <button class="nav-tab" data-tab="automations" type="button">Automations &amp; Ticks</button>
         <button class="nav-tab" data-tab="channels" type="button">Channels &amp; Groups</button>
+        <button class="nav-tab" data-tab="secrets" type="button">Secrets</button>
       </nav>
       <div class="topbar-actions">
         <span id="env-badge" class="pill pill-muted hidden"></span>
@@ -97,6 +98,14 @@
 
               <div id="insp-error-banner" class="alert alert-danger hidden"></div>
               <div id="insp-meta-grid" class="meta-grid"></div>
+
+              <div class="inspector-section">
+                <div class="section-header">
+                  <h3>Granted Secrets <span class="muted text-sm">(names only)</span></h3>
+                  <button id="btn-manage-agent-secrets" class="btn btn-secondary btn-sm" type="button">Manage Grants</button>
+                </div>
+                <div id="insp-secrets-list" class="badge-row"></div>
+              </div>
 
               <div class="inspector-section">
                 <h3>Send Test Message</h3>
@@ -240,6 +249,75 @@
               <span id="groups-count" class="muted text-sm"></span>
             </div>
             <div id="groups-list" class="card-body"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- Tab 6: Encrypted Deployment Secrets (Write-Only) -->
+      <section id="tab-secrets" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-group">
+            <h2>Encrypted Deployment Secrets</h2>
+            <span class="pill pill-muted">Write-Only &bull; AEAD Encrypted</span>
+          </div>
+          <div class="toolbar-group">
+            <button id="secrets-refresh-btn" class="btn btn-secondary" type="button">Refresh</button>
+          </div>
+        </div>
+
+        <section class="card">
+          <div class="card-header">
+            <h3>Named Secret Bundles</h3>
+            <span id="secrets-count" class="muted text-sm">0 secret bundle(s)</span>
+          </div>
+          <div id="secrets-table" class="table-wrap"></div>
+        </section>
+
+        <div class="split-grid mt-16">
+          <section class="card">
+            <div class="card-header">
+              <h3>Create / Rotate Secret (Write-Only)</h3>
+              <label class="checkbox-label">
+                <input id="secret-mask-toggle" type="checkbox" checked />
+                Mask input
+              </label>
+            </div>
+            <form id="form-secret-upsert" class="card-body secret-form" autocomplete="off">
+              <label class="field">
+                <span>Secret Bundle Name *</span>
+                <input id="secret-name" class="input mono" type="text" required autocomplete="off" spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="e.g. github-ci, stripe-prod" />
+              </label>
+              <label class="field">
+                <span>Environment Entries (KEY=VALUE lines, cleared on submit) *</span>
+                <textarea id="secret-env-lines" class="textarea secret-writeonly" rows="5" required autocomplete="off" spellcheck="false" placeholder="GH_TOKEN=...&#10;API_KEY=..."></textarea>
+              </label>
+              <p class="muted text-sm">
+                Write-only: values are sealed with <code>ANYAGENTS_MASTER_KEY</code> before storage and are never returned by any API or UI. Reserved <code>ANYAGENTS_*</code> keys are rejected.
+              </p>
+              <div class="toolbar-group">
+                <button class="btn btn-primary" type="submit">Encrypt &amp; Save Secret</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card">
+            <div class="card-header">
+              <h3>Agent Secret Grants</h3>
+              <span class="muted text-sm">Least-privilege capability delegation</span>
+            </div>
+            <form id="form-agent-secrets" class="card-body secret-form">
+              <label class="field">
+                <span>Target Agent</span>
+                <select id="secret-grant-agent" class="select"></select>
+              </label>
+              <div class="field">
+                <span>Granted Secret Bundles</span>
+                <div id="secret-grant-checkboxes" class="secret-grant-list"></div>
+              </div>
+              <div class="toolbar-group">
+                <button class="btn btn-primary" type="submit">Save Agent Grants</button>
+              </div>
+            </form>
           </section>
         </div>
       </section>
@@ -430,5 +508,6 @@
     </div>
   </div>
   <script src="/admin/assets/app.js" defer></script>
+  <script src="/admin/assets/secrets.js" defer></script>
 </body>
 </html>

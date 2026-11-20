@@ -230,6 +230,67 @@ pub(crate) fn apply_create_browser_profiles(
     Ok(())
 }
 
+/// Pre-validate `browser_profiles` requested during `PATCH /v1/agents/{name}`
+/// before any metadata or secret mutation runs, enforcing the exact
+/// `child ⊆ parent` Capability Attenuation Law (including denying non-admin
+/// self-mutation even when revoking to `[]`).
+pub(crate) fn validate_patch_browser_profiles(
+    store: &Store,
+    principal: &Principal,
+    target: &Agent,
+    requested: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let mut normalized = BTreeSet::new();
+    for raw in requested {
+        normalized.insert(validate_browser_profile_name(raw).map_err(ApiError::from_store)?);
+    }
+    let normalized: Vec<String> = normalized.into_iter().collect();
+    if principal_is_admin_or_operator(store, principal)? {
+        return Ok(normalized);
+    }
+    let Principal::Agent { agent_id, .. } = principal else {
+        return Err(ApiError::forbidden("administrative authority required"));
+    };
+    if agent_id == &target.id {
+        return Err(ApiError::forbidden(
+            "non-admin agent cannot modify its own browser profile grants",
+        ));
+    }
+    if target.parent_id.as_ref() != Some(agent_id) {
+        return Err(ApiError::forbidden(
+            "only an operator, admin, or the agent's direct parent may modify browser profile grants",
+        ));
+    }
+    let held: BTreeSet<String> = store
+        .list_agent_browser_profiles(agent_id)
+        .map_err(ApiError::from_store)?
+        .into_iter()
+        .collect();
+    for profile in &normalized {
+        if !held.contains(profile) {
+            return Err(ApiError::forbidden(format!(
+                "cannot grant browser profile `{profile}`: parent does not hold grant for `{profile}`"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+/// Apply pre-validated `browser_profiles` replacement during `PATCH /v1/agents/{name}`
+/// (unconditionally replacing grants so `[]` revokes existing grants).
+pub(crate) fn apply_patch_browser_profiles(
+    store: &Store,
+    principal: &Principal,
+    agent_id: &AgentId,
+    profiles: &[String],
+) -> Result<(), ApiError> {
+    let actor = actor_from_principal(principal);
+    store
+        .set_agent_browser_profiles_as(&actor, agent_id, profiles)
+        .map_err(ApiError::from_store)?;
+    Ok(())
+}
+
 async fn list_browser_profiles_route(
     principal: Principal,
     State(state): State<AppState>,
