@@ -646,6 +646,7 @@ mod tests {
             &[
                 "agents",
                 "send",
+                "report_bug",
                 "inbox",
                 "conversation",
                 "memory",

@@ -5950,6 +5950,7 @@ fn remote_session_tokens_get_universal_mcp_surface() {
         [
             "agents",
             "send",
+            "report_bug",
             "inbox",
             "conversation",
             "memory",
