@@ -2557,17 +2557,27 @@ mod tests {
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].seq, 1);
 
-        // Wait briefly for the spawned initial dispatch task to hit the transient 503 and arm retry.
+        // The backend can record the timer before dispatch retry state is persisted.
+        // Wait for both effects of the detached dispatch before inspecting the view.
         let rec_tid = reconcile_timer_id(&aid);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !recorder.scheduled_ids().contains(&rec_tid) {
+        let scheduled_at_ms = loop {
+            let scheduled_at_ms = recorder
+                .scheduled
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(id, at)| (id == &rec_tid).then_some(*at));
+            let retry = read_dispatch_retry_state(&store, &aid);
+            if let (Some(at), Some(_)) = (scheduled_at_ms, &retry) {
+                break at;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for spawn cold-wake retry timer; scheduled={:?}",
-                recorder.scheduled_ids()
+                "timed out waiting for spawn cold-wake retry: timer={scheduled_at_ms:?}, state={retry:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        };
 
         let agent = store.agent(&aid).unwrap();
         let failed_view =
@@ -2580,7 +2590,7 @@ mod tests {
             "expected spawn dispatch error in AgentView.last_error, got {:?}",
             failed_view.last_error
         );
-        assert!(failed_view.retry_at_ms.is_some());
+        assert_eq!(failed_view.retry_at_ms, Some(scheduled_at_ms));
 
         // Firing the armed reconcile timer recovers and drains `seq=1`.
         let app = crate::server::build_public_router(state.clone());
