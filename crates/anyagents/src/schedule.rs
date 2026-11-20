@@ -9,7 +9,8 @@
 //! any other message. Mailbox delivery alone decides when the owner sees it: it is
 //! steered into a running turn, or held while the owner is paused or quota-blocked
 //! and delivered on resume. A schedule adds no new tick while its previous one is
-//! still undelivered, so missed recurring ticks coalesce into one. Cancelling a
+//! still undelivered, so missed recurring ticks coalesce into one. Persistent webhook
+//! watches instead retain each distinct delivery. Cancelling a
 //! schedule takes effect immediately.
 //!
 //! The server's loop ([`start_loops`]) holds active schedules in memory and wakes
@@ -505,7 +506,8 @@ mod call_shape_tests {
     }
 }
 
-/// Create a new schedule for `agent` from `(at, every, watch, prompt)`.
+/// Create a schedule with the default one-shot watch behavior.
+#[cfg(test)]
 pub fn create_agent_schedule(
     store: &Store,
     health: &HealthBoard,
@@ -514,6 +516,20 @@ pub fn create_agent_schedule(
     every: Option<&str>,
     watch: Option<&str>,
     prompt: &str,
+) -> Result<ScheduleView, String> {
+    create_agent_schedule_with_mode(store, health, agent, at, every, watch, prompt, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_agent_schedule_with_mode(
+    store: &Store,
+    health: &HealthBoard,
+    agent: &Agent,
+    at: Option<&str>,
+    every: Option<&str>,
+    watch: Option<&str>,
+    prompt: &str,
+    persistent: bool,
 ) -> Result<ScheduleView, String> {
     let clean_prompt = prompt.trim();
     if clean_prompt.is_empty() || crate::api::is_null_word(clean_prompt) {
@@ -547,6 +563,14 @@ pub fn create_agent_schedule(
             "a schedule has exactly one trigger, and this call set {}. Make one call per trigger, e.g. {SCHEDULE_EXAMPLE} and `{{action: \"create\", at: \"30m\", prompt: \"...\"}}`",
             set.join(" and ")
         ));
+    }
+    if persistent
+        && !matches!(
+            watch_opt.map(parse_watch_spec),
+            Some(Ok(WatchTarget::Webhook { .. }))
+        )
+    {
+        return Err("`persistent` is only supported for webhook/event watches".into());
     }
     let now = anyagents_core::now_ms();
     let input = if let Some(at_str) = at_opt {
@@ -611,9 +635,12 @@ pub fn create_agent_schedule(
         unreachable!()
     };
 
-    let created = store
-        .create_schedule_jittered(input)
-        .map_err(|err| err.to_string())?;
+    let created = if persistent {
+        store.create_persistent_webhook_watch(input)
+    } else {
+        store.create_schedule_jittered(input)
+    }
+    .map_err(|err| err.to_string())?;
     schedules_changed(store.data_dir());
     Ok(ScheduleView::from(created))
 }
@@ -2374,96 +2401,6 @@ fn probe_path_fingerprint(path: &str) -> String {
     }
 }
 
-/// Result of delivering a generic authenticated webhook event against active
-/// `webhook:<topic>` watches.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct WebhookDispatch {
-    pub matched: usize,
-    pub fired_agents: Vec<AgentId>,
-}
-
-const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 8 * 1024;
-
-/// Fire every active `watch` schedule subscribed to `webhook:<topic>` (exact
-/// topic match or wildcard `*`).
-///
-/// Each matching watch receives one mailbox wake containing the event topic,
-/// delivery ID, and truncated JSON payload, keyed by `delivery_id` so retried
-/// deliveries remain idempotent.
-pub fn fire_webhook_event(
-    store: &Store,
-    topic: &str,
-    delivery_id: &str,
-    payload: &serde_json::Value,
-    now: i64,
-) -> Result<WebhookDispatch, anyagents_core::Error> {
-    let topic = topic.trim();
-    if topic.is_empty() {
-        return Ok(WebhookDispatch::default());
-    }
-    let schedules = store.list_schedules(None, true)?;
-    let mut dispatch = WebhookDispatch::default();
-    let payload_snippet = format_webhook_payload(payload);
-    for sched in schedules {
-        if sched.kind != "watch" {
-            continue;
-        }
-        let Ok(WatchTarget::Webhook { topic: watched }) = parse_watch_spec(&sched.spec) else {
-            continue;
-        };
-        if watched != topic && watched != "*" {
-            continue;
-        }
-        let agent = match schedule_owner(store, &sched) {
-            Owner::Live(agent) => agent,
-            Owner::Gone => {
-                cancel_for_gone_owner(store, &sched);
-                continue;
-            }
-            Owner::Unknown => continue,
-        };
-        dispatch.matched += 1;
-        let wake_prompt = format!(
-            "[webhook: {topic} delivery={delivery_id}]\n{}\n\nPayload:\n{payload_snippet}",
-            sched.prompt
-        );
-        let source_key = format!("schedule:{}:webhook:{topic}:{delivery_id}", sched.id);
-        let observed = format!("event:{topic}:{delivery_id}");
-        if claim_and_deliver_scheduled_wake(
-            store,
-            &agent,
-            &sched,
-            None,
-            "fired",
-            None,
-            sched.watch_baseline.as_deref(),
-            Some(&observed),
-            &wake_prompt,
-            &source_key,
-            now,
-        ) && !dispatch.fired_agents.contains(&agent.id)
-        {
-            dispatch.fired_agents.push(agent.id);
-        }
-    }
-    if dispatch.matched > 0 {
-        schedules_changed(store.data_dir());
-    }
-    Ok(dispatch)
-}
-
-fn format_webhook_payload(payload: &serde_json::Value) -> String {
-    let raw = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
-    if raw.len() <= MAX_WEBHOOK_PAYLOAD_BYTES {
-        return raw;
-    }
-    let mut end = MAX_WEBHOOK_PAYLOAD_BYTES;
-    while end > 0 && !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...(truncated)", &raw[..end])
-}
-
 fn evaluate_agent_idle_watch(
     store: &Store,
     health: &HealthBoard,
@@ -2560,6 +2497,9 @@ fn evaluate_agent_idle_watch(
 
 mod github;
 mod local;
+mod webhook;
+pub use webhook::fire_webhook_event;
+pub(crate) use webhook::fresh_delivery_id;
 
 #[cfg(test)]
 pub(crate) use github::{RestoreEnv, reset_probes_for_test, spawn_mock_github};

@@ -5,7 +5,7 @@ use std::io::Read;
 
 use super::helpers::{agent_by_id, hex};
 use super::mailbox::cursor;
-use super::types::{AgentSchedule, Incoming, NewSchedule};
+use super::types::{AgentSchedule, Incoming, NewSchedule, ReceiveOutcome};
 use super::{Store, now_ms};
 use crate::db::{DbExec, DbExecExt, DbRow};
 use crate::db_params;
@@ -29,6 +29,11 @@ pub(super) fn cancel_archived_schedules(
     )?;
     Ok(())
 }
+
+// `kind` is an unconstrained trigger discriminator in both stores. A standing
+// webhook is a distinct trigger, not an annotation on the topic or baseline.
+// Expose it as kind=watch, persistent=true at the Store boundary.
+const WEBHOOK_SUBSCRIPTION: &str = "webhook_subscription";
 
 const RECURRING_JITTER_MIN_INTERVAL_MS: i64 = 15 * 60_000;
 const RECURRING_JITTER_MAX_MS: i64 = 180_000;
@@ -85,6 +90,24 @@ impl Store {
         self.create_schedule_inner(input, true)
     }
 
+    /// Create a standing webhook subscription, separate from any one-shot watch.
+    pub fn create_persistent_webhook_watch(
+        &self,
+        mut input: NewSchedule,
+    ) -> Result<AgentSchedule, Error> {
+        if input.kind != "watch"
+            || !(input.spec.starts_with("webhook:") || input.spec.starts_with("event:"))
+            || input.interval_ms.is_some()
+            || input.next_fire_at_ms.is_some()
+        {
+            return Err(Error::Message(
+                "persistent schedules require a webhook watch".into(),
+            ));
+        }
+        input.kind = WEBHOOK_SUBSCRIPTION.into();
+        self.create_schedule_inner(input, false)
+    }
+
     fn create_schedule_inner(
         &self,
         input: NewSchedule,
@@ -97,6 +120,9 @@ impl Store {
         }
         let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
         self.write_tx(|tx| {
+            if input.kind == WEBHOOK_SUBSCRIPTION {
+                tx.lock_agent_for_seq(input.agent_id.as_str())?;
+            }
             let owner = agent_by_id(tx, &input.agent_id)?;
             if owner.state == "archived" {
                 return Err(Error::Precondition {
@@ -120,7 +146,7 @@ impl Store {
                 }
             };
             // Deduplicate identical active recurring/watch schedules for the same agent.
-            if (input.kind == "every" || input.kind == "watch")
+            if matches!(input.kind.as_str(), "every" | "watch" | WEBHOOK_SUBSCRIPTION)
                 && let Some(existing_id) = tx.db_query_opt(
                     "SELECT id FROM agent_schedules
                      WHERE agent_id = ?1 AND kind = ?2 AND spec = ?3 AND prompt = ?4 AND state = 'active'
@@ -427,6 +453,47 @@ impl Store {
         Ok(outcome.is_some())
     }
 
+    /// Retain a distinct delivery and update its active subscription atomically.
+    /// The source alias is the durable receipt even after mailbox delivery.
+    /// The caller holds the lifecycle lock and checks external archive markers.
+    pub fn deliver_persistent_webhook_wake(
+        &self,
+        schedule_id: &str,
+        agent_id: &AgentId,
+        source_key: &str,
+        prompt: String,
+        observed: &str,
+        now: i64,
+    ) -> Result<bool, Error> {
+        let mut incoming = Incoming::new(prompt);
+        incoming.source_key = Some(source_key.into());
+        incoming.sender = Some(format!("schedule:{schedule_id}"));
+        incoming.received_at_ms = Some(now);
+        incoming.source_time_ms = Some(now);
+        let outcome = self.receive_with_admission(agent_id, incoming, true, |conn| {
+            // Lock the owner first, in the same order as archival. The lock
+            // also makes a concurrent retry see the committed source alias.
+            conn.lock_agent_for_seq(agent_id.as_str())?;
+            let duplicate: bool = conn.db_query_one(
+                "SELECT EXISTS(SELECT 1 FROM message_source_aliases WHERE agent_id = ?1 AND source_key = ?2
+                   UNION ALL SELECT 1 FROM messages WHERE agent_id = ?1 AND source_key = ?2)",
+                &db_params![agent_id.as_str(), source_key],
+                |r| r.get(0),
+            )?;
+            if duplicate {
+                return Ok(false);
+            }
+            let updated = conn.db_execute(
+                "UPDATE agent_schedules SET last_fired_at_ms = ?4, last_observed = ?5
+                 WHERE id = ?1 AND agent_id = ?2 AND kind = ?3 AND state = 'active'
+                   AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND state <> 'archived')",
+                &db_params![schedule_id, agent_id.as_str(), WEBHOOK_SUBSCRIPTION, now, observed],
+            )?;
+            Ok(updated == 1)
+        })?;
+        Ok(matches!(outcome, Some(ReceiveOutcome::New(_))))
+    }
+
     /// Whether the agent's mailbox still holds a message from `sender` that the
     /// harness has not taken.
     pub fn has_undelivered_message_from(
@@ -535,10 +602,12 @@ fn schedule_by_id(conn: &dyn DbExec, id: &str) -> Result<AgentSchedule, Error> {
 
 fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
     let agent_id = row.parse_str(1)?;
+    let kind: String = row.get(2)?;
+    let persistent = kind == WEBHOOK_SUBSCRIPTION;
     Ok(AgentSchedule {
         id: row.get(0)?,
         agent_id,
-        kind: row.get(2)?,
+        kind: if persistent { "watch".into() } else { kind },
         spec: row.get(3)?,
         prompt: row.get(4)?,
         interval_ms: row.get(5)?,
@@ -549,6 +618,7 @@ fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
         state: row.get(10)?,
         created_at_ms: row.get(11)?,
         external_timer_id: row.get(12)?,
+        persistent,
     })
 }
 

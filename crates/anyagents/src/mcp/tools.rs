@@ -1327,6 +1327,7 @@ impl AgentMcp {
             "at": args.at,
             "every": args.every,
             "watch": args.watch,
+            "persistent": args.persistent,
             "spec": args.spec,
             "prompt": args.prompt,
             "id": args.id,

@@ -38,6 +38,7 @@ pub(super) struct ScheduleRequest {
     pub(super) every: Option<String>,
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     pub(super) watch: Option<String>,
+    pub(super) persistent: Option<bool>,
     /// A trigger value or mode under a generic name; see
     /// `schedule::resolve_schedule_call`.
     #[serde(
@@ -345,6 +346,12 @@ pub(super) async fn handle_schedule_action(
         body.every = trigger.every;
         body.watch = trigger.watch;
 
+        if body.persistent == Some(true) && !matches!(verb, ScheduleVerb::Create) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "`persistent` is only supported when creating a webhook/event watch",
+            ));
+        }
         if is_fleet_schedule_target(body.agent.as_deref()) {
             if !matches!(verb, ScheduleVerb::List) {
                 return Err(ApiError::new(
@@ -395,7 +402,7 @@ pub(super) async fn handle_schedule_action(
                         &state.health,
                         anyagents_core::now_ms(),
                     );
-                let created = crate::schedule::create_agent_schedule(
+                let created = crate::schedule::create_agent_schedule_with_mode(
                     &state.store,
                     &effective_health,
                     &target,
@@ -403,6 +410,7 @@ pub(super) async fn handle_schedule_action(
                     body.every.as_deref(),
                     body.watch.as_deref(),
                     prompt,
+                    body.persistent.unwrap_or(false),
                 )
                 .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
                 if let Ok(Some(sched_row)) = state.store.get_schedule(&created.id)
