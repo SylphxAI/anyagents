@@ -930,40 +930,9 @@ pub struct SendResponse {
     pub skipped: Vec<SkippedDelivery>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-pub struct InteractRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    /// Channel action: `"react"` (set/clear emoji reaction), `"vote"` (cast a ballot on a poll),
-    /// `"check"` / `"uncheck"` (toggle checklist items by 1-based index in `options`),
-    /// `"edit"` (edit message text), `"delete"` (delete a message), `"pin"` (pin a message),
-    /// `"unpin"` (unpin a message), or `"stop_poll"` / `"close_poll"` (close a poll).
-    pub action: String,
-    /// Target message: `anyagents:reply:msg_...` from the message header, `msg_...`,
-    /// or `telegram:chat:<chat_id>:<message_id>`.
-    pub target: String,
-    /// Emoji reaction for `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, or `""` to clear).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub emoji: Option<String>,
-    /// Selected poll option(s) for `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text).
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub options: Vec<String>,
-    /// New text for `action = "edit"`, or optional rationale/comment for `action = "vote"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// The sender's own channel bot to act through (`@username` or channel id).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bot: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct InteractResponse {
-    pub ok: bool,
-    pub action: String,
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
+mod interact;
+pub(crate) use interact::is_telegram_chat_admin_action;
+pub use interact::{InteractRequest, InteractResponse};
 
 #[cfg(test)]
 mod create_agent_tests {

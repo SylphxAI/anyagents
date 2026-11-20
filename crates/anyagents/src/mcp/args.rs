@@ -2,70 +2,8 @@
 
 use super::*;
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub(super) struct SendArgs {
-    /// Destinations: agent names or IDs (`planner`, `agent:planner`, `agt_...`, `parent`,
-    /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
-    /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
-    /// `telegram:user:<user_id>[:<message_id>]`). A send never wakes an archived
-    /// agent: one addressed only to archived agents fails with `409`; wake it
-    /// first with `agents(action="wake")`. May be
-    /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
-    /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
-    #[serde(default, deserialize_with = "deserialize_send_targets")]
-    pub(super) to: Vec<String>,
-    /// Message text or caption (Markdown is automatically rendered as rich HTML on Telegram).
-    /// Also used as new message text when `action = "edit"` or optional comment when `action = "vote"`.
-    #[serde(default)]
-    pub(super) text: String,
-    /// Optional reply or interaction target: `anyagents:reply:<msg_id>` from the message header
-    /// (answers or reacts in the same chat/topic/agent), or a plain destination address.
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) reply_to: Option<String>,
-    /// Optional quoted substring or message text to attach as a quote.
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) quote: Option<String>,
-    /// Optional media attachment (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`)
-    /// by local file path, `https://` URL, or Telegram `file_id` (plus optional `title` and `performer` for `music`/`audio`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) media: Option<SendMedia>,
-    /// Optional GPS coordinates or venue (`latitude`, `longitude`, optional `title` and `address`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) location: Option<SendLocation>,
-    /// Optional interactive poll (`question`, `options`, optional `is_anonymous` and `allows_multiple_answers`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) poll: Option<SendPoll>,
-    /// Optional interactive checklist (`title`, `tasks`, optional `business_connection_id`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) checklist: Option<SendChecklist>,
-    /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) article: Option<SendArticle>,
-    /// Optional message interaction action (`"send"` default, or `"react"`, `"vote"`, `"check"`, `"uncheck"`,
-    /// `"edit"`, `"delete"`, `"pin"`, `"unpin"`, `"stop_poll"` on an existing message identified by `target` or `reply_to`).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) action: Option<String>,
-    /// Target message for interactions (`anyagents:reply:msg_...`, `msg_...`, or `telegram:chat:<chat_id>:<message_id>`).
-    /// Falls back to `reply_to` if omitted.
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) target: Option<String>,
-    /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) emoji: Option<String>,
-    /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text)
-    /// or checklist item numbers when `action = "check" | "uncheck"`.
-    #[serde(default, deserialize_with = "deserialize_send_targets")]
-    pub(super) options: Vec<String>,
-    /// Optional own channel bot to post or act through (`@username` or channel id),
-    /// needed only when this agent has more than one bot. Unknown bots and other
-    /// agents' bots are refused.
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) bot: Option<String>,
-    /// Names this send. Send it again with the same value only when an earlier
-    /// attempt got no answer.
-    #[serde(default, deserialize_with = "crate::api::absent_if_null")]
-    pub(super) idempotency_key: Option<String>,
-}
+mod send;
+pub(super) use send::SendArgs;
 
 /// A destination word that names agents by their relation to the sender.
 pub(super) fn relation_word(raw: &str) -> Option<&'static str> {

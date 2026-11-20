@@ -6,112 +6,19 @@ use super::*;
 mod memory_tool;
 use memory_tool::MemoryArgs;
 
+#[path = "send_tool.rs"]
+mod send_tool;
+
 #[tool_router(vis = "pub(super)")]
 impl AgentMcp {
     #[tool(
-        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). Use `operator` to report a defect in AnyAgents, the harness, or the host environment that you cannot fix within your own work. Include the exact error and what you tried. Do not work around it silently."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). For Telegram chat administration, use `set_chat_title`, `set_chat_description`, or `set_chat_photo` with one `telegram:chat:<chat_id>` in `target` or `to`. The selected `bot` must have admin rights to change chat info. Supply `text` for title or description or `media: {kind: \"photo\", source: ...}` (local JPEG/PNG or direct public HTTP(S) image URL) for photo. Use `operator` to report a defect in AnyAgents, the harness, or the host environment that you cannot fix within your own work. Include the exact error and what you tried. Do not work around it silently."
     )]
     pub(super) async fn send(
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
-        let mut args = args;
-        // Relation words (`parent`, `children`, ...) read the same in `to` and
-        // in `reply_to`, whatever their case or `agent:` prefix.
-        for target in &mut args.to {
-            if let Some(word) = relation_word(target) {
-                *target = word.to_string();
-            }
-        }
-        if args.to.is_empty()
-            && let Some(word) = args
-                .reply_to
-                .as_deref()
-                .and_then(relation_word)
-                .filter(|word| matches!(*word, "parent" | "children"))
-        {
-            args.to = vec![word.to_string()];
-            args.reply_to = None;
-        }
-        let inferred_interact = args
-            .action
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("send"))
-            .map(str::to_ascii_lowercase)
-            .or_else(|| {
-                if args.emoji.is_some() && args.to.is_empty() && args.text.trim().is_empty() {
-                    Some("react".to_string())
-                } else {
-                    None
-                }
-            });
-        if let Some(interact_action) = inferred_interact {
-            let target = args
-                .target
-                .or(args.reply_to)
-                .or_else(|| args.to.into_iter().next())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    format!("`send` with `action = \"{interact_action}\"` requires `target` or `reply_to`")
-                })?;
-            let text_opt = if args.text.trim().is_empty() {
-                None
-            } else {
-                Some(args.text)
-            };
-            let res = self
-                .interact(Parameters(InteractArgs {
-                    action: interact_action,
-                    target,
-                    emoji: args.emoji,
-                    options: args.options,
-                    text: text_opt,
-                    bot: args.bot,
-                }))
-                .await?
-                .0;
-            return Ok(rmcp::handler::server::wrapper::Json(
-                serde_json::to_value(res).map_err(|e| e.to_string())?,
-            ));
-        }
-
-        let quote =
-            args.quote
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|t| anyagents_core::Quote {
-                    text: t.to_string(),
-                    ..anyagents_core::Quote::default()
-                });
-        let body = SendRequest {
-            // The server sends as this agent whatever this says, and refuses a
-            // body that names anyone else.
-            sender: Some(format!("agent:{}", self.agent.name)),
-            to: args.to,
-            text: args.text,
-            reply_to: args.reply_to,
-            quote,
-            media: args.media,
-            location: args.location,
-            poll: args.poll,
-            checklist: args.checklist,
-            article: args.article,
-            bot: args.bot,
-            idempotency_key: args.idempotency_key,
-        };
-        let closing = body.is_turn_closing_sentinel();
-        let response: SendResponse = self
-            .client
-            .get(
-                "/v1/send",
-                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
-            )
-            .await?;
-        Ok(rmcp::handler::server::wrapper::Json(send_turn_result(
-            response, closing,
-        )?))
+        send_tool::send(self, args).await
     }
 
     #[tool(
@@ -563,7 +470,7 @@ impl AgentMcp {
                     .ok_or_else(|| "`agents steer` requires `prompt`".to_string())?;
                 self.send(Parameters(SendArgs {
                     to: vec![target.to_string()],
-                    text: text.to_string(),
+                    text: Some(text.to_string()),
                     ..SendArgs::default()
                 }))
                 .await
@@ -991,7 +898,7 @@ impl AgentMcp {
                 let sent = self
                     .send(Parameters(SendArgs {
                         to: vec![target.to_string()],
-                        text: text.to_string(),
+                        text: Some(text.to_string()),
                         ..SendArgs::default()
                     }))
                     .await?
@@ -1187,7 +1094,7 @@ impl AgentMcp {
             let _ = self
                 .send(Parameters(SendArgs {
                     to: vec![target],
-                    text: prompt.to_string(),
+                    text: Some(prompt.to_string()),
                     ..SendArgs::default()
                 }))
                 .await?;
@@ -1272,22 +1179,17 @@ impl AgentMcp {
         Parameters(args): Parameters<InteractArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<InteractResponse>, String> {
         let body = InteractRequest {
-            sender: Some(format!("agent:{}", self.agent.name)),
             action: args.action,
             target: args.target,
             emoji: args.emoji,
             options: args.options,
             text: args.text,
             bot: args.bot,
+            ..Default::default()
         };
-        let response = self
-            .client
-            .get(
-                "/v1/interact",
-                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
-            )
-            .await?;
-        Ok(rmcp::handler::server::wrapper::Json(response))
+        Ok(rmcp::handler::server::wrapper::Json(
+            send_tool::post_interaction(self, body).await?,
+        ))
     }
 
     #[tool(

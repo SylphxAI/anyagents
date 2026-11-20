@@ -58,6 +58,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"
 toml = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ureq = { version = "3", features = ["json"] }
 url = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -72,7 +73,6 @@ anyagents-core = { path = "../anyagents-core" }
 anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 anyagents-harness-muse = { path = "../anyagents-harness-muse" }
 anyagents-invariants = { path = "../../tests/invariants" }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
