@@ -138,7 +138,6 @@ pub use operator_inbox::{
     OPERATOR_BURST, OPERATOR_FLEET_BURST, OPERATOR_FLEET_HOURLY_CAP, OPERATOR_HOURLY_CAP,
     OperatorMessage, OperatorReceipt, OperatorReport,
 };
-pub use origin::format_edited_message_diff;
 pub(crate) use origin::origin_namespace;
 pub use registry::holds_store_writer;
 pub use remote_sessions::{
@@ -160,8 +159,7 @@ pub use types::{
 };
 pub use usage::{
     UsageAccessError, UsageBucket, UsageFilter, UsageGroupBy, UsageReport, UsageTotal, UsageTotals,
-    aggregate_usage, resolve_usage_agents, sum_usage, usage_caller_is_privileged,
-    usage_descendants, utc_day,
+    aggregate_usage, resolve_usage_agents, sum_usage, utc_day,
 };
 
 // Re-exports kept at `store` root for existing sibling submodules (`use super::...`).
