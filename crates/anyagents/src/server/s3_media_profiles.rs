@@ -788,10 +788,12 @@ mod tests {
         }
     }
 
-    fn spawn_mock_s3(bucket: &str) -> (String, Arc<Mutex<BTreeMap<String, Vec<u8>>>>) {
+    type MockS3Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+
+    fn spawn_mock_s3(bucket: &str) -> (String, MockS3Objects) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock S3");
         let addr = listener.local_addr().unwrap();
-        let objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let objects: MockS3Objects = Arc::new(Mutex::new(BTreeMap::new()));
         let objects_srv = Arc::clone(&objects);
         let bucket_prefix = format!("/{bucket}/");
         let bucket_root = format!("/{bucket}");
