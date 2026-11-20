@@ -588,7 +588,7 @@ pub(super) struct DescriptionRequest {
     #[serde(default)]
     pub(super) lifecycle: Option<String>,
     #[serde(default, alias = "allow_external")]
-    public: Option<bool>,
+    pub(super) public: Option<bool>,
     #[serde(default)]
     pub(super) clear: Option<bool>,
 }
@@ -1089,7 +1089,7 @@ pub(super) struct SpawnFinish {
     /// The spawning agent's id: the prompt's sender and a group member.
     pub(super) caller: Option<String>,
     pub(super) scope: Option<String>,
-    public: Option<bool>,
+    pub(super) public: Option<bool>,
     pub(super) lifecycle: Option<String>,
     pub(super) groups: Vec<String>,
     pub(super) prompt: Option<String>,
