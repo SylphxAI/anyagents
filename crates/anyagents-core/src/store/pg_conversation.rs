@@ -12,7 +12,7 @@ use super::helpers::agent_by_id;
 use super::history::{matches_conversation_peer, visible_agent_ids_sql};
 use super::index_sync::tokenize_hybrid_search_tokens;
 use super::types::{ConversationTurn, HistorySearchQuery, HistorySort};
-use crate::db::{DbBackend, DbExecExt as _, DbParam, ToDbParam};
+use crate::db::{DbBackend, DbExec as _, DbExecExt as _, DbParam, ToDbParam};
 use crate::error::Error;
 use crate::id::AgentId;
 
