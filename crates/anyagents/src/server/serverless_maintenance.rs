@@ -34,6 +34,7 @@ pub(crate) const SYS_RECONCILE_PREFIX: &str = "sys:reconcile:";
 
 const SYS_TIMERS_BLOB_NS: &str = "markers";
 const MIN_LEASE_RENEW_LEAD_MS: i64 = 5_000;
+const OVERDUE_SCHEDULE_CATCHUP_DELAY_MS: i64 = 1_000;
 const RECONCILE_RETRY_DELAY_MS: i64 = 15_000;
 const STARTUP_ACTIVE_TURN_LIMIT: usize = 64;
 
@@ -854,12 +855,46 @@ pub(crate) async fn fire_system_timer(
     })
 }
 
+/// Reconcile stale serverless sandbox turns and orphaned `turn_recovery` open-turn
+/// locks for a single agent before computing runtime cutover state.
+///
+/// In non-serverless mode this is a pure `store.has_open_turn(agent_id)` read.
+/// In serverless mode, any stale sandbox turn (`last_event_at_ms <= now - threshold`)
+/// is settled first, and if zero active remote turns remain the orphaned open-turn
+/// lock is cleared so dead sandboxes never stall `cutover_status` forever.
+pub(crate) fn reconcile_agent_open_turn_serverless(store: &Store, agent_id: &AgentId) -> bool {
+    let mut open_turn = store.has_open_turn(agent_id).unwrap_or(false);
+    if !open_turn || !is_serverless_mode() {
+        return open_turn;
+    }
+    let now = now_ms();
+    let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
+    if let Ok(active_turns) = store.remote_turn_store().list_active_for_agent(agent_id) {
+        for turn in &active_turns {
+            if turn.harness_kind == "sandbox" && turn.last_event_at_ms <= stale_before {
+                let _ = super::serverless_failure::settle_timed_out_sandbox_turn(store, turn, now);
+            }
+        }
+        let no_live_remote_turns = store
+            .remote_turn_store()
+            .list_active_for_agent(agent_id)
+            .is_ok_and(|turns| turns.is_empty());
+        if no_live_remote_turns {
+            let _ = store.reconcile_stale_open_turn(agent_id);
+            open_turn = store.has_open_turn(agent_id).unwrap_or(false);
+        }
+    }
+    open_turn
+}
+
 /// Summary of startup/cold-start serverless reconciliation & backlog drain (`2c`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StartupReconcileReport {
     pub stale_open_turns_cleared: usize,
     pub stale_turns_settled: usize,
     pub timers_rearmed: usize,
+    pub schedules_rearmed: usize,
+    pub overdue_schedules_rearmed: usize,
     pub backlog_dispatched: usize,
 }
 
@@ -867,7 +902,9 @@ pub(crate) struct StartupReconcileReport {
 /// 1. Settles already-stale sandbox turns (`2b`) and re-arms `sys:turn-timeout:*` /
 ///    `sys:cloud-poll:*` timers for still-live remote turns (`2a`, `2b`).
 /// 2. Re-arms `sys:lease-renew:*` for active ready sandbox bindings (`3`).
-/// 3. Reconciles orphaned `turn_recovery` open-turn locks and drains queued undelivered
+/// 3. Rehydrates active user schedules (`every`, `at`, `watch`) onto `timer_backend`
+///    when `!timer_backend.is_noop()`, including immediate catch-up for overdue rows.
+/// 4. Reconciles orphaned `turn_recovery` open-turn locks and drains queued undelivered
 ///    mailbox messages for running idle agents (`2c`).
 pub(crate) async fn startup_reconcile_serverless(
     store: Arc<Store>,
@@ -975,7 +1012,118 @@ pub(crate) async fn startup_reconcile_serverless(
                 }
             }
 
-            // 3. Reconcile orphaned open turns and gather running agents with undelivered mail.
+            // 3. Rehydrate active user schedules (`every`, `at`, `watch`) onto the active
+            //    TimerBackend so coordinator deploys/restarts never strand existing schedules.
+            if !tb_b.is_noop()
+                && let Ok(active_schedules) = store_b.list_schedules(None, true)
+            {
+                let catchup_at = now.saturating_add(OVERDUE_SCHEDULE_CATCHUP_DELAY_MS);
+                for sched in &active_schedules {
+                    if sched.state != "active" {
+                        continue;
+                    }
+                    let owner_archived_or_missing = match store_b.agent(&sched.agent_id) {
+                        Ok(agent) => {
+                            agent.state == "archived"
+                                || super::is_explicitly_archived(store_b.data_dir(), &agent)
+                        }
+                        Err(anyagents_core::Error::AgentNotFound(_)) => true,
+                        Err(_) => false,
+                    };
+                    if owner_archived_or_missing {
+                        continue;
+                    }
+                    match sched.kind.as_str() {
+                        "at" | "every" => {
+                            let Some(due_ms) = sched.next_fire_at_ms else {
+                                continue;
+                            };
+                            if due_ms <= now {
+                                let fire_at = due_ms.max(catchup_at);
+                                match crate::timer::arm_schedule_timer_at(
+                                    &store_b,
+                                    tb_b.as_ref(),
+                                    sched,
+                                    fire_at,
+                                ) {
+                                    Ok(_) => report.overdue_schedules_rearmed += 1,
+                                    Err(err) => eprintln!(
+                                        "anyagents-serverless: failed to re-arm overdue schedule {}: {err}",
+                                        sched.id
+                                    ),
+                                }
+                            } else {
+                                match crate::timer::arm_schedule_timer(
+                                    &store_b,
+                                    tb_b.as_ref(),
+                                    sched,
+                                ) {
+                                    Ok(_) => report.schedules_rearmed += 1,
+                                    Err(err) => eprintln!(
+                                        "anyagents-serverless: failed to re-arm schedule {}: {err}",
+                                        sched.id
+                                    ),
+                                }
+                            }
+                        }
+                        "watch" => {
+                            if matches!(
+                                crate::schedule::parse_watch_spec(&sched.spec),
+                                Ok(crate::schedule::WatchTarget::Webhook { .. })
+                            ) {
+                                continue;
+                            }
+                            match sched.next_fire_at_ms {
+                                Some(due_ms) if due_ms <= now => {
+                                    let fire_at = due_ms.max(catchup_at);
+                                    match crate::timer::arm_schedule_timer_at(
+                                        &store_b,
+                                        tb_b.as_ref(),
+                                        sched,
+                                        fire_at,
+                                    ) {
+                                        Ok(_) => report.overdue_schedules_rearmed += 1,
+                                        Err(err) => eprintln!(
+                                            "anyagents-serverless: failed to re-arm overdue watch {}: {err}",
+                                            sched.id
+                                        ),
+                                    }
+                                }
+                                Some(_) => {
+                                    match crate::timer::arm_schedule_timer(
+                                        &store_b,
+                                        tb_b.as_ref(),
+                                        sched,
+                                    ) {
+                                        Ok(_) => report.schedules_rearmed += 1,
+                                        Err(err) => eprintln!(
+                                            "anyagents-serverless: failed to re-arm watch {}: {err}",
+                                            sched.id
+                                        ),
+                                    }
+                                }
+                                None => {
+                                    match crate::timer::arm_schedule_timer_at(
+                                        &store_b,
+                                        tb_b.as_ref(),
+                                        sched,
+                                        catchup_at,
+                                    ) {
+                                        Ok(_) => report.schedules_rearmed += 1,
+                                        Err(err) => eprintln!(
+                                            "anyagents-serverless: failed to re-arm watch probe {}: {err}",
+                                            sched.id
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 4. Reconcile orphaned open turns and gather running agents with undelivered mail.
             report.stale_open_turns_cleared = if store_b.is_postgres() {
                 store_b
                     .reconcile_all_stale_serverless_open_turns()
@@ -1049,6 +1197,17 @@ pub(crate) async fn startup_reconcile_serverless(
             }
         }
     }
+
+    eprintln!(
+        "anyagents-serverless: startup_reconcile complete backend={} schedules_rearmed={} overdue_schedules_rearmed={} timers_rearmed={} stale_turns_settled={} stale_open_turns_cleared={} backlog_dispatched={}",
+        timer_backend.backend_kind(),
+        report.schedules_rearmed,
+        report.overdue_schedules_rearmed,
+        report.timers_rearmed,
+        report.stale_turns_settled,
+        report.stale_open_turns_cleared,
+        report.backlog_dispatched,
+    );
 
     Ok(report)
 }
@@ -1719,5 +1878,273 @@ mod tests {
         assert!(j2.get("next_run_ms").is_none());
         assert_eq!(ensure_hits.load(Ordering::SeqCst), 1);
         assert_eq!(recorder.scheduled_ids().len(), 1);
+    }
+
+    /// Regression test: `startup_reconcile_serverless` re-arms active future `every`/`at`
+    /// schedules, re-arms overdue (`next_fire_at_ms <= now`) schedules at `>= now + 1000`
+    /// so external delayed-run schedulers never reject past timestamps, re-arms pollable
+    /// watches while skipping push-only webhooks, skips cancelled/fired/paused schedules,
+    /// and does not arm anything when `TimerBackend::is_noop()` is true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_reconcile_rehydrates_future_overdue_and_watch_schedules_and_skips_inactive() {
+        use anyagents_core::NewSchedule;
+
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("sched-rehydrate-agent", "codex"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+        let peer = store
+            .create_agent(NewAgent::new("watch-target-peer", "codex"))
+            .unwrap();
+        store.set_agent_running(&peer.id, "/work").unwrap();
+
+        let now = now_ms();
+        let future_every_due = now + 3_600_000;
+        let future_at_due = now + 600_000;
+        let overdue_every_due = now - 60_000;
+        let overdue_at_due = now - 30_000;
+
+        let future_every = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "every".into(),
+                spec: "1h".into(),
+                prompt: "future hourly patrol".into(),
+                interval_ms: Some(3_600_000),
+                next_fire_at_ms: Some(future_every_due),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let future_at = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "10m".into(),
+                prompt: "future reminder".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(future_at_due),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let overdue_every = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "every".into(),
+                spec: "5m".into(),
+                prompt: "overdue recurring patrol".into(),
+                interval_ms: Some(300_000),
+                next_fire_at_ms: Some(overdue_every_due),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let overdue_at = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "1s".into(),
+                prompt: "overdue one-shot reminder".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(overdue_at_due),
+                watch_baseline: None,
+            })
+            .unwrap();
+        let active_watch = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "watch".into(),
+                spec: format!("agent:idle:{}", peer.name),
+                prompt: "peer went idle".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+        let webhook_watch = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "watch".into(),
+                spec: "webhook:deploy".into(),
+                prompt: "push webhook event".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: None,
+            })
+            .unwrap();
+
+        // Inactive schedules that MUST be skipped: cancelled, fired, paused.
+        let cancelled = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "every".into(),
+                spec: "15m".into(),
+                prompt: "cancelled schedule".into(),
+                interval_ms: Some(900_000),
+                next_fire_at_ms: Some(now + 900_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        store
+            .cancel_schedule(Some(&agent.id), &cancelled.id)
+            .unwrap();
+
+        let fired = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "at".into(),
+                spec: "1m".into(),
+                prompt: "already fired schedule".into(),
+                interval_ms: None,
+                next_fire_at_ms: Some(now + 60_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .claim_schedule_tick(
+                    &fired.id,
+                    fired.next_fire_at_ms,
+                    "fired",
+                    None,
+                    Some(now),
+                    None,
+                    Some("fired"),
+                )
+                .unwrap()
+        );
+
+        let paused = store
+            .create_schedule(NewSchedule {
+                agent_id: agent.id.clone(),
+                kind: "every".into(),
+                spec: "30m".into(),
+                prompt: "paused schedule".into(),
+                interval_ms: Some(1_800_000),
+                next_fire_at_ms: Some(now + 1_800_000),
+                watch_baseline: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .claim_schedule_tick(
+                    &paused.id,
+                    paused.next_fire_at_ms,
+                    "paused",
+                    paused.next_fire_at_ms,
+                    None,
+                    None,
+                    Some("paused"),
+                )
+                .unwrap()
+        );
+
+        // 1. NoopTimerBackend skips rehydration cleanly.
+        let noop_report =
+            startup_reconcile_serverless(Arc::clone(&store), Arc::new(NoopTimerBackend))
+                .await
+                .unwrap();
+        assert_eq!(noop_report.schedules_rearmed, 0);
+        assert_eq!(noop_report.overdue_schedules_rearmed, 0);
+
+        // 2. Active TimerBackend rehydrates future, overdue, and pollable watch schedules.
+        let recorder = Arc::new(MockTimerRecorder::default());
+        let before_reconcile = now_ms();
+        let report = startup_reconcile_serverless(
+            Arc::clone(&store),
+            Arc::clone(&recorder) as Arc<dyn TimerBackend>,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.schedules_rearmed, 3);
+        assert_eq!(report.overdue_schedules_rearmed, 2);
+
+        let scheduled: std::collections::HashMap<String, i64> =
+            recorder.scheduled.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            scheduled.len(),
+            5,
+            "unexpected scheduled set: {scheduled:?}"
+        );
+
+        // Future schedules keep their exact persisted next_fire_at_ms (deterministic runId!).
+        assert_eq!(scheduled.get(&future_every.id), Some(&future_every_due));
+        assert_eq!(scheduled.get(&future_at.id), Some(&future_at_due));
+
+        // Overdue schedules are scheduled at >= now + 1_000 while DB preserves original due time.
+        let overdue_every_armed = *scheduled.get(&overdue_every.id).unwrap();
+        let overdue_at_armed = *scheduled.get(&overdue_at.id).unwrap();
+        assert!(
+            overdue_every_armed >= before_reconcile + OVERDUE_SCHEDULE_CATCHUP_DELAY_MS,
+            "expected overdue every armed >= {}, got {overdue_every_armed}",
+            before_reconcile + OVERDUE_SCHEDULE_CATCHUP_DELAY_MS
+        );
+        assert!(
+            overdue_at_armed >= before_reconcile + OVERDUE_SCHEDULE_CATCHUP_DELAY_MS,
+            "expected overdue at armed >= {}, got {overdue_at_armed}",
+            before_reconcile + OVERDUE_SCHEDULE_CATCHUP_DELAY_MS
+        );
+        assert_eq!(
+            store
+                .get_schedule(&overdue_at.id)
+                .unwrap()
+                .unwrap()
+                .next_fire_at_ms,
+            Some(overdue_at_due)
+        );
+        assert_eq!(
+            store
+                .get_schedule(&overdue_every.id)
+                .unwrap()
+                .unwrap()
+                .next_fire_at_ms,
+            Some(overdue_every_due)
+        );
+
+        // Pollable watch armed for immediate catch-up probe; push-only webhook watch skipped.
+        let watch_armed = *scheduled.get(&active_watch.id).unwrap();
+        assert!(watch_armed >= before_reconcile + OVERDUE_SCHEDULE_CATCHUP_DELAY_MS);
+        assert!(!scheduled.contains_key(&webhook_watch.id));
+
+        // Cancelled, fired, and paused schedules were skipped.
+        assert!(!scheduled.contains_key(&cancelled.id));
+        assert!(!scheduled.contains_key(&fired.id));
+        assert!(!scheduled.contains_key(&paused.id));
+
+        // End-to-end proof: firing the catch-up trigger for both overdue schedules succeeds!
+        let health = HealthBoard::default();
+        let fired_at = crate::timer::fire_schedule_by_id(
+            &store,
+            &health,
+            recorder.as_ref(),
+            &overdue_at.id,
+            Some(overdue_at_armed),
+            overdue_at_armed,
+        )
+        .unwrap();
+        assert!(
+            fired_at.fired,
+            "overdue one-shot catch-up failed: {fired_at:?}"
+        );
+        assert_eq!(
+            store.get_schedule(&overdue_at.id).unwrap().unwrap().state,
+            "fired"
+        );
+
+        let fired_every = crate::timer::fire_schedule_by_id(
+            &store,
+            &health,
+            recorder.as_ref(),
+            &overdue_every.id,
+            Some(overdue_every_armed),
+            overdue_every_armed,
+        )
+        .unwrap();
+        assert!(
+            fired_every.fired,
+            "overdue recurring catch-up failed: {fired_every:?}"
+        );
+        assert!(fired_every.next_run_ms.unwrap() > overdue_every_armed);
     }
 }
