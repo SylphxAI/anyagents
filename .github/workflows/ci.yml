@@ -1,7 +1,8 @@
 name: ci
 
-# Continuous integration for a public repository: format, clippy and the
-# workspace tests on Linux and macOS.
+# Continuous integration for a public repository: module size ratchet, policy
+# checks, format, clippy and crate-graph-scoped workspace tests on Linux and
+# macOS.
 #
 # GitHub-hosted standard runners are free only on a public repository, so a
 # private one must never reach them: every job here carries
@@ -39,47 +40,68 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
 
 jobs:
-  # Whether the change reaches more than documentation, so a docs-only pull
-  # request skips the compile and lint jobs. Everything except Markdown under
-  # docs/, the root notices and the issue templates counts as code; a run with
-  # no diff (main, manual) reports everything changed.
+  # Compute crate-graph path-scoping from Cargo.toml and run fast policy and
+  # module-size ratchet checks on every run. Docs/markdown/AGENTS.md/prebuilt/
+  # tools-only PRs skip heavy Rust and macOS jobs; leaf-crate-only PRs scope
+  # clippy/tests to touched crates + Cargo reverse dependents; core/coordinator
+  # and non-diff runs (push/main, manual) execute the full workspace suite.
   changes:
     if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       code: ${{ steps.scope.outputs.code }}
+      rust_scope: ${{ steps.scope.outputs.rust_scope }}
+      cargo_pkg_args: ${{ steps.scope.outputs.cargo_pkg_args }}
+      cargo_doc_args: ${{ steps.scope.outputs.cargo_doc_args }}
+      run_macos: ${{ steps.scope.outputs.run_macos }}
+      run_host_acceptance: ${{ steps.scope.outputs.run_host_acceptance }}
+      run_npm: ${{ steps.scope.outputs.run_npm }}
+      needs_fake_opencode: ${{ steps.scope.outputs.needs_fake_opencode }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: scope
+        name: Compute crate-graph CI scope
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
           case "$EVENT" in
-            pull_request | merge_group) ;;
-            *) echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            pull_request | merge_group)
+              if [ -n "$BASE" ] && git diff --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/scope.txt"; then
+                echo "$(wc -l < "$RUNNER_TEMP/scope.txt") changed paths" >&2
+                python3 tools/ci_scope.py --event "$EVENT" --paths-file "$RUNNER_TEMP/scope.txt" --github-output "$GITHUB_OUTPUT"
+              else
+                # A diff that cannot be computed runs the full workspace rather than skipping.
+                echo "git diff unavailable; falling back to full workspace" >&2
+                python3 tools/ci_scope.py --event "$EVENT" --diff-failed --github-output "$GITHUB_OUTPUT"
+              fi
+              ;;
+            *)
+              python3 tools/ci_scope.py --event "$EVENT" --github-output "$GITHUB_OUTPUT"
+              ;;
           esac
-          if git diff --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/scope.txt"; then
-            non_code='^(docs/.+\.md|[^/]+\.md|LICENSE[^/]*|\.github/ISSUE_TEMPLATE/.+|Dockerfile\.prebuilt|sylphx\.toml)$'
-            if grep -qvE "$non_code" "$RUNNER_TEMP/scope.txt"; then
-              echo "code=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "code=false" >> "$GITHUB_OUTPUT"
-            fi
-            echo "$(wc -l < "$RUNNER_TEMP/scope.txt") changed paths" >&2
-          else
-            # A diff that cannot be computed runs everything rather than skipping.
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Module size ratchet
+        run: python3 tools/module_size_scan.py
+      - name: Tooling tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Release admission policy
+        run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
+      - name: Deploy build policy
+        run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
+      - name: npm package tests
+        if: steps.scope.outputs.run_npm == 'true'
+        run: npm test
 
-  # The Linux lane: format, clippy and the whole workspace test suite.
+  # The Linux lane: format, clippy, crate-scoped or workspace tests, plus host
+  # acceptance lanes when host/core/coordinator crates are affected.
   test:
     needs: changes
-    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
+    if: github.event.repository.private == false && needs.changes.outputs.rust_scope != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -123,25 +145,42 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Release admission policy
-        run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
-      - name: Deploy build policy
-        run: python3 -m unittest discover -s tests -p 'test_deploy_build.py' -v
-      - name: npm package tests
-        run: npm test
-      - name: Build harness helper and runtime binaries
+        env:
+          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
         run: |
           set -euo pipefail
-          cargo build -p anyagents-harness-opencode --bin fake_opencode -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
+          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
+          cargo clippy "${pkg_args[@]}" --all-targets --locked -- -D warnings
+      - name: Build harness helper binary
+        if: needs.changes.outputs.needs_fake_opencode == 'true' && needs.changes.outputs.run_host_acceptance != 'true'
+        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
+      - name: Build harness helper and runtime binaries
+        if: needs.changes.outputs.run_host_acceptance == 'true'
+        env:
+          NEEDS_FAKE_OPENCODE: ${{ needs.changes.outputs.needs_fake_opencode }}
+        run: |
+          set -euo pipefail
+          build_args=(-p anyagents --bin anyagents)
+          if [ "$NEEDS_FAKE_OPENCODE" = "true" ]; then
+            build_args+=(-p anyagents-harness-opencode --bin fake_opencode)
+          fi
+          cargo build "${build_args[@]}" --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
           binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/prod-build.json")
           echo "ANYAGENTS_PROD_BIN=$binary" >> "$GITHUB_ENV"
       - name: Test
+        env:
+          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
+          CARGO_DOC_ARGS: ${{ needs.changes.outputs.cargo_doc_args }}
         run: |
           set -euo pipefail
-          cargo nextest run --workspace --locked --no-fail-fast
-          cargo test --doc --workspace --locked
+          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
+          cargo nextest run "${pkg_args[@]}" --locked --no-fail-fast
+          if [ -n "$CARGO_DOC_ARGS" ]; then
+            read -r -a doc_args <<< "$CARGO_DOC_ARGS"
+            cargo test --doc "${doc_args[@]}" --locked
+          fi
       - name: Locate anyagents test binary
+        if: needs.changes.outputs.run_host_acceptance == 'true'
         run: |
           set -euo pipefail
           cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/unit-test-build.json"
@@ -151,6 +190,7 @@ jobs:
       # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
       - name: Host memory managed-UID admission
+        if: needs.changes.outputs.run_host_acceptance == 'true'
         run: |
           set -euo pipefail
           # RUNNER_TEMP is below the runner's private home, inaccessible to the
@@ -158,13 +198,14 @@ jobs:
           # the script verifies ancestry and never changes existing ancestors.
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$ANYAGENTS_PROD_BIN" --vendor-test-binary "$ANYAGENTS_UNIT_TEST_BIN" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
       - name: Host memory managed-UID receipt
-        if: always()
+        if: always() && needs.changes.outputs.run_host_acceptance == 'true'
         run: |
           if [ -f "$RUNNER_TEMP/host-memory-seat-receipt.json" ]; then
             cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
           fi
 
       - name: Privileged config ACL acceptance
+        if: needs.changes.outputs.run_host_acceptance == 'true'
         run: |
           set -euo pipefail
           test_name=seat_tree::privileged_config_tests::privileged_config_acl_cross_uid
@@ -178,6 +219,7 @@ jobs:
           grep -Fx 'A2A_PRIVATE_MEDIA_CROSS_UID_EXECUTED' "$RUNNER_TEMP/a2a-media-test.log"
 
       - name: Cross-seat repositories
+        if: needs.changes.outputs.run_host_acceptance == 'true'
         run: |
           set -euo pipefail
           # Two seat uids, each committing and pushing in its own repository
@@ -186,11 +228,11 @@ jobs:
           # A file the server opens for a seat is opened by that seat.
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$ANYAGENTS_UNIT_TEST_BIN" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
-  # The macOS lane: the same gate on a second platform. macOS is a supported
-  # host for a long-lived agent, so its build is checked before merge.
+  # The macOS lane: runs whenever workspace-wide or macOS/platform-branching
+  # crates are affected. Skipped for docs/tools-only and Linux-sandbox/leaf PRs.
   macos:
     needs: changes
-    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
+    if: github.event.repository.private == false && needs.changes.outputs.run_macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 45
     env:
@@ -226,14 +268,27 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build harness helper binaries
-        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
-      - name: Test
+        env:
+          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
         run: |
           set -euo pipefail
-          cargo nextest run --workspace --locked --no-fail-fast
-          cargo test --doc --workspace --locked
+          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
+          cargo clippy "${pkg_args[@]}" --all-targets --locked -- -D warnings
+      - name: Build harness helper binaries
+        if: needs.changes.outputs.needs_fake_opencode == 'true'
+        run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
+      - name: Test
+        env:
+          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
+          CARGO_DOC_ARGS: ${{ needs.changes.outputs.cargo_doc_args }}
+        run: |
+          set -euo pipefail
+          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
+          cargo nextest run "${pkg_args[@]}" --locked --no-fail-fast
+          if [ -n "$CARGO_DOC_ARGS" ]; then
+            read -r -a doc_args <<< "$CARGO_DOC_ARGS"
+            cargo test --doc "${doc_args[@]}" --locked
+          fi
 
   # The required check name. Skipped lanes pass; a failed or cancelled lane
   # fails. It reads results only and runs no repository code.
