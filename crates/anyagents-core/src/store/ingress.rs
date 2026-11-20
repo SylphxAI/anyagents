@@ -520,6 +520,7 @@ impl Store {
             mentions,
             participants,
             topology,
+            org_instructions: None,
             reply_to_message: None,
             timestamp: None,
             workspace: None,

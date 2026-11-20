@@ -97,6 +97,7 @@ mod history;
 mod history_ops;
 mod index_sync;
 mod ingress;
+pub mod knowledge;
 mod lifecycle;
 mod locks;
 mod mail_notices;

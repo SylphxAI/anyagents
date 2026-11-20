@@ -31,6 +31,14 @@ pub enum Error {
     AgentBusy,
     #[error("group `{group}`: {reason}")]
     GroupForbidden { group: String, reason: &'static str },
+    #[error("invalid knowledge request: {0}")]
+    KnowledgeInvalid(String),
+    #[error("knowledge record not found")]
+    KnowledgeMissing,
+    #[error("knowledge version conflict (current version: {current})")]
+    KnowledgeConflict { current: i64 },
+    #[error("knowledge proposal has already been reviewed")]
+    KnowledgeReviewed,
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
     #[error("failed to provision worktree for `{repo}`: {message}")]

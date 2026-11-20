@@ -243,6 +243,11 @@ pub(crate) struct AgentMcp {
     pub(crate) client: Client,
 }
 
+#[cfg(test)]
+mod knowledge_tests;
+#[cfg(test)]
+pub(crate) use knowledge_tests::test_agent_over_router;
+
 /// The `schedules` tool's contract, with the exact shape of each action.
 const SCHEDULES_TOOL_DESCRIPTION: &str = "List authorized fleet automations with {action: list, agent: all}; fleet reads include owner names and never permit mutation. Wake yourself later or on an event. Create: `{action: \"create\", prompt, <one trigger>}` with `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch`: `webhook:<topic>` (generic webhook/event trigger), `agent:idle:<name_or_id>`, `pid:<pid>`, or `file:<path>`. `action: \"at\"|\"every\"|\"watch\"` with that field also creates. One trigger per schedule; make two calls for a watch plus a deadline. `{action: \"list\"}`; `{action: \"cancel\", id: \"sch_...\"|\"all\"}`. A fired schedule enters your mailbox like any message (steered into a running turn, held while you are paused or quota-blocked) and never queues a second wake while its last one is undelivered.";
 

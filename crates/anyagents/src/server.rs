@@ -37,6 +37,7 @@ mod console_html;
 mod file_cache;
 mod hybrid;
 mod in_flight;
+mod knowledge;
 #[cfg(test)]
 mod latency_tests;
 mod memory_backlog;
@@ -127,6 +128,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
             post(serverless::cloud_events_route),
         )
         .merge(timer_fire::router())
+        .merge(knowledge::sandbox_router())
         .fallback(ops::public_not_found)
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
@@ -159,7 +161,8 @@ fn build_webhook_router(state: AppState) -> Router {
         "/v1/internal/cloud/events",
         post(serverless::cloud_events_route),
     )
-    .merge(timer_fire::router());
+    .merge(timer_fire::router())
+    .merge(knowledge::sandbox_router());
     let router = if expose_console {
         admin_ui::mount_admin_routes(mount_authenticated_api_routes(base))
     } else {
@@ -183,6 +186,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(roles::router())
         .merge(ops::router())
         .merge(s3_media_profiles::router())
+        .merge(knowledge::router())
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -203,6 +207,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(serverless::cloud_events_route),
         )
         .merge(timer_fire::router())
+        .merge(knowledge::sandbox_router())
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
             &state.store,

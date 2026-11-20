@@ -350,6 +350,14 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 impl Presented {
+    pub(crate) fn is_oidc(&self) -> bool {
+        self.admin_session.is_some()
+            || self
+                .bearer_token
+                .as_deref()
+                .is_some_and(|token| !anyagents_core::is_remote_session_token(token))
+    }
+
     pub fn of(parts: &Parts) -> Self {
         let agent_token = header(parts, operator::AGENT_HEADER);
         let operator_token = header(parts, operator::HEADER);

@@ -13,6 +13,7 @@ mod auth_bootstrap;
 mod code_mcp;
 mod gemini;
 mod guest;
+mod knowledge_wake;
 pub mod mcp_bootstrap;
 mod mcp_proxy;
 mod media;
