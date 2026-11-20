@@ -1976,12 +1976,8 @@ impl Harness for OpenCodeHarness {
         }
     }
 
-    /// Wait for the prompt call that is out to answer or fail, then stop the
-    /// service and read its event stream to the end, so what it proved is
-    /// known. The proofs stay readable. A service that does not answer within
-    /// [`CALL_TIMEOUT`] is stopped anyway, so a stuck service never holds its
-    /// replacement: the call then fails, its outcome is unknown, and the next
-    /// process writes the same id once more, which OpenCode admits once.
+    /// Wait for any in-flight prompt call (bounded by [`CALL_TIMEOUT`]), stop the
+    /// service, and drain its event stream so proofs remain readable.
     fn stop(&mut self) {
         {
             let state = self.vendor.lock();
@@ -2001,7 +1997,8 @@ impl Harness for OpenCodeHarness {
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
-        Ok(())
+        let alive = self.vendor.lock().alive;
+        alive.then_some(()).ok_or(HarnessError::Dead)
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
@@ -2014,9 +2011,14 @@ impl Harness for OpenCodeHarness {
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        let Some(session) = self.vendor.lock().session.clone() else {
+        let state = self.vendor.lock();
+        if !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        let Some(session) = state.session.clone() else {
             return Ok(());
         };
+        drop(state);
         self.vendor
             .call(
                 "POST",
@@ -2490,16 +2492,11 @@ impl ApiError {
         }
     }
 
-    /// What this answer to `POST /api/session/{id}/prompt` means for the line.
-    /// OpenCode 2.x declares 400 (`BadRequest`: a payload that does not
-    /// decode, an attachment or a skill it cannot take), 409
-    /// (`PromptConflictError`: the id belongs to another durable record) and
-    /// 404 (`Session.NotFoundError`) for the route; its readiness gate answers
-    /// 503 before any route.
+    /// Classify non-2xx `POST /api/session/{id}/prompt` responses.
     fn refusal(&self) -> Refusal {
         match self.status {
             Some(404) => Refusal::SessionGone,
-            Some(400 | 409) => Refusal::Permanent,
+            Some(400 | 409 | 413 | 422) => Refusal::Permanent,
             Some(401 | 403) => Refusal::Fault,
             Some(503) => match self.code.as_deref() {
                 Some("service_starting" | "service_stopping") => Refusal::NotReady,

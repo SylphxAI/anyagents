@@ -596,3 +596,229 @@ fn model_selector_matrix_reaches_app_server_start_and_resume() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn codex_multi_step_next_step_steer_incorporates_into_step2_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let py = root.join("mock_codex.py");
+    let sh = root.join("mock_codex");
+    std::fs::write(
+        &py,
+        r#"
+import json, os, pathlib, sys, time
+
+state_dir = pathlib.Path(os.environ["MOCK_STATE_DIR"])
+trace_path = state_dir / "codex_trace.jsonl"
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def trace(event, **fields):
+    with trace_path.open("a") as f:
+        f.write(json.dumps({"event": event, **fields}) + "\n")
+
+def wait_gate(name):
+    gate = state_dir / name
+    deadline = time.time() + 10.0
+    while not gate.exists():
+        if time.time() > deadline:
+            sys.exit(99)
+        time.sleep(0.01)
+
+active_turn = None
+turn_seq = 0
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    req = json.loads(raw)
+    method = req.get("method")
+    rpc_id = req.get("id")
+    params = req.get("params") or {}
+    trace("rx", method=method, id=rpc_id, params=params)
+
+    if method == "initialize":
+        emit({"id": rpc_id, "result": {"userAgent": "codex_cli_rs/0.171.0 (Linux; x86_64)"}})
+    elif method == "initialized":
+        continue
+    elif method == "thread/start":
+        emit({"id": rpc_id, "result": {"thread": {"id": "thread-multi"}}})
+    elif method == "turn/start":
+        cid = params.get("clientUserMessageId", "")
+        text = params["input"][0]["text"]
+        if cid == "m_bad":
+            emit({"id": rpc_id, "error": {"code": -32602, "message": "input exceeds length limit"}})
+            continue
+        if cid == "m_die":
+            sys.exit(0)
+        turn_seq += 1
+        active_turn = f"turn-{turn_seq}"
+        emit({"id": rpc_id, "result": {"turn": {"id": active_turn}}})
+        emit({"method": "turn/started", "params": {"turn": {"id": active_turn}}})
+        emit({
+            "method": "item/started",
+            "params": {
+                "turnId": active_turn,
+                "item": {
+                    "type": "userMessage",
+                    "id": f"item-{cid}",
+                    "clientId": cid,
+                    "content": [{"type": "text", "text": text}],
+                },
+            },
+        })
+        emit({"method": "item/agentMessage/delta", "params": {"turnId": active_turn, "delta": "step1:working;"}})
+    elif method == "turn/steer":
+        cid = params.get("clientUserMessageId", "")
+        expected = params.get("expectedTurnId")
+        text = params["input"][0]["text"]
+        payload = "codex-steer-payload" if "codex-steer-payload" in text else text.splitlines()[-1]
+        if cid == "m4":
+            emit({"id": rpc_id, "error": {"code": -32600, "message": "cannot steer during review"}})
+            continue
+        assert expected == active_turn, f"expected {active_turn}, got {expected}"
+        # Reply to RPC first while holding `userMessage` item behind gate to prove
+        # RPC reply alone keeps m2 InFlight.
+        emit({"id": rpc_id, "result": {"turnId": active_turn}})
+        wait_gate("allow_step2")
+        emit({
+            "method": "item/started",
+            "params": {
+                "turnId": active_turn,
+                "item": {
+                    "type": "userMessage",
+                    "id": f"item-{cid}",
+                    "clientId": cid,
+                    "content": [{"type": "text", "text": text}],
+                },
+            },
+        })
+        out = f"step1:working;step2:incorporated:{payload}"
+        trace("consumed_before_complete", client_id=cid, turn=active_turn, out=out)
+        emit({
+            "method": "item/completed",
+            "params": {
+                "turnId": active_turn,
+                "item": {"type": "agentMessage", "id": "am-step2", "text": out},
+            },
+        })
+        emit({
+            "method": "thread/tokenUsage/updated",
+            "params": {"tokenUsage": {"last": {"inputTokens": 12, "outputTokens": 7, "cachedInputTokens": 0}}},
+        })
+        emit({"method": "turn/completed", "params": {"turn": {"id": active_turn, "status": "completed"}}})
+        active_turn = None
+    elif method == "turn/interrupt":
+        emit({"id": rpc_id, "result": {}})
+        emit({"method": "turn/completed", "params": {"turn": {"id": active_turn, "status": "interrupted"}}})
+        active_turn = None
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &sh,
+        format!("#!/bin/sh\nexec python3 -u '{}' \"$@\"\n", py.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut harness = CodexHarness::start(&sh, None, &[("MOCK_STATE_DIR", root.to_str().unwrap())])
+        .expect("codex mock starts");
+
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::NextStep);
+    assert!(harness.health().delivery.idempotent);
+
+    let mk = |id: &str, text: &str| OutboundMessage {
+        id: id.to_string(),
+        seq: 1,
+        text: text.to_string(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: Context::default(),
+    };
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Step 1: turn/start opens Turn 1 and pauses mid-turn.
+    let m1 = mk("m1", "step-1-work");
+    assert_eq!(
+        settle(&mut harness, &m1),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+
+    // Mid-turn steer m2: `turn/steer` RPC reply alone MUST stay InFlight until `userMessage` item.
+    let m2 = mk("m2", "codex-steer-payload");
+    let first_m2 = harness.deliver(&m2).unwrap();
+    assert_eq!(first_m2, DeliverOutcome::InFlight);
+    wait_until("mock received turn/steer", || {
+        std::fs::read_to_string(root.join("codex_trace.jsonl"))
+            .unwrap_or_default()
+            .contains("\"method\": \"turn/steer\"")
+    });
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        harness.proven("m2"),
+        None,
+        "turn/steer RPC response alone must not prove m2"
+    );
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+
+    // Step 2 consumes m2 BEFORE turn/completed and incorporates it into Step 2 output.
+    std::fs::write(root.join("allow_step2"), "1").unwrap();
+    assert!(harness.wait_finished("m1", PATIENCE));
+    assert!(harness.wait_finished("m2", PATIENCE));
+    assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.turns_served(), 1);
+    let (thread, reply) = harness.task_turn_result("m2").expect("task turn result");
+    assert_eq!(thread, "thread-multi");
+    assert!(
+        reply.contains("step2:incorporated:codex-steer-payload"),
+        "{reply}"
+    );
+
+    // Turn 2: refused steer (-32600) -> Deferred, never proven.
+    let m3 = mk("m3", "turn-2");
+    assert_eq!(
+        settle(&mut harness, &m3),
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    let m4 = mk("m4", "refused-steer");
+    offer_until(&mut harness, &m4, &DeliverOutcome::Deferred);
+    assert_eq!(harness.proven("m4"), None);
+    harness.cancel().unwrap();
+    wait_idle(&harness);
+
+    // Invalid params (-32602) -> Rejected, never proven.
+    let m_bad = mk("m_bad", "too-big");
+    assert!(matches!(
+        settle(&mut harness, &m_bad),
+        DeliverOutcome::Rejected { .. }
+    ));
+    assert_eq!(harness.proven("m_bad"), None);
+
+    // Dead child fail-closed -> Err(HarnessError::Dead).
+    let _ = harness.deliver(&mk("m_die", "exit"));
+    assert!(harness.wait_dead(PATIENCE));
+    assert_eq!(
+        harness.deliver(&mk("m_after_death", "nope")),
+        Err(HarnessError::Dead)
+    );
+    assert_eq!(harness.background(), Err(HarnessError::Dead));
+    assert_eq!(harness.cancel(), Err(HarnessError::Dead));
+}

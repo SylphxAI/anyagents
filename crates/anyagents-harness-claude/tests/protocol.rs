@@ -782,3 +782,215 @@ fn a_line_is_committed_only_once_claude_code_stored_it() {
     ));
     assert!(stored.consumed("m2"));
 }
+
+#[cfg(unix)]
+#[test]
+fn claude_multi_step_next_step_steer_incorporates_into_step2_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use anyagents_harness::{HarnessError, Proof};
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let config = root.join("claude-cfg");
+    let project = config.join("projects").join("-work");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let py = root.join("mock_claude.py");
+    let sh = root.join("mock_claude");
+    std::fs::write(
+        &py,
+        r#"
+import json, os, pathlib, sys, time
+
+state_dir = pathlib.Path(os.environ["MOCK_STATE_DIR"])
+transcript = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "-work" / "sess-multi.jsonl"
+trace_path = state_dir / "claude_trace.jsonl"
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def trace(event, **fields):
+    with trace_path.open("a") as f:
+        f.write(json.dumps({"event": event, **fields}) + "\n")
+
+def append_jsonl(obj):
+    with transcript.open("a") as f:
+        f.write(json.dumps(obj) + "\n")
+        f.flush()
+
+def wait_gate(name):
+    gate = state_dir / name
+    deadline = time.time() + 10.0
+    while not gate.exists():
+        if time.time() > deadline:
+            sys.exit(99)
+        time.sleep(0.01)
+
+turn_uuids = []
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    frame = json.loads(raw)
+    if frame.get("type") == "control_request":
+        continue
+    if frame.get("type") != "user":
+        continue
+    uid = frame["uuid"]
+    text = frame["message"]["content"][0]["text"]
+    marker = text.splitlines()[0]
+    payload = "claude-steer-payload" if "claude-steer-payload" in text else text.splitlines()[-1]
+    trace("rx_user", uuid=uid, marker=marker, payload=payload)
+
+    if marker == "anyagents-message:m1":
+        turn_uuids = [uid]
+        emit({"type": "system", "subtype": "init", "session_id": "sess-multi", "claude_code_version": "2.1.329"})
+        emit({"type": "command_lifecycle", "command_uuid": uid, "state": "started"})
+        emit({"type": "user", "uuid": uid, "isReplay": True, "message": frame["message"]})
+        append_jsonl({"type": "user", "uuid": uid, "message": frame["message"]})
+        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "step1:working"}]}})
+    elif marker == "anyagents-message:m2":
+        turn_uuids.append(uid)
+        # Emit lifecycle/replay BEFORE durable transcript persistence to verify
+        # the adapter keeps m2 InFlight until the transcript row lands.
+        emit({"type": "command_lifecycle", "command_uuid": uid, "state": "started"})
+        emit({"type": "user", "uuid": uid, "isReplay": True, "message": frame["message"]})
+        wait_gate("allow_step2")
+        append_jsonl({
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": frame["message"]["content"],
+                "source_uuid": uid,
+            },
+        })
+        out = f"step2:incorporated:{payload}"
+        trace("consumed_before_result", uuid=uid, out=out)
+        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": out}]}})
+        emit({
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "session_id": "sess-multi",
+            "result": out,
+            "user_message_uuids": list(turn_uuids),
+            "usage": {"input_tokens": 15, "output_tokens": 9, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "total_cost_usd": 0.001,
+        })
+        turn_uuids = []
+    elif marker == "anyagents-message:m_refused":
+        emit({"type": "command_lifecycle", "command_uuid": uid, "state": "refused", "reason": "input invalid"})
+    elif marker == "anyagents-message:m_die":
+        sys.exit(0)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &sh,
+        format!("#!/bin/sh\nexec python3 -u '{}' \"$@\"\n", py.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut harness = ClaudeHarness::start(
+        &sh,
+        None,
+        &[
+            ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
+            ("MOCK_STATE_DIR", root.to_str().unwrap()),
+        ],
+    )
+    .expect("claude mock starts");
+
+    assert_eq!(harness.health().delivery.level, DeliveryLevel::NextStep);
+    assert!(harness.health().delivery.idempotent);
+
+    let mk = |id: &str, text: &str| OutboundMessage {
+        id: id.to_string(),
+        seq: 1,
+        text: text.to_string(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: Context::default(),
+    };
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Step 1 opens turn and pauses mid-turn.
+    let m1 = mk("m1", "step-1-work");
+    assert_eq!(harness.deliver(&m1).unwrap(), DeliverOutcome::InFlight);
+    wait_until("m1 proven in turn", || {
+        harness.proven("m1")
+            == Some(Proof::Taken {
+                turn_finished: false,
+            })
+    });
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+
+    // Mid-turn steer m2: lifecycle/replay without transcript persistence MUST stay InFlight.
+    let m2 = mk("m2", "claude-steer-payload");
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+    wait_until("mock received m2", || {
+        std::fs::read_to_string(root.join("claude_trace.jsonl"))
+            .unwrap_or_default()
+            .contains("anyagents-message:m2")
+    });
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        harness.proven("m2"),
+        None,
+        "unpersisted mid-turn steer must stay InFlight"
+    );
+    assert_eq!(harness.deliver(&m2).unwrap(), DeliverOutcome::InFlight);
+
+    // Step 2 persists queued_command attachment and finishes turn incorporating m2.
+    std::fs::write(root.join("allow_step2"), "1").unwrap();
+    wait_until("m1 and m2 finished in one turn", || {
+        harness.proven("m1")
+            == Some(Proof::Taken {
+                turn_finished: true,
+            })
+            && harness.proven("m2")
+                == Some(Proof::Taken {
+                    turn_finished: true,
+                })
+    });
+    assert_eq!(harness.turns_started(), 1);
+    assert_eq!(harness.turns_served(), 2);
+    assert_eq!(
+        harness.result_for("m2").as_deref(),
+        Some("step2:incorporated:claude-steer-payload")
+    );
+
+    // Explicit refusal -> DeliverOutcome::Rejected, never proven.
+    let m_refused = mk("m_refused", "bad");
+    assert_eq!(
+        harness.deliver(&m_refused).unwrap(),
+        DeliverOutcome::InFlight
+    );
+    wait_until("m_refused rejected", || {
+        matches!(
+            harness.deliver(&m_refused).unwrap(),
+            DeliverOutcome::Rejected { .. }
+        )
+    });
+    assert_eq!(harness.proven("m_refused"), None);
+
+    // Dead child fail-closed: deliver/background/cancel return Err(Dead).
+    let _ = harness.deliver(&mk("m_die", "exit"));
+    assert!(harness.wait_dead(Duration::from_secs(5)));
+    assert_eq!(
+        harness.deliver(&mk("m_after_death", "nope")),
+        Err(HarnessError::Dead)
+    );
+    assert_eq!(harness.background(), Err(HarnessError::Dead));
+    assert_eq!(harness.cancel(), Err(HarnessError::Dead));
+}

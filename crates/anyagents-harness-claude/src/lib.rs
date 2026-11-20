@@ -649,11 +649,11 @@ impl Harness for ClaudeHarness {
         let write_res = write_stdin(&self.stdin, &line);
         let mut state = lock(&self.shared);
         if write_res.is_err() {
-            // The line did not reach the vendor. It is forgotten and offered
-            // again; the process is dead only once its output ends, so a
-            // proof still in the pipe is read first.
             unwrite(&mut state, id);
-            return Ok(DeliverOutcome::Deferred);
+            let alive = state.alive;
+            return alive
+                .then_some(DeliverOutcome::Deferred)
+                .ok_or(HarnessError::Dead);
         }
         // A proof can beat this lock.
         Ok(if state.duplicates.contains(id) {

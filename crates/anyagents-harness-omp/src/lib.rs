@@ -132,6 +132,13 @@ struct State {
     finished: HashSet<String>,
     /// A message was taken since the session was last idle.
     serving: bool,
+    /// OMP refused `set_steering_mode: "all"` or reported another mode.
+    steering_all_refused: bool,
+    /// Last assistant text emitted in the active turn, propagated to consumed
+    /// prompts when their turn yields.
+    active_reply: Option<String>,
+    /// Final assistant reply text recorded for each consumed prompt.
+    replies: HashMap<String, String>,
     turns_served: u32,
     usage: TurnUsage,
     fault: Option<String>,
@@ -299,6 +306,8 @@ impl OmpHarness {
             state.open = 0;
             state.unsettled = false;
             state.serving = false;
+            state.steering_all_refused = false;
+            state.active_reply = None;
             state.fault = None;
             state.session_id = session_id.map(str::to_string);
         }
@@ -442,7 +451,11 @@ impl Harness for OmpHarness {
             // process counts as gone once its output ends, after every proof
             // it printed is read; that end wakes the host.
             state.forget(id);
-            return Ok(DeliverOutcome::Deferred);
+            return if state.alive {
+                Ok(DeliverOutcome::Deferred)
+            } else {
+                Err(HarnessError::Dead)
+            };
         }
         Ok(written_outcome(&mut state, id).unwrap_or(DeliverOutcome::InFlight))
     }
@@ -482,8 +495,24 @@ impl Harness for OmpHarness {
         write_line(&self.stdin, &line).map_err(|_| HarnessError::Dead)
     }
 
+    fn task_turn_result(&self, input_id: &str) -> Option<(String, String)> {
+        let state = lock(&self.shared);
+        let text = state.replies.get(input_id)?.clone();
+        Some((state.session_id.clone().unwrap_or_default(), text))
+    }
+
     fn health(&self) -> HarnessHealth {
         let state = lock(&self.shared);
+        let delivery = if state.steering_all_refused {
+            Delivery {
+                level: DeliveryLevel::TurnEnd,
+                idempotent: true,
+                proof: std::borrow::Cow::Borrowed("omp refused steering mode all"),
+                peer: state.peer.clone(),
+            }
+        } else {
+            DELIVERY.with_peer(state.peer.clone())
+        };
         HarnessHealth {
             process_alive: state.alive,
             turn_state: if state.busy() {
@@ -491,7 +520,7 @@ impl Harness for OmpHarness {
             } else {
                 TurnState::Idle
             },
-            delivery: DELIVERY.with_peer(state.peer.clone()),
+            delivery,
             quota_reset_at_ms: None,
             sign_in_fault: state.fault.clone(),
         }
@@ -652,6 +681,7 @@ fn on_response(state: &mut State, frame: &Value) {
     match frame.get("id").and_then(Value::as_str) {
         Some(STEERING_REQUEST) => {
             if !success {
+                state.steering_all_refused = true;
                 state.fault = Some(format!("omp refused steering mode all: {}", error()));
             }
         }
@@ -665,7 +695,11 @@ fn on_response(state: &mut State, frame: &Value) {
             }
             state.known = true;
         }
-        _ if frame.get("command").and_then(Value::as_str) == Some("prompt") => {
+        _ if frame
+            .get("command")
+            .and_then(Value::as_str)
+            .is_none_or(|cmd| cmd == "prompt") =>
+        {
             let Some(id) = state.prompt_for(frame) else {
                 return;
             };
@@ -694,6 +728,7 @@ fn read_state(state: &mut State, data: &Value) {
         state.session_id = Some(session.to_string());
     }
     if data.get("steeringMode").and_then(Value::as_str) != Some("all") {
+        state.steering_all_refused = true;
         state.fault = Some("omp did not take steering mode all".to_string());
     }
     let file = data
@@ -768,6 +803,9 @@ fn on_message(state: &mut State, message: &Value) {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return;
     }
+    if let Some(text) = assistant_text(message) {
+        state.active_reply = Some(text);
+    }
     let Some(usage) = message.get("usage") else {
         return;
     };
@@ -779,6 +817,21 @@ fn on_message(state: &mut State, message: &Value) {
     if let Some(cost) = usage.pointer("/cost/total").and_then(Value::as_f64) {
         *state.usage.reported_cost_micros.get_or_insert(0) += (cost * 1_000_000.0).round() as i64;
     }
+}
+
+/// Extract non-empty text from an assistant `message_end` payload.
+fn assistant_text(message: &Value) -> Option<String> {
+    let text = match message.get("content")? {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// The run that took a prompt yielded. A prompt without its proof was
@@ -804,10 +857,16 @@ fn on_prompt_result(state: &mut State, frame: &Value) {
     }
     if state.consumed.contains(&id) {
         state.finished.insert(id.clone());
+        if let Some(reply) = state.active_reply.clone() {
+            state.replies.insert(id.clone(), reply);
+        }
     } else if let Some(prompt) = state.prompts.get_mut(&id) {
         prompt.returned = true;
     }
     state.close(&id);
+    if !state.busy() {
+        state.active_reply = None;
+    }
 }
 
 fn write_line(stdin: &Mutex<Option<ChildStdin>>, line: &Value) -> std::io::Result<()> {
