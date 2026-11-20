@@ -24,7 +24,7 @@
     "crates/anyagents/src/schedule.rs": 2452,
     "crates/anyagents/src/seat_tree.rs": 1938,
     "crates/anyagents/src/server/admin_auth.rs": 1572,
-    "crates/anyagents/src/server/serverless.rs": 3336,
+    "crates/anyagents/src/server/serverless.rs": 3338,
     "crates/anyagents/src/telegram/channel.rs": 4375,
     "crates/anyagents/src/ui.rs": 1546,
     "crates/anyagents/src/vendor.rs": 2846

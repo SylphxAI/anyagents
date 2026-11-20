@@ -75,7 +75,7 @@ fn runtime_details(value: &Value, verbose: bool) -> Vec<String> {
     lines
 }
 
-pub(super) fn harness(value: &Value, name: &str) {
+pub(crate) fn harness(value: &Value, name: &str) {
     receipt("Runtime updated", text(value, "name", name));
     for line in runtime_details(value, ui::is_verbose()) {
         ui::note(&line);

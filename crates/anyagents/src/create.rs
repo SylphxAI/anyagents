@@ -60,13 +60,15 @@ pub(crate) use quota::{
     probe_profile_models_catalog, probe_profile_remaining_pct, record_profile_quota_reset,
 };
 pub(crate) use quota_probe::probe_one_profile_usage;
+#[cfg(test)]
+pub(crate) use runtime::set_agent_harness;
 pub(crate) use runtime::{
     compute_live_session_continuity, configure_agent_runtime, configure_agent_runtime_with_options,
     ensure_agy_mcp_config, harness_session_filename, maybe_notify_parent_on_error,
     poke_agent_wake_socket, poke_agent_wake_socket_mail, reconcile_agent_runtime_config,
     reconcile_agent_runtime_config_for_launch, reconcile_agent_runtime_config_for_live,
     reset_agent_session_locked, resolve_root_seat_hint, resolved_agent_seat_info,
-    set_agent_harness, set_agent_harness_with_options, verify_harness_runtime_config,
+    set_agent_harness_with_options, verify_harness_runtime_config,
 };
 pub(crate) use signin::{
     SigninStaging, deduplicate_same_account_profiles, finalize_agent_signin,

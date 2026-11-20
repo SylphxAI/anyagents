@@ -293,7 +293,7 @@ async fn dispatch_cloud_turn(
             format!("no cloud endpoint configured for serverless harness `{harness_kind}`")
         })?;
 
-    let meta_val = super::runtime::build_cloud_turn_metadata(
+    let mut meta_val = super::runtime::build_cloud_turn_metadata(
         &input,
         &cloud_endpoint,
         saved_remote_agent.as_deref(),
@@ -378,13 +378,15 @@ async fn dispatch_cloud_turn(
         }
     };
 
-    if let Some(ref remote_aid) = submission.remote_agent_id {
-        meta.insert("remote_agent_id".into(), json!(remote_aid));
+    if let Some(ref remote_aid) = submission.remote_agent_id
+        && let Some(obj) = meta_val.as_object_mut()
+    {
+        obj.insert("remote_agent_id".into(), json!(remote_aid));
     }
     let next_poll = submission
         .next_poll_after_ms
         .map(|d| now_ms().saturating_add(i64::try_from(d).unwrap_or(DEFAULT_CLOUD_POLL_DELAY_MS)));
-    let updated_meta = Value::Object(meta);
+    let updated_meta = meta_val;
 
     let store_upd = Arc::clone(&store);
     let aid_upd = input.agent.id.clone();
