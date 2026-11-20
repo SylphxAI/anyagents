@@ -974,6 +974,7 @@ impl Store {
             let has_topic_files = visible_metas
                 .iter()
                 .any(|m| !m.path.eq_ignore_ascii_case("MEMORY.md") && m.path.ends_with(".md"));
+            let mut changed_metas = Vec::new();
             for meta in visible_metas {
                 if has_topic_files && meta.path.eq_ignore_ascii_case("MEMORY.md") {
                     continue;
@@ -982,11 +983,7 @@ impl Store {
                 if blocked(&seg) {
                     continue;
                 }
-                let id = format!(
-                    "memory:{}:{}",
-                    owner.id,
-                    sha256(seg.as_os_str().as_encoded_bytes())
-                );
+                keep.insert(seg.to_string_lossy().into_owned());
                 let metadata = memory_metadata(owner, Some(meta.updated_at_ms));
                 let stamp = FileStamp::virtual_blob(
                     meta.size_bytes as u64,
@@ -997,11 +994,28 @@ impl Store {
                 let unchanged = index
                     .source_cursor(&metadata.agent_id, &seg)?
                     .is_some_and(|old| old.stamp == stamp && old.policy == policy);
-                if !unchanged
-                    && let Some(entry) = blob_store
-                        .get_agent_file(&owner.id, "memory", &meta.path)
-                        .map_err(store_error)?
-                {
+                if !unchanged {
+                    changed_metas.push((meta, seg, metadata, stamp, policy));
+                }
+            }
+            if !changed_metas.is_empty() {
+                let by_path: HashMap<String, crate::stateless::BlobEntry> = blob_store
+                    .get_agent_files_all(&owner.id, "memory")
+                    .map_err(store_error)?
+                    .into_iter()
+                    .map(|e| (e.path.clone(), e))
+                    .collect();
+                let mut pg_batch =
+                    Vec::with_capacity(changed_metas.len().min(MEMORY_PUBLISH_BATCH_DOCS));
+                for (meta, seg, metadata, stamp, policy) in changed_metas {
+                    let Some(entry) = by_path.get(&meta.path) else {
+                        continue;
+                    };
+                    let id = format!(
+                        "memory:{}:{}",
+                        owner.id,
+                        sha256(seg.as_os_str().as_encoded_bytes())
+                    );
                     let raw = crate::raw_segment::RawCoordinate {
                         segment: seg.clone(),
                         offset: 0,
@@ -1019,32 +1033,67 @@ impl Store {
                             &raw,
                         )?)
                     };
+                    pg_batch.push((seg, stamp, policy, raw.length, prepared));
+                    if pg_batch.len() >= MEMORY_PUBLISH_BATCH_DOCS {
+                        let chunk = std::mem::take(&mut pg_batch);
+                        if let Some(_guard) = gate()? {
+                            index.refresh_source(|index| {
+                                for (seg, stamp, policy, raw_len, prepared) in &chunk {
+                                    if let Some(doc) = prepared {
+                                        index.publish_document(doc)?;
+                                    }
+                                    index.save_source(
+                                        owner.id.as_str(),
+                                        seg,
+                                        &SourceCursor {
+                                            stamp: stamp.clone(),
+                                            policy: policy.clone(),
+                                            end: *raw_len,
+                                            next_seq: 2,
+                                            boundary_sha256: String::new(),
+                                            full_verified_ms: 0,
+                                            verification_attempt_ms: 0,
+                                            complete: true,
+                                            rebuilding: false,
+                                        },
+                                    )?;
+                                }
+                                Ok(())
+                            })?;
+                        } else {
+                            refresh.complete = false;
+                        }
+                    }
+                }
+                if !pg_batch.is_empty() {
                     if let Some(_guard) = gate()? {
                         index.refresh_source(|index| {
-                            if let Some(doc) = &prepared {
-                                index.publish_document(doc)?;
+                            for (seg, stamp, policy, raw_len, prepared) in &pg_batch {
+                                if let Some(doc) = prepared {
+                                    index.publish_document(doc)?;
+                                }
+                                index.save_source(
+                                    owner.id.as_str(),
+                                    seg,
+                                    &SourceCursor {
+                                        stamp: stamp.clone(),
+                                        policy: policy.clone(),
+                                        end: *raw_len,
+                                        next_seq: 2,
+                                        boundary_sha256: String::new(),
+                                        full_verified_ms: 0,
+                                        verification_attempt_ms: 0,
+                                        complete: true,
+                                        rebuilding: false,
+                                    },
+                                )?;
                             }
-                            index.save_source(
-                                &metadata.agent_id,
-                                &seg,
-                                &SourceCursor {
-                                    stamp: stamp.clone(),
-                                    policy,
-                                    end: raw.length,
-                                    next_seq: 2,
-                                    boundary_sha256: String::new(),
-                                    full_verified_ms: 0,
-                                    verification_attempt_ms: 0,
-                                    complete: true,
-                                    rebuilding: false,
-                                },
-                            )
+                            Ok(())
                         })?;
                     } else {
                         refresh.complete = false;
                     }
                 }
-                keep.insert(seg.to_string_lossy().into_owned());
             }
         }
         let stale: Vec<String> = index
@@ -5451,9 +5500,14 @@ mod tests {
             .join("memory");
         fs::create_dir_all(&mem_dir).unwrap();
         for i in 0..40 {
+            let unique = if i == 37 {
+                "uniquetopicthirtyseven"
+            } else {
+                "sharedtopic"
+            };
             fs::write(
                 mem_dir.join(format!("topic-{i:03}.md")),
-                format!("# Topic {i}\nShared keyword batchneedle_{i} and hypoidea.\n"),
+                format!("# Topic {i}\nKeyword {unique} and hypoidea.\n"),
             )
             .unwrap();
         }
@@ -5493,7 +5547,7 @@ mod tests {
                 &[agent.id.to_string()],
                 MemoryScope::Memory,
                 &HistorySearchQuery {
-                    query: Some("batchneedle_37".into()),
+                    query: Some("uniquetopicthirtyseven".into()),
                     ..Default::default()
                 },
             )
