@@ -6929,7 +6929,7 @@ async fn agent_memory_route(
                     continue;
                 };
                 let slug = fname.strip_suffix(".md").unwrap_or(fname).to_string();
-                let (_, description, _, fm_updated_ms) =
+                let (_, description, _, fm_updated_ms, _) =
                     anyagents_core::learned_memory::parse_topic_frontmatter_full(&slug, &raw);
                 let fs_mtime_ms = smeta
                     .modified()
