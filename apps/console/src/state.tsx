@@ -2,7 +2,8 @@ import { createContext, useContext } from 'solid-js';
 import type { Resource } from './api';
 import type { Forest } from './lib/tree';
 import type { Account, ProviderGroup } from './lib/providers';
-import type { Agent, Overview, Profile, RuntimeIssue, Session, VersionsReport } from './types';
+import type { RuntimeIssue } from './lib/issues';
+import type { Agent, Overview, Profile, Session, VersionsReport } from './types';
 
 export type AgentAction =
   | { kind: 'spawn'; parent?: Agent }

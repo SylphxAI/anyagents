@@ -216,6 +216,10 @@ textarea.input { height: auto; padding: 8px 10px; resize: vertical; line-height:
 .search-clear { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 4px; color: var(--text-3); }
 .search-clear:hover { background: var(--active); color: var(--text); }
 .field { display: grid; gap: 6px; min-width: 0; }
+.grant-modes { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.grant-mode { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--surface); }
+.grant-mode:has(input:checked) { border-color: var(--line-3); background: var(--selected); }
+.grant-mode input { accent-color: var(--primary); }
 .field-hint { font-size: 12px; color: var(--text-3); }
 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; cursor: pointer; }
@@ -280,8 +284,10 @@ a.stat-body:hover { background: var(--hover); text-decoration: none; }
 .stat-value.ok { color: var(--ok); } .stat-value.bad { color: var(--bad); } .stat-value.warn { color: var(--warn); }
 .stat-of { font-size: 16px; font-weight: 500; color: var(--text-3); letter-spacing: 0; }
 .stat-detail { margin-top: 2px; font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.table-wrap { border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); overflow-x: auto; }
+/* Anchor positioned table descendants (including screen-reader labels) inside the scrollport. */
+.table-wrap { position: relative; min-width: 0; max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); overflow-x: auto; }
 .table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.issue-summary { min-width: 180px; overflow-wrap: anywhere; }
 .table th { height: 34px; padding: 0 14px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap;
   font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); }
 .table td { height: 46px; padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; font-weight: 500; }

@@ -1,4 +1,4 @@
-import { BookOpen, Bot, LayoutDashboard, PackageCheck, Settings, WalletCards } from 'lucide-solid';
+import { Activity, BookOpen, Bot, LayoutDashboard, PackageCheck, Settings, WalletCards } from 'lucide-solid';
 import type { Page } from './types';
 
 export const NAV: { page: Page; label: string; icon: typeof Bot }[] = [
@@ -7,5 +7,6 @@ export const NAV: { page: Page; label: string; icon: typeof Bot }[] = [
   { page: 'accounts', label: 'Accounts & Quotas', icon: WalletCards },
   { page: 'knowledge', label: 'Knowledge', icon: BookOpen },
   { page: 'versions', label: 'Versions & Updates', icon: PackageCheck },
+  { page: 'issues', label: 'System Issues', icon: Activity },
   { page: 'settings', label: 'Settings', icon: Settings },
 ];

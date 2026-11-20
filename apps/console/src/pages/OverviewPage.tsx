@@ -2,6 +2,7 @@ import { For, Show, createMemo, createSignal } from 'solid-js';
 import type { JSX } from 'solid-js';
 import { ArrowRight, Bot, CircleCheck, Gauge, KeyRound, PackageCheck, Server, Timer } from 'lucide-solid';
 import { duration, plural } from '../format';
+import { issueKey } from '../lib/issues';
 import { needsQuota, providerName } from '../lib/providers';
 import { shortModel } from '../lib/status';
 import { ancestorsOf } from '../lib/tree';
@@ -37,16 +38,12 @@ export function OverviewPage() {
       detail: () => <span class="truncate">{agent.last_error || agent.turn_errors?.last_error || 'The last turn faulted.'}</span>,
       action: () => <a class="btn sm" href={agentHref(agent.name)}>Inspect</a>,
     })),
-    ...(issues.data() ?? []).slice(0, 10).map((issue, index) => {
-      const agent = issue.agent_name ?? issue.agent;
-      const severe = ['critical', 'error', 'bad', 'high'].includes((issue.severity ?? '').toLowerCase());
-      return {
-        key: 'issue:' + (issue.id ?? index), tone: (severe ? 'bad' : 'warn') as Tone, icon: () => <Server size={15} />,
-        title: () => <span class="strong">{issue.title ?? issue.kind ?? issue.message ?? 'Runtime issue'}</span>,
-        detail: () => <span class="truncate">{[agent, issue.detail ?? (issue.title ? issue.message : undefined)].filter(Boolean).join(' · ') || 'Reported by the coordinator runtime.'}</span>,
-        action: () => agent ? <a class="btn sm" href={agentHref(agent)}>Inspect</a> : <span />,
-      };
-    }),
+    ...(issues.data() ?? []).filter(issue => !['resolved', 'closed'].includes(issue.status?.toLowerCase() ?? '')).slice(0, 10).map(issue => ({
+      key: 'issue:' + issueKey(issue), tone: 'warn' as const, icon: () => <Server size={15} />,
+      title: () => <span class="strong">{issue.summary}</span>,
+      detail: () => <span class="truncate">{[issue.component, issue.source].filter(Boolean).join(' · ')}</span>,
+      action: () => <a class="btn sm" href="#issues">View issue</a>,
+    })),
     ...(outdated().length ? [{
       key: 'outdated', tone: 'warn' as const, icon: () => <PackageCheck size={15} />,
       title: () => <span class="strong">{plural(outdated().length, 'agent')} on an outdated sandbox image</span>,

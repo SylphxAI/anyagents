@@ -272,6 +272,17 @@ export const knowledge = {
   ],
 };
 
+const leaseIssue = {
+  id: 'rti_fixture_01', error_fingerprint: 'fixture-sandbox-lease-renewals', component: 'sandbox', summary: 'Sandbox lease renewals are flapping',
+  occurrence_count: 7, source: 'auto_capture', status: 'open', first_seen_at: now - DAY, last_seen_at: now - 9 * MIN,
+  exact_error: 'Sandbox lease renewal failed', repro_steps: 'Automatically captured; reproduction steps unavailable.',
+  sample_agent_id: byName.get('granite-patrol-certs').id,
+};
 export const runtimeIssues = { issues: [
-  { id: 'iss_01', kind: 'sandbox_lease_flapping', severity: 'warning', title: 'Sandbox lease renewals are flapping', agent_name: 'granite-patrol-certs', detail: '3 renewal failures in the last 15 minutes', at_ms: now - 9 * MIN },
+  leaseIssue,
+  { ...leaseIssue, occurrence_count: 3, last_seen_at: now - 14 * MIN },
+  { id: 'rti_fixture_02', error_fingerprint: 'fixture-knowledge-index-timeout', component: 'coordinator', summary: 'Index refresh exceeded its deadline',
+    occurrence_count: 2, source: 'agent_report', status: 'resolved', first_seen_at: now - 2 * DAY, last_seen_at: now - DAY,
+    exact_error: 'Index refresh deadline exceeded', repro_steps: 'Refresh the index.',
+    sample_agent_id: byName.get('cobalt-research').id },
 ] };

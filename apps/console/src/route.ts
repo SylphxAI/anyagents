@@ -11,6 +11,7 @@ export function parseRoute(hash = window.location.hash): Route {
     case 'accounts': case 'profiles': return { page: 'accounts' };
     case 'knowledge': return { page: 'knowledge' };
     case 'versions': return { page: 'versions' };
+    case 'issues': return { page: 'issues' };
     case 'settings': return { page: 'settings', tab: settingsTabs.find(tab => tab === id) ?? 'channels' };
     case 'channels': case 'secrets': case 'automations': case 'usage': return { page: 'settings', tab: section };
     case 'schedules': return { page: 'settings', tab: 'automations' };

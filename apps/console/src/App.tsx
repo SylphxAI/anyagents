@@ -11,7 +11,7 @@ import { NAV } from './nav';
 import { pageHref, parseRoute } from './route';
 import { ConsoleContext } from './state';
 import type { AgentAction, ConnectRequest, ConsoleState, Fleet } from './state';
-import { runtimeIssues } from './types';
+import { runtimeIssues } from './lib/issues';
 import type { Agent, Overview, Page, Profile, Session, VersionsReport } from './types';
 import { Palette } from './ui/Palette';
 import { Dot, Kbd, Mark, Problem, ThemeToggle } from './ui/primitives';
@@ -20,6 +20,7 @@ import { AgentsPage } from './pages/AgentsPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { VersionsPage } from './pages/VersionsPage';
+import { SystemIssuesPage } from './pages/SystemIssuesPage';
 import { SettingsPage } from './pages/SettingsPage';
 
 const noAgents: Agent[] = [];
@@ -30,7 +31,10 @@ export function App() {
   const overview = createPoll(signal => api<Overview>('/admin/api/overview', { signal }), { interval: 5000 });
   const session = createPoll(signal => api<Session>('/admin/auth/me', { signal }), { interval: 30000 });
   const versions = createPoll(signal => optional<VersionsReport>('/admin/api/versions', { signal }), { interval: 30000 });
-  const issues = createPoll(async signal => { const payload = await optional<unknown>('/admin/api/runtime-issues', { signal }); return payload === null ? null : runtimeIssues(payload); }, { interval: 30000 });
+  const issues = createPoll(async signal => {
+    const payload = await optional<unknown>('/admin/api/runtime-issues', { signal });
+    return payload === null ? null : runtimeIssues(payload);
+  }, { interval: 30000 });
   let wantFresh = false;
   const profiles = createPoll(signal => {
     const fresh = wantFresh; wantFresh = false;
@@ -154,6 +158,7 @@ export function App() {
             <Match when={route().page === 'accounts'}><AccountsPage /></Match>
             <Match when={route().page === 'knowledge'}><KnowledgePage /></Match>
             <Match when={route().page === 'versions'}><VersionsPage /></Match>
+            <Match when={route().page === 'issues'}><SystemIssuesPage /></Match>
             <Match when={route().page === 'settings'}><SettingsPage tab={(route() as { tab: 'channels' }).tab} /></Match>
           </Switch>
         </main>

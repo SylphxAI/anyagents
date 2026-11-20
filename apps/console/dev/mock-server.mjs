@@ -19,6 +19,8 @@ const json = (res, status, body) => { res.writeHead(status, headers('application
 const readBody = req => new Promise(done => { let data = ''; req.on('data', chunk => { data += chunk; }); req.on('end', () => { try { done(data ? JSON.parse(data) : {}); } catch { done({}); } }); });
 const sleep = ms => new Promise(done => setTimeout(done, ms));
 const signins = new Map();
+const grants = flags.has('--empty-grants') ? [] : [...fx.knowledge.grants];
+let mockGrantId = 0;
 
 async function asset(res, file, type, replace = {}) {
   let body = await readFile(resolve(root, file), 'utf8');
@@ -86,8 +88,23 @@ async function knowledge(req, res) {
       if (proposal) proposal.status = body.action === 'promote' ? 'promoted' : 'rejected';
       return json(res, 200, { proposal });
     }
-    case 'grants': return json(res, 200, { grants: fx.knowledge.grants, next_after: null });
-    case 'revoke': fx.knowledge.grants = fx.knowledge.grants.filter(grant => grant.id !== body.grant_id); return json(res, 200, { revoked: true });
+    case 'grants': return json(res, 200, { grants, next_after: null });
+    case 'grant': {
+      const { agent_id, namespace_pattern, mode } = body;
+      if (typeof agent_id !== 'string' || !agent_id.startsWith('agt_') || typeof namespace_pattern !== 'string'
+        || !namespace_pattern.trim() || !['read', 'write', 'propose'].includes(mode)) return json(res, 400, { error: 'Invalid grant' });
+      if (flags.has('--reject-write-grant') && mode === 'write') return json(res, 403, { error: 'Write grants are unavailable in this fixture' });
+      const existing = grants.find(grant => grant.agent_id === agent_id && grant.namespace_pattern === namespace_pattern && grant.mode === mode);
+      if (existing) return json(res, 200, existing);
+      const grant = { id: 'kgrant_mock_' + ++mockGrantId, agent_id, namespace_pattern, mode, granted_by: 'owner', granted_at_ms: Date.now() };
+      grants.unshift(grant);
+      return json(res, 200, grant);
+    }
+    case 'revoke': {
+      const i = grants.findIndex(grant => grant.id === body.grant_id);
+      if (i >= 0) grants.splice(i, 1);
+      return json(res, 200, { revoked: i >= 0 });
+    }
     default: return json(res, 422, { error: 'unknown action' });
   }
 }
@@ -109,7 +126,11 @@ const server = createServer(async (req, res) => {
     if (path === '/admin/auth/logout') return json(res, 204);
     if (path === '/admin/api/overview') return json(res, 200, fx.overview());
     if (path === '/admin/api/tick' && method === 'POST') return json(res, 200, { schedules_fired: 3, cloud_turns_polled: 5, turns_settled: 2, stale_open_turns_cleared: 0, backlog_dispatched: 1, leases_renewed: 38, sandboxes_swept: 2 });
-    if (path === '/admin/api/runtime-issues') return unavailable.has('issues') ? json(res, 404, { error: 'not found' }) : json(res, 200, fx.runtimeIssues);
+    if (path === '/admin/api/runtime-issues' && method === 'GET') {
+      if (unavailable.has('issues')) return json(res, 404, { error: 'not found' });
+      if (flags.has('--unimplemented-issues')) return json(res, 501, { error: 'not implemented' });
+      return json(res, 200, fx.runtimeIssues);
+    }
     if (path === '/admin/api/versions') return unavailable.has('versions') ? json(res, 404, { error: 'not found' }) : json(res, 200, fx.versionsReport());
     if (path === '/admin/api/versions/policy' && method === 'PATCH') {
       const body = await readBody(req);

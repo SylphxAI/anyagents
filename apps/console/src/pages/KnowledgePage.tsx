@@ -1,9 +1,10 @@
 import { For, Match, Show, Switch, createMemo, createSignal } from 'solid-js';
-import { BookOpen, FileText, History, Pin, ShieldCheck } from 'lucide-solid';
+import { BookOpen, FileText, History, Pin, Plus, ShieldCheck } from 'lucide-solid';
 import { HttpError, api, createPoll, errorMessage } from '../api';
 import { ago, dateTime } from '../format';
-import { Empty, Field, FormDialog, PageHeader, Pill, Problem, SearchField, Skeleton, Tabs, formText } from '../ui/primitives';
+import { Empty, Field, FormDialog, PageHeader, Pill, Problem, SearchField, Section, Skeleton, Tabs, formText } from '../ui/primitives';
 import { Markdown } from '../ui/Markdown';
+import { GrantAccessDialog } from './GrantAccessDialog';
 
 interface Summary { namespace: string; topic: string; title: string; description: string; pinned: boolean; version: number }
 interface Doc extends Summary { id: string; body: string; updated_by: string; created_at_ms: number; updated_at_ms: number }
@@ -187,10 +188,14 @@ function Proposals(props: { namespaces: string[]; refresh: () => void }) {
 function Grants() {
   const grants = createPoll(signal => knowledge<{ grants: Grant[] }>({ action: 'grants', limit: 100 }, signal));
   const [error, setError] = createSignal('');
-  return <Switch>
+  const [grantOpen, setGrantOpen] = createSignal(false);
+  return <Section title="Namespace grants" actions={<Show when={grants.data() && !grants.error()}>
+    <button class="btn sm primary" type="button" onClick={() => setGrantOpen(true)}><Plus size={14} aria-hidden="true" />Grant Access</button>
+  </Show>}>
+  <Switch>
     <Match when={grants.error()}><Problem retry={grants.refresh}>{grants.error()}</Problem></Match>
     <Match when={!grants.data()}><Skeleton rows={4} /></Match>
-    <Match when={!grants.data()!.grants.length}><Empty icon={<ShieldCheck size={20} />} title="No namespace grants">Agents can always read their own namespace. Grant wider access with <code>anyagents knowledge grant</code>.</Empty></Match>
+    <Match when={!grants.data()!.grants.length}><Empty icon={<ShieldCheck size={20} />} title="No namespace grants">Agents can always read their own namespace. Grant access to share other namespaces.</Empty></Match>
     <Match when={grants.data()}>{data => <>
       <Show when={error()}><Problem>{error()}</Problem></Show>
       <div class="table-wrap"><table class="table">
@@ -205,5 +210,8 @@ function Grants() {
           }}>Revoke</button></td>
         </tr>}</For></tbody></table></div>
     </>}</Match>
-  </Switch>;
+  </Switch>
+  <Show when={grantOpen()}><GrantAccessDialog close={() => setGrantOpen(false)} refresh={grants.refresh}
+    grant={(agent_id, namespace_pattern, mode) => knowledge({ action: 'grant', agent_id, namespace_pattern, mode })} /></Show>
+  </Section>;
 }

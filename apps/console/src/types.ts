@@ -95,19 +95,10 @@ export type Route =
   | { page: 'accounts' }
   | { page: 'knowledge' }
   | { page: 'versions' }
+  | { page: 'issues' }
   | { page: 'settings'; tab: SettingsTab };
 export type SettingsTab = 'channels' | 'secrets' | 'automations' | 'usage';
 export type Page = Route['page'];
 
 export const harnesses = ['agy', 'claude-code', 'codex', 'cursor', 'muse', 'omp', 'opencode'];
 export const runtimes = ['sandbox', 'local', 'cloud'];
-
-/** Optional `GET /admin/api/runtime-issues` (newer coordinators). Read tolerantly; absent on older builds. */
-export interface RuntimeIssue {
-  id?: string; kind?: string; severity?: string; title?: string; message?: string; detail?: string;
-  agent?: string; agent_name?: string; at_ms?: number; observed_at_ms?: number;
-}
-export function runtimeIssues(payload: unknown): RuntimeIssue[] {
-  const list = Array.isArray(payload) ? payload : (payload as { issues?: unknown } | null)?.issues;
-  return Array.isArray(list) ? list.filter((item): item is RuntimeIssue => Boolean(item) && typeof item === 'object') : [];
-}

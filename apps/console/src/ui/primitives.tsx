@@ -164,8 +164,9 @@ export function FormDialog(props: Children & {
     event.preventDefault();
     if (busy()) return;
     const node = event.currentTarget;
+    const form = new FormData(node);
     setBusy(true); setError('');
-    try { await props.submit(new FormData(node), node); props.close(); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); }
+    try { await props.submit(form, node); props.close(); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); }
   }
   return <Dialog title={props.title} description={props.description} close={props.close} busy={busy()} wide={props.wide}><form class="dialog-form" onSubmit={save}>
     <Show when={props.children}><fieldset class="dialog-body" disabled={busy()}>{props.children}</fieldset></Show>
