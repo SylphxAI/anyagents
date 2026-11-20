@@ -10,6 +10,13 @@
 //!
 //! Inputs are journaled and deduplicated by request_id; only v2 is accepted.
 
+pub mod cloud;
+mod cloud_api;
+#[cfg(test)]
+mod cloud_tests;
+
+pub use cloud::{SpironCloudConfig, SpironCloudHarness, SpironCloudProvider};
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};

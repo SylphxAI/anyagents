@@ -9,7 +9,10 @@ description = "Spiron headless adapter"
 [dependencies]
 anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-stream = { path = "../anyagents-harness-stream" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
