@@ -108,7 +108,8 @@ impl StdioSpiron {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = anyagents_harness::spawn_child(&mut cmd)?;
+        let mut child = anyagents_harness::spawn_child(&mut cmd)
+            .map_err(|e| HarnessError::Failed(e.to_string()))?;
         let (stdin, stdout, stderr) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take());
         *self.stdin.lock().unwrap_or_else(|e| e.into_inner()) = stdin;
