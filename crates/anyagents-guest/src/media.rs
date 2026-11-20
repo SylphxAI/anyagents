@@ -228,10 +228,10 @@ fn download_media(
         .new_agent();
     let mut req = agent.get(url);
     if let Some(tok) = token {
-        req = req.header("Authorization", &format!("Bearer {tok}"));
+        req = req.header("x-anyagents-agent", tok);
     }
     if let Some(id) = agent_id {
-        req = req.header("x-anyagents-agent", id);
+        req = req.header("x-anyagents-agent-id", id);
     }
     let resp = req.call().ok()?;
     let filename = resp
@@ -331,11 +331,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let srv = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = s.read(&mut buf);
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req_text = String::from_utf8_lossy(&buf[..n]).into_owned();
             let resp = "HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"brief.docx\"\r\nContent-Length: 4\r\n\r\nPK\x03\x04";
             let _ = s.write_all(resp.as_bytes());
             let _ = s.flush();
+            req_text
         });
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
@@ -345,13 +347,41 @@ mod tests {
                 "ANYAGENTS_AGENT_DATA_DIR".into(),
                 tmp.path().display().to_string(),
             ),
+            (
+                "ANYAGENTS_MEDIA_DIR".into(),
+                tmp.path().join("media").display().to_string(),
+            ),
             ("ANYAGENTS_API_URL".into(), format!("http://{addr}")),
-            ("ANYAGENTS_AGENT_TOKEN".into(), "tok-1".into()),
+            ("ANYAGENTS_AGENT_TOKEN".into(), "aars_tok_1".into()),
+            ("ANYAGENTS_AGENT_ID".into(), "agt_test_1".into()),
         ];
         let prompt =
             "Please review:\n[Local media (document) file: /var/lib/anyagents/media/att_1.docx]";
         let rewritten = hydrate_turn_media_refs(prompt, &state, &env, None);
-        srv.join().unwrap();
+        let captured = srv.join().unwrap();
+        let headers: std::collections::BTreeMap<String, String> = captured
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            })
+            .collect();
+        assert_eq!(
+            headers.get("x-anyagents-agent").map(String::as_str),
+            Some("aars_tok_1"),
+            "captured request:\n{captured}"
+        );
+        assert_eq!(
+            headers.get("x-anyagents-agent-id").map(String::as_str),
+            Some("agt_test_1"),
+            "captured request:\n{captured}"
+        );
+        assert!(
+            !headers.contains_key("authorization"),
+            "download_media must not send duplicate Authorization header:\n{captured}"
+        );
         let expected = tmp.path().join("media/brief.docx");
         assert!(
             expected.is_file(),
@@ -385,7 +415,10 @@ mod tests {
                 Some("https://coord.example"),
                 "ANYAGENTS_API_URL={raw}"
             );
-            let mcp_env = vec![("ANYAGENTS_MCP_URL".into(), raw.into())];
+            let mcp_env = vec![
+                ("ANYAGENTS_API_URL".into(), String::new()),
+                ("ANYAGENTS_MCP_URL".into(), raw.into()),
+            ];
             assert_eq!(
                 resolve_api_base(&mcp_env, None).as_deref(),
                 Some("https://coord.example"),

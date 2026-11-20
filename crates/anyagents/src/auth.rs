@@ -159,6 +159,14 @@ impl Mode {
             return decided;
         }
         if let Some(token) = presented.agent_token.as_deref() {
+            if token.starts_with(anyagents_core::REMOTE_SESSION_TOKEN_PREFIX) {
+                if !presented.allows_remote_session {
+                    return Err(AuthError::Unauthenticated(
+                        "the session is not authenticated".into(),
+                    ));
+                }
+                return agent_for_capability(store, token);
+            }
             // A machine without the boundary knows no capabilities: its route
             // is the agent the tool server reads from its own config directory,
             // which the server resolves to an existing agent and nothing else.
@@ -170,6 +178,16 @@ impl Mode {
                 return agent_named(store, id);
             }
             return agent_for_capability(store, token);
+        }
+        if let Some(bearer) = presented.bearer_token.as_deref()
+            && anyagents_core::is_remote_session_token(bearer)
+        {
+            if !presented.allows_remote_session {
+                return Err(AuthError::Unauthenticated(
+                    "the session is not authenticated".into(),
+                ));
+            }
+            return agent_for_capability(store, bearer);
         }
         match self {
             Self::Trusted { data_dir }
@@ -255,8 +273,40 @@ pub struct Presented {
     bearer_token: Option<String>,
     admin_csrf: bool,
     is_state_changing: bool,
+    allows_remote_session: bool,
     agent_id: Option<String>,
     route_agent: Option<String>,
+}
+
+/// Whether a request method and path are explicitly admitted for remote session
+/// tokens (`aars_*`): sandbox browser-profile sync and media retrieval only.
+/// Every other internal coordinator API route refuses remote session tokens
+/// fail-closed.
+fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
+    if path.contains("..") || path.contains('\\') {
+        return false;
+    }
+    let is_profile_archive = path
+        .strip_prefix("/v1/browser-profiles/")
+        .and_then(|rest| rest.strip_suffix("/archive"))
+        .is_some_and(|seg| !seg.is_empty() && !seg.contains('/'));
+    match *method {
+        axum::http::Method::GET => {
+            path == "/v1/browser-profiles"
+                || is_profile_archive
+                || path.strip_prefix("/v1/media/").is_some_and(|rest| {
+                    let mut parts = rest.split('/');
+                    let first = parts.next().is_some_and(|s| !s.is_empty());
+                    let second = match parts.next() {
+                        None => true,
+                        Some(s) => !s.is_empty(),
+                    };
+                    first && second && parts.next().is_none()
+                })
+        }
+        axum::http::Method::PUT => is_profile_archive,
+        _ => false,
+    }
 }
 
 fn bearer_header(parts: &Parts) -> Option<String> {
@@ -269,13 +319,43 @@ fn bearer_header(parts: &Parts) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let a = left.as_bytes();
+    let b = right.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Presented {
     pub fn of(parts: &Parts) -> Self {
+        let agent_token = header(parts, operator::AGENT_HEADER);
+        let operator_token = header(parts, operator::HEADER);
+        let admin_session = crate::server::admin_auth::extract_session_cookie(&parts.headers);
+        let mut bearer_token = bearer_header(parts);
+
+        // Backward-compatible dedup for legacy clients that send the exact same
+        // agent token in both `x-anyagents-agent` and `Authorization: Bearer`.
+        // Only collapse when no operator/admin authority is present; mismatched
+        // or mixed authorities continue to fail closed with 401.
+        if operator_token.is_none()
+            && admin_session.is_none()
+            && let (Some(agent), Some(bearer)) = (agent_token.as_deref(), bearer_token.as_deref())
+            && constant_time_eq(agent, bearer)
+        {
+            bearer_token = None;
+        }
+
         Self {
-            agent_token: header(parts, operator::AGENT_HEADER),
-            operator_token: header(parts, operator::HEADER),
-            admin_session: crate::server::admin_auth::extract_session_cookie(&parts.headers),
-            bearer_token: bearer_header(parts),
+            agent_token,
+            operator_token,
+            admin_session,
+            bearer_token,
             admin_csrf: header(parts, crate::server::admin_auth::ADMIN_CSRF_HEADER).as_deref()
                 == Some("1"),
             is_state_changing: matches!(
@@ -285,6 +365,7 @@ impl Presented {
                     | axum::http::Method::PATCH
                     | axum::http::Method::DELETE
             ),
+            allows_remote_session: allows_remote_session_path(&parts.method, parts.uri.path()),
             agent_id: header(parts, AGENT_ID_HEADER),
             route_agent: parts
                 .extensions
@@ -307,11 +388,13 @@ pub async fn off_worker<T: Send + 'static>(
     }
 }
 
-/// The agent one capability authenticates, read from the store on every call:
-/// one indexed lookup of the capability and its agent's name, so a rotated or
-/// revoked capability stops working on the next call, whichever process
-/// committed the change.
+/// The agent one capability or remote session token authenticates, read from
+/// the store on every call so a rotated, expired, or revoked credential stops
+/// working on the next call, whichever process committed the change.
 pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, AuthError> {
+    if token.starts_with(anyagents_core::REMOTE_SESSION_TOKEN_PREFIX) {
+        return agent_for_remote_session(store, token);
+    }
     if let Ok(Some((agent_id, name))) = store.capability_holder(token) {
         let name = name.ok_or_else(|| AuthError::Unauthenticated("the agent is gone".into()))?;
         return Ok(Principal::Agent { agent_id, name });
@@ -325,6 +408,34 @@ pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, Aut
     Err(AuthError::Unauthenticated(
         "the session is not authenticated".into(),
     ))
+}
+
+fn agent_for_remote_session(store: &Store, token: &str) -> Result<Principal, AuthError> {
+    let unauthenticated =
+        || AuthError::Unauthenticated("invalid, expired or revoked remote session token".into());
+    let map_auth_err = |err: anyagents_core::Error| match err {
+        anyagents_core::Error::Db(_)
+        | anyagents_core::Error::Postgres(_)
+        | anyagents_core::Error::Io(_) => AuthError::Internal(
+            "temporarily unable to verify remote session token; retry shortly".into(),
+        ),
+        _ => unauthenticated(),
+    };
+    if !anyagents_core::is_remote_session_token(token) {
+        return Err(unauthenticated());
+    }
+    let grant = store
+        .authenticate_remote_session(token)
+        .map_err(map_auth_err)?;
+    let agent = store.agent(&grant.agent_id).map_err(map_auth_err)?;
+    let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+    if !crate::remote::runs_off_host_in(store, &agent, &config_dir) {
+        return Err(unauthenticated());
+    }
+    Ok(Principal::Agent {
+        agent_id: agent.id,
+        name: agent.name,
+    })
 }
 
 #[cfg(unix)]
@@ -423,7 +534,9 @@ impl FromRequestParts<AppState> for Principal {
         if let Some(decided) = state.auth.principal_without_store(&presented) {
             return decided.map_err(AuthRejection);
         }
-        if let Some(bearer) = presented.bearer_token.as_deref() {
+        if let Some(bearer) = presented.bearer_token.as_deref()
+            && !anyagents_core::is_remote_session_token(bearer)
+        {
             return crate::server::oidc_bearer::authenticate_bearer_token(
                 state.store.data_dir(),
                 bearer,
@@ -431,14 +544,30 @@ impl FromRequestParts<AppState> for Principal {
             .await
             .map_err(AuthRejection);
         }
+        let is_remote = presented
+            .agent_token
+            .as_deref()
+            .or(presented.bearer_token.as_deref())
+            .is_some_and(anyagents_core::is_remote_session_token);
         let auth = state.auth.clone();
         let store = std::sync::Arc::clone(&state.store);
-        off_worker(move || auth.principal(&store, &presented)).await
+        let principal = off_worker(move || auth.principal(&store, &presented)).await?;
+        if is_remote && matches!(principal, Principal::Agent { .. }) {
+            // Preserve the same host-isolation guards (`refuse_host_media_over_http`,
+            // `refuse_host_placement_over_http`, no host wake/revival) on direct
+            // remote-session HTTP calls as on HTTP MCP calls.
+            parts.headers.insert(
+                axum::http::header::HeaderName::from_static(crate::mcp::HTTP_MCP_HEADER),
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        Ok(principal)
     }
 }
 
 /// The rejection an unauthenticated or forbidden call gets. The message never
 /// echoes what was presented.
+#[derive(Debug)]
 pub struct AuthRejection(pub AuthError);
 
 impl axum::response::IntoResponse for AuthRejection {
@@ -691,5 +820,327 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remote_session_token_auth_dedup_and_fail_closed_boundaries() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&[
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_SANDBOX_MODE",
+            "ANYAGENTS_SANDBOX_PROVIDER",
+            "ANYAGENTS_SANDBOX_ENDPOINT",
+            "ANYAGENTS_SANDBOX_API_KEY",
+            "E2B_API_KEY",
+            "MODAL_TOKEN_ID",
+            "DAYTONA_API_KEY",
+            "SPRITES_TOKEN",
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+            "ANYAGENTS_ADMIN_OIDC_CLIENT_ID",
+            "ANYAGENTS_ADMIN_EMAILS",
+            "ANYAGENTS_ADMIN_SESSION_SECRET",
+            "ANYAGENTS_OPERATOR_TOKEN",
+        ]);
+        for key in [
+            "ANYAGENTS_SERVERLESS",
+            "ANYAGENTS_SANDBOX_MODE",
+            "ANYAGENTS_SANDBOX_PROVIDER",
+            "ANYAGENTS_SANDBOX_ENDPOINT",
+            "ANYAGENTS_SANDBOX_API_KEY",
+            "E2B_API_KEY",
+            "MODAL_TOKEN_ID",
+            "DAYTONA_API_KEY",
+            "SPRITES_TOKEN",
+            "ANYAGENTS_ADMIN_OIDC_ISSUER",
+            "ANYAGENTS_ADMIN_OIDC_CLIENT_ID",
+            "ANYAGENTS_ADMIN_EMAILS",
+            "ANYAGENTS_ADMIN_SESSION_SECRET",
+        ] {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let store = std::sync::Arc::new(Store::open(&db_path).unwrap());
+        let off_host = store
+            .create_agent(
+                anyagents_core::NewAgent::new("sandbox-agent", "claude-code")
+                    .with_runtime(anyagents_core::ExecutionRuntime::Sandbox { provider: None }),
+            )
+            .unwrap();
+        let local_agent = store
+            .create_agent(
+                anyagents_core::NewAgent::new("local-agent", "claude-code")
+                    .with_runtime(anyagents_core::ExecutionRuntime::Local),
+            )
+            .unwrap();
+        let off_host_session = store.begin_remote_session(&off_host.id, 60_000).unwrap();
+        let local_session = store.begin_remote_session(&local_agent.id, 60_000).unwrap();
+        let tok = off_host_session.token;
+        let local_tok = local_session.token;
+
+        struct NoopRunner;
+
+        impl anyagents_installer::CommandRunner for NoopRunner {
+            fn run(
+                &mut self,
+                _program: &str,
+                _args: &[String],
+                _dir: &Path,
+                _env: &[(&str, &str)],
+                _on_line: &mut dyn anyagents_installer::LineSink,
+            ) -> Result<(), anyagents_installer::InstallError> {
+                Ok(())
+            }
+        }
+
+        let expected = Principal::Agent {
+            agent_id: off_host.id.clone(),
+            name: off_host.name.clone(),
+        };
+        let state = AppState {
+            store: std::sync::Arc::clone(&store),
+            health: anyagents_supervisor::HealthBoard::default(),
+            sign_in: std::sync::Arc::new(std::sync::Mutex::new(NoopRunner)),
+            auth: Mode::Confined {
+                operator_digest: Some(operator_digest("op-secret-0123456789")),
+            },
+            identity: std::sync::Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+            timer_backend: std::sync::Arc::new(crate::timer::NoopTimerBackend),
+        };
+
+        // 1. Single `x-anyagents-agent` remote session token authenticates and sets host-isolation header.
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let p = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(p, expected);
+        assert!(!p.is_operator());
+        assert_eq!(
+            parts
+                .headers
+                .get(crate::mcp::HTTP_MCP_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        // 2. Legacy matching `x-anyagents-agent` + `Authorization: Bearer` deduplicates to single authority.
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let p = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(p, expected);
+        assert_eq!(
+            parts
+                .headers
+                .get(crate::mcp::HTTP_MCP_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        // 3. Pure `Authorization: Bearer <remote-token>` routes to remote session auth (not OIDC).
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let p = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        assert_eq!(p, expected);
+        assert_eq!(
+            parts
+                .headers
+                .get(crate::mcp::HTTP_MCP_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        // 4. Distinct dual authority (`x-anyagents-agent: A` + `Authorization: Bearer B`) fails closed (401).
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {local_tok}"),
+            )
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.0.message(), "one authority per call");
+
+        // 5. Matching agent+bearer combined with operator token or admin cookie still fails closed (401).
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(operator::HEADER, "op-secret-0123456789")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.0.message(), "one authority per call");
+
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(
+                axum::http::header::COOKIE,
+                format!(
+                    "{}=fake-cookie",
+                    crate::server::admin_auth::ADMIN_SESSION_COOKIE
+                ),
+            )
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err.0.message(), "one authority per call");
+
+        // 6. Non-off-host (local) agent remote session token fails closed (401).
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &local_tok)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // 7. Malformed `aars_*` token fails closed (401) and non-remote Bearer still hits OIDC (401).
+        for bad_hdr in [
+            (operator::AGENT_HEADER, "aars_not_hex_or_short"),
+            ("authorization", "Bearer not-a-remote-token"),
+        ] {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/browser-profiles")
+                .header(bad_hdr.0, bad_hdr.1)
+                .body(())
+                .unwrap()
+                .into_parts();
+            let err = Principal::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        // 8. Internal API routes (outside browser-profiles and media) refuse remote session tokens (401).
+        for (method, uri) in [
+            ("GET", "/"),
+            ("GET", "/v1/agents"),
+            ("POST", "/v1/send"),
+            ("GET", "/v1/secrets"),
+            ("DELETE", "/v1/browser-profiles/team-site"),
+            ("PUT", "/v1/agents/sandbox-agent/browser-profiles"),
+            ("GET", "/v1/browser-profiles/../secrets"),
+        ] {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(operator::AGENT_HEADER, &tok)
+                .body(())
+                .unwrap()
+                .into_parts();
+            let err = Principal::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.0.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+
+        // 9. Even in Mode::Trusted, a remote session token ignores spoofed `x-anyagents-agent-id`.
+        let trusted = Mode::Trusted {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let (parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .header(AGENT_ID_HEADER, local_agent.id.as_str())
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            trusted.principal(&store, &Presented::of(&parts)).unwrap(),
+            expected
+        );
+
+        // 10. Revoking the remote session immediately invalidates it (401).
+        store.revoke_remote_sessions(&off_host.id, None).unwrap();
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(operator::AGENT_HEADER, &tok)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // 10. Expired remote session token immediately fails closed (401).
+        let fresh = store.begin_remote_session(&off_host.id, 60_000).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE remote_session_tokens SET expires_at_ms = 1 WHERE session_id = ?1",
+                [fresh.session_id.as_str()],
+            )
+            .unwrap();
+        let (mut parts, ()) = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/browser-profiles")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", fresh.token),
+            )
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = Principal::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 }

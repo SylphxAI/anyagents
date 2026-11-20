@@ -154,10 +154,7 @@ impl CoordinatorAuth {
 
     pub fn headers(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Agent(t) => vec![
-                ("x-anyagents-agent", t.clone()),
-                ("Authorization", format!("Bearer {t}")),
-            ],
+            Self::Agent(t) => vec![("x-anyagents-agent", t.clone())],
             Self::Operator(t) => vec![("x-anyagents-operator", t.clone())],
         }
     }
@@ -1307,11 +1304,11 @@ mod tests {
                 let mut stream = stream;
                 if path == "/v1/browser-profiles" || (!token.is_empty() && !op_tok.is_empty()) {
                     let (st, m) = match (token.as_str(), bearer.as_str(), op_tok.as_str()) {
-                        ("valid-agent-token", "Bearer valid-agent-token", "") => (
+                        ("valid-agent-token", "", "") => (
                             "200 OK",
                             r#"{"s3_configured":true,"profiles":[{"profile":"demo-profile","granted":true}]}"#,
                         ),
-                        ("other-agent-token", "Bearer other-agent-token", "") => {
+                        ("other-agent-token", "", "") => {
                             ("200 OK", r#"{"s3_configured":true,"profiles":[]}"#)
                         }
                         ("", "", "op-token") => (
@@ -1327,7 +1324,7 @@ mod tests {
                     );
                     continue;
                 }
-                if token != "valid-agent-token" || bearer != "Bearer valid-agent-token" {
+                if token != "valid-agent-token" || !bearer.is_empty() {
                     let msg = r#"{"error":"profile not granted"}"#;
                     let _ = write!(
                         stream,
@@ -1448,7 +1445,7 @@ mod tests {
         .unwrap();
         let h = exp.headers();
         assert!(exp.is_agent() && !format!("{exp:?}").contains("exp"));
-        assert!(h[0].0 == "x-anyagents-agent" && h[1].1 == "Bearer exp");
+        assert_eq!(h, vec![("x-anyagents-agent", "exp".to_string())]);
         for key in [
             AGENT_TOKEN_ENV,
             CAPABILITY_TOKEN_ENV,
@@ -1457,11 +1454,9 @@ mod tests {
             MCP_TOKEN_ENV,
         ] {
             let a = resolve_coordinator_auth_from(None, |k| (k == key).then(|| "tok".into()));
-            assert!(
-                a.unwrap()
-                    .headers()
-                    .iter()
-                    .all(|(k, _)| *k != "x-anyagents-operator")
+            assert_eq!(
+                a.unwrap().headers(),
+                vec![("x-anyagents-agent", "tok".to_string())]
             );
         }
         let (ms, os) = (mcp_f.display().to_string(), op_f.display().to_string());
