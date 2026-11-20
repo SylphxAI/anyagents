@@ -11,6 +11,7 @@ use std::{
 pub const MAX_BYTES: usize = 4096;
 pub const MAX_LINES: usize = 150;
 const MARKER: &str = "[Memory truncated; consult the configured source for full text.]\n";
+const HEADER: &str = "<learned_memory>\n# Learned memory (session snapshot)\n";
 const FOOTER: &str = "</learned_memory>\n";
 
 pub fn sha256(bytes: &[u8]) -> String {
@@ -52,7 +53,6 @@ pub fn sanitize_memory_delimiters(input: &str) -> String {
 /// Complete section including its delimiters and visible truncation marker.
 /// The digest lives alongside it, avoiding a self-referential section hash.
 pub fn bounded_section(input: &str) -> String {
-    const HEADER: &str = "<learned_memory>\n# Learned memory (session snapshot)\n";
     let base = HEADER.len() + FOOTER.len();
     let base_lines = HEADER.lines().count() + FOOTER.lines().count();
     let sanitized = sanitize_memory_delimiters(input);
@@ -203,6 +203,8 @@ pub struct MemoryTopicEntry {
     pub description: String,
     pub updated_at_ms: i64,
     pub bytes: usize,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,33 +275,6 @@ fn truncate_utf8_chars(input: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &input[..end]
-}
-
-fn truncate_summary_clean(input: &str, max_bytes: usize) -> String {
-    let trimmed = input.trim();
-    if trimmed.len() <= max_bytes {
-        return trimmed.to_string();
-    }
-    if max_bytes <= 3 {
-        return truncate_utf8_chars(trimmed, max_bytes).to_string();
-    }
-    let limit = max_bytes - 3;
-    let slice = truncate_utf8_chars(trimmed, limit);
-    let min_snap = (limit * 2) / 3;
-    let snapped = slice
-        .char_indices()
-        .rev()
-        .find(|(idx, ch)| {
-            *idx >= min_snap
-                && matches!(
-                    *ch,
-                    ' ' | ',' | ';' | ':' | '.' | '—' | '–' | '。' | '，' | '；' | '、' | '：'
-                )
-        })
-        .map(|(idx, _)| slice[..idx].trim_end_matches([' ', ',', ';', ':', '-', '—', '–']))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| slice.trim_end());
-    format!("{snapped}...")
 }
 
 fn clean_single_line_description(raw: &str) -> String {
@@ -376,9 +351,27 @@ pub fn parse_topic_frontmatter_full<'a>(
     (name, clipped, created_at_ms, updated_at_ms, body)
 }
 
+/// The optional boolean in a topic's frontmatter; body text never sets a pin.
+pub fn topic_pin(text: &str) -> Option<bool> {
+    let frontmatter = text.trim_start().strip_prefix("---\n")?;
+    let (frontmatter, _) = frontmatter.split_once("\n---")?;
+    frontmatter.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("pinned:")?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
 pub fn parse_topic_frontmatter(slug: &str, text: &str) -> (String, String) {
     let (name, description, _, _, _) = parse_topic_frontmatter_full(slug, text);
     (name, description)
+}
+
+/// Retained PostgreSQL coordinate for a learned-memory file (used for redaction checks).
+pub fn memory_blob_segment(agent_id: &str, filename: &str) -> std::path::PathBuf {
+    crate::host_retrieval::pg_agent_file_segment(agent_id, "memory", filename)
 }
 
 pub fn list_memory_topics(agent_root: &Path) -> io::Result<Vec<MemoryTopicEntry>> {
@@ -418,6 +411,7 @@ pub fn list_memory_topics(agent_root: &Path) -> io::Result<Vec<MemoryTopicEntry>
             description,
             updated_at_ms,
             bytes: raw.len(),
+            pinned: topic_pin(&text).unwrap_or(false),
         });
     }
     entries.sort_by(|a, b| a.slug.cmp(&b.slug));
@@ -450,133 +444,61 @@ fn ensure_private_memory_dir(agent_root: &Path) -> io::Result<std::path::PathBuf
     Ok(mem_dir)
 }
 
-/// Rebuilds `<agent_root>/memory/MEMORY.md` so 100% of topic `.md` files are
-/// indexed while guaranteeing `bounded_section(&memory_md)` stays strictly
-/// within `MAX_BYTES` (`4096`) and `MAX_LINES` (`150`) with zero truncation.
+/// Render complete topic lines in pin/recency order, with an exact omission count.
+pub fn render_memory_index(
+    agent_name: &str,
+    role: Option<&str>,
+    topics: &[MemoryTopicEntry],
+) -> String {
+    let title = clean_single_line_description(&match role.filter(|r| !r.trim().is_empty()) {
+        Some(role) => format!("{agent_name} ({role})"),
+        None => agent_name.to_string(),
+    });
+    let mut index = format!("# {title} — Learned Memory Index\n");
+    if topics.is_empty() {
+        index.push_str("- No topic files recorded yet.\n");
+        return index;
+    }
+    let mut ordered: Vec<_> = topics.iter().collect();
+    ordered.sort_by_key(|t| {
+        (
+            std::cmp::Reverse(t.pinned),
+            std::cmp::Reverse(t.updated_at_ms),
+            &t.slug,
+        )
+    });
+    let mut bytes = MAX_BYTES - HEADER.len() - FOOTER.len() - index.len();
+    let mut lines = MAX_LINES - HEADER.lines().count() - FOOTER.lines().count() - 1;
+    let marker = |n| format!("(+{n} more topics via memory list/search)\n");
+    for (i, topic) in ordered.into_iter().enumerate() {
+        let slug = clean_single_line_description(&topic.slug);
+        let filename = sanitize_memory_delimiters(&topic.filename.replace(['\n', '\r'], " "));
+        let description = clean_single_line_description(&topic.description);
+        let line = format!("- [{slug}]({filename}) — {description}\n");
+        let remaining = topics.len() - i - 1;
+        let reserve = if remaining == 0 {
+            0
+        } else {
+            marker(remaining).len()
+        };
+        if line.len() + reserve > bytes || lines < 1 + usize::from(remaining > 0) {
+            index.push_str(&marker(remaining + 1));
+            break;
+        }
+        index.push_str(&line);
+        bytes -= line.len();
+        lines -= 1;
+    }
+    index
+}
+
 pub fn rebuild_memory_index(
     agent_root: &Path,
     agent_name: &str,
     role: Option<&str>,
 ) -> io::Result<String> {
     let mem_dir = ensure_private_memory_dir(agent_root)?;
-    let topics = list_memory_topics(agent_root)?;
-    let role_suffix = role
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|r| format!(" ({r})"))
-        .unwrap_or_default();
-    let header = format!("# {agent_name}{role_suffix} — Learned Memory Index\n");
-
-    let wrapper_overhead = bounded_section("").len() + 64;
-    let max_body_bytes = MAX_BYTES.saturating_sub(wrapper_overhead + header.len());
-    let max_body_lines = MAX_LINES.saturating_sub(header.lines().count() + 6);
-    let n = topics.len();
-    let mut body = String::new();
-
-    let format_full_line = |t: &MemoryTopicEntry, desc_budget: usize| -> String {
-        let prefix = format!("- [{}]({}) — ", t.slug, t.filename);
-        let desc = if !t.description.is_empty() {
-            truncate_summary_clean(&t.description, desc_budget)
-        } else {
-            "topic".to_string()
-        };
-        format!("{prefix}{desc}\n")
-    };
-
-    let format_archival_section = |archival: &[&MemoryTopicEntry]| -> String {
-        if archival.is_empty() {
-            return String::new();
-        }
-        let mut out =
-            String::from("## Archival Topics (`conversation scope=\"memory\" topic=\"<slug>\"`)\n");
-        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        for t in archival {
-            let prefix = t
-                .slug
-                .split('-')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("general")
-                .to_string();
-            groups.entry(prefix).or_default().push(t.slug.clone());
-        }
-        let mut singletons = Vec::new();
-        for (group, mut slugs) in groups {
-            slugs.sort();
-            if slugs.len() >= 2 {
-                for chunk in slugs.chunks(5) {
-                    out.push_str(&format!("- **{group}**: {}\n", chunk.join(", ")));
-                }
-            } else {
-                singletons.extend(slugs);
-            }
-        }
-        singletons.sort();
-        for chunk in singletons.chunks(5) {
-            out.push_str(&format!("- **other**: {}\n", chunk.join(", ")));
-        }
-        out
-    };
-
-    if n == 0 {
-        body.push_str("- No topic files recorded yet.\n");
-    } else {
-        // First check if all topics fit with complete, readable 1-line descriptions (>= 72 bytes).
-        let mut all_full = String::new();
-        let per_desc_budget = if n <= 20 { 110 } else { 84 };
-        for t in &topics {
-            all_full.push_str(&format_full_line(t, per_desc_budget));
-        }
-        if all_full.len() <= max_body_bytes && all_full.lines().count() <= max_body_lines {
-            body = all_full;
-        } else {
-            // Prioritize most recently updated topics (`updated_at_ms DESC`),
-            // giving each active topic a full readable 85-byte summary and folding older topics into Archival Topics.
-            let mut prioritized: Vec<&MemoryTopicEntry> = topics.iter().collect();
-            prioritized.sort_by(|a, b| {
-                b.updated_at_ms
-                    .cmp(&a.updated_at_ms)
-                    .then_with(|| a.slug.cmp(&b.slug))
-            });
-
-            let max_active = prioritized.len().min(20);
-            let mut chosen = String::new();
-            for k in (0..=max_active).rev() {
-                let (active_slice, archival_slice) = prioritized.split_at(k);
-                let mut candidate = String::new();
-                if !active_slice.is_empty() {
-                    candidate.push_str("## Active Topics\n");
-                    for t in active_slice {
-                        candidate.push_str(&format_full_line(t, 85));
-                    }
-                }
-                let archival_text = format_archival_section(archival_slice);
-                candidate.push_str(&archival_text);
-                if candidate.len() <= max_body_bytes && candidate.lines().count() <= max_body_lines
-                {
-                    chosen = candidate;
-                    break;
-                }
-            }
-            if chosen.is_empty() {
-                let all_refs: Vec<&MemoryTopicEntry> = topics.iter().collect();
-                let archival_text = format_archival_section(&all_refs);
-                for line in archival_text.lines() {
-                    let l = format!("{line}\n");
-                    if body.len() + l.len() <= max_body_bytes
-                        && body.lines().count() < max_body_lines
-                    {
-                        body.push_str(&l);
-                    }
-                }
-            } else {
-                body = chosen;
-            }
-        }
-    }
-
-    let full = format!("{header}{body}");
+    let full = render_memory_index(agent_name, role, &list_memory_topics(agent_root)?);
     let mem_path = mem_dir.join("MEMORY.md");
     if fs::read(&mem_path).ok().as_deref() != Some(full.as_bytes()) {
         atomic_write(&mem_path, full.as_bytes())?;
@@ -597,9 +519,10 @@ pub fn upsert_memory_topic(
     let mem_dir = ensure_private_memory_dir(agent_root)?;
     let filename = format!("{slug}.md");
     let path = mem_dir.join(&filename);
-    let existing_created_ms = fs::read_to_string(&path)
-        .ok()
-        .and_then(|old_text| parse_topic_frontmatter_full(&slug, &old_text).2);
+    let existing = fs::read_to_string(&path).ok();
+    let existing_created_ms = existing
+        .as_deref()
+        .and_then(|old_text| parse_topic_frontmatter_full(&slug, old_text).2);
     let trimmed = content.trim();
     let (_, inferred_desc, fm_created_ms, _, body_without_fm) =
         parse_topic_frontmatter_full(&slug, trimmed);
@@ -617,10 +540,14 @@ pub fn upsert_memory_topic(
                 inferred_desc
             }
         });
+    let pinned = topic_pin(trimmed)
+        .or_else(|| existing.as_deref().and_then(topic_pin))
+        .unwrap_or(false);
+    let pin_line = if pinned { "pinned: true\n" } else { "" };
     let safe_desc = desc.replace('"', "'");
     let clean_body = sanitize_memory_delimiters(body_without_fm.trim());
     let formatted = format!(
-        "---\nname: {slug}\ndescription: \"{safe_desc}\"\nmetadata:\n  node_type: memory\n  created_at_ms: {created_at_ms}\n  updated_at_ms: {now_ms}\n---\n\n{clean_body}\n"
+        "---\nname: {slug}\ndescription: \"{safe_desc}\"\n{pin_line}metadata:\n  node_type: memory\n  created_at_ms: {created_at_ms}\n  updated_at_ms: {now_ms}\n---\n\n{clean_body}\n"
     );
     atomic_write(&path, formatted.as_bytes())?;
     let index = rebuild_memory_index(agent_root, agent_name, role)?;
@@ -630,6 +557,7 @@ pub fn upsert_memory_topic(
         description: desc,
         updated_at_ms: now_ms,
         bytes: formatted.len(),
+        pinned,
     };
     Ok((path, entry, index))
 }
@@ -1704,8 +1632,12 @@ mod tests {
                 Some("Designer"),
                 &topic,
                 Some("Verified invariant and trigger condition for this domain topic"),
-                "Detailed body fact",
-                1794089000000,
+                if i == 0 {
+                    "---\npinned: true\n---\nDetailed body fact"
+                } else {
+                    "Detailed body fact"
+                },
+                1794089000000 + i as i64,
             )
             .unwrap();
             let bounded = bounded_section(&index);
@@ -1713,6 +1645,13 @@ mod tests {
             assert!(bounded.lines().count() <= MAX_LINES);
             assert!(!bounded.contains(MARKER), "truncated at i={i}: {bounded}");
             assert!(bounded.contains(&topic), "missing {topic} at i={i}");
+            assert!(bounded.contains("alpha-topic-000"));
+            let omitted = i + 1 - index.lines().filter(|line| line.starts_with("- [")).count();
+            if omitted > 0 {
+                assert!(
+                    bounded.contains(&format!("(+{omitted} more topics via memory list/search)"))
+                );
+            }
         }
         let (removed, after) =
             delete_memory_topic(root.path(), "sage", Some("Designer"), "alpha-topic-000").unwrap();
