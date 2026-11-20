@@ -28,6 +28,8 @@ pub(crate) struct AppState {
     pub(crate) identity: Arc<ServingIdentity>,
     /// The last provider-profile listing, refreshed in the background.
     pub(crate) profiles: Arc<profiles::ProfileSnapshots>,
+    /// Event-driven timer backend (local Tokio timers or external webhook/delayed-run scheduler).
+    pub(crate) timer_backend: Arc<dyn crate::timer::TimerBackend>,
 }
 
 /// Resolve the logical workspace directory inside a remote sandbox VM.

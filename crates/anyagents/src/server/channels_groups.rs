@@ -86,12 +86,16 @@ async fn telegram_webhook(
     if serverless::is_serverless_mode() {
         for agent_id in target_agents {
             let store_disp = Arc::clone(&state.store);
+            let timer_disp = Arc::clone(&state.timer_backend);
             let call = super::in_flight::carry();
             tokio::spawn(async move {
                 let _call = call;
-                if let Err(err) =
-                    serverless::dispatch_next_mailbox_message_if_serverless(store_disp, &agent_id)
-                        .await
+                if let Err(err) = serverless::dispatch_next_mailbox_message_with_timer(
+                    store_disp,
+                    &agent_id,
+                    Some(timer_disp),
+                )
+                .await
                 {
                     eprintln!(
                         "anyagents-serverless: telegram webhook dispatch failed for {agent_id}: {err}"

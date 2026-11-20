@@ -57,8 +57,10 @@ pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod serverless_envelope;
 mod serverless_failure;
+pub(crate) mod serverless_maintenance;
 mod serverless_memory;
-mod serverless_watches;
+pub(crate) mod serverless_watches;
+pub(crate) mod timer_fire;
 mod types;
 mod webhooks_mcp;
 
@@ -120,7 +122,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route))
+        .merge(timer_fire::router())
         .fallback(ops::public_not_found)
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
@@ -142,7 +144,7 @@ fn build_webhook_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route));
+        .merge(timer_fire::router());
     // In Pure Serverless mode there is no reachable host Unix socket, so expose
     // the full authenticated control/agent API and embedded `/admin` console on
     // the HTTP listener strictly when fail-closed operator auth
@@ -188,7 +190,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/v1/internal/cloud/events",
             post(serverless::cloud_events_route),
         )
-        .route("/v1/internal/tick", post(serverless::tick_route))
+        .merge(timer_fire::router())
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
             &state.store,

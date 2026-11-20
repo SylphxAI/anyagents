@@ -350,6 +350,23 @@ pub(super) async fn handle_schedule_action(
                     prompt,
                 )
                 .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+                if let Ok(Some(sched_row)) = state.store.get_schedule(&created.id)
+                    && sched_row.next_fire_at_ms.is_some()
+                {
+                    // Cancel any prior external run ID when deduplicating/updating an existing schedule.
+                    if sched_row.external_timer_id.is_some() {
+                        crate::timer::cancel_schedule_timer(
+                            state.timer_backend.as_ref(),
+                            &sched_row,
+                        );
+                    }
+                    crate::timer::arm_schedule_timer(
+                        &state.store,
+                        state.timer_backend.as_ref(),
+                        &sched_row,
+                    )
+                    .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+                }
                 let schedules: Vec<crate::api::ScheduleView> = state
                     .store
                     .list_schedules(Some(&target.id), true)
@@ -373,10 +390,14 @@ pub(super) async fn handle_schedule_action(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("all");
-                let cancelled = state
+                let cancelled_rows = state
                     .store
-                    .cancel_schedule(Some(&target.id), id_or_all)
+                    .cancel_schedules_returning(Some(&target.id), id_or_all)
                     .map_err(ApiError::from_store)?;
+                for sched in &cancelled_rows {
+                    crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
+                }
+                let cancelled = cancelled_rows.len();
                 crate::schedule::schedules_changed(state.store.data_dir());
                 let schedules: Vec<crate::api::ScheduleView> = state
                     .store

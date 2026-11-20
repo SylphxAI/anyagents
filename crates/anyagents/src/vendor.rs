@@ -1174,6 +1174,8 @@ fn is_untrusted_launch_env(k: &str) -> bool {
                 | "ANYAGENTS_CAPABILITY_KEY"
                 | "ANYAGENTS_MASTER_KEY"
                 | "ANYAGENTS_TICK_TOKEN"
+                | "ANYAGENTS_TIMER_TOKEN"
+                | "ANYAGENTS_TIMER_SCHEDULER_TOKEN"
                 | "ANYAGENTS_DATABASE_URL"
                 | "ANYAGENTS_DIRECT_DATABASE_URL"
                 | "LD_PRELOAD"

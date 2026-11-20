@@ -36,9 +36,6 @@ pub(crate) fn enrich_guest_env(
             data_dir.join("tmp/screenshots").display().to_string(),
         ),
     ];
-    if let Some(url) = resolve_api_base(env, file_cfg) {
-        extras.push(("ANYAGENTS_API_URL", url));
-    }
     if let Some(id) =
         lookup_env("ANYAGENTS_AGENT_ID", env).or_else(|| file_cfg.and_then(|c| c.agent_id.clone()))
     {
@@ -49,6 +46,10 @@ pub(crate) fn enrich_guest_env(
             env.retain(|(ek, _)| ek != k);
             env.push((k.to_string(), v));
         }
+    }
+    if let Some(url) = resolve_api_base(env, file_cfg) {
+        env.retain(|(ek, _)| ek != "ANYAGENTS_API_URL");
+        env.push(("ANYAGENTS_API_URL".to_string(), url));
     }
 }
 
@@ -278,17 +279,26 @@ fn lookup_env(key: &str, env: &[(String, String)]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+pub(crate) fn normalize_api_base_url(raw: &str) -> String {
+    let mut url = raw.trim().trim_end_matches('/');
+    for suffix in ["/v1/webhooks/mcp", "/v1/mcp", "/mcp", "/v1/webhooks"] {
+        if let Some(stripped) = url.strip_suffix(suffix) {
+            url = stripped.trim_end_matches('/');
+            break;
+        }
+    }
+    url.to_string()
+}
+
 pub(crate) fn resolve_api_base(
     env: &[(String, String)],
     file_cfg: Option<&GuestConfig>,
 ) -> Option<String> {
-    if let Some(u) = lookup_env("ANYAGENTS_API_URL", env) {
-        return Some(u.trim_end_matches('/').to_string());
-    }
-    let mcp = lookup_env("ANYAGENTS_MCP_URL", env)
+    let raw = lookup_env("ANYAGENTS_API_URL", env)
+        .or_else(|| lookup_env("ANYAGENTS_MCP_URL", env))
         .or_else(|| file_cfg.and_then(|c| c.mcp_url.clone()))?;
-    let t = mcp.trim().trim_end_matches('/');
-    Some(t.strip_suffix("/mcp").unwrap_or(t).to_string())
+    let base = normalize_api_base_url(&raw);
+    (!base.is_empty()).then_some(base)
 }
 
 pub(crate) fn resolve_auth_token(
@@ -351,6 +361,55 @@ mod tests {
         assert!(
             rewritten.contains(&expected.display().to_string()),
             "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_strips_webhook_and_mcp_suffixes_for_api_and_mcp_urls() {
+        for raw in [
+            "https://coord.example/v1/webhooks/mcp",
+            "https://coord.example/v1/webhooks/mcp/",
+            "https://coord.example/v1/webhooks",
+            "https://coord.example/v1/mcp",
+            "https://coord.example/mcp",
+            "https://coord.example/",
+        ] {
+            assert_eq!(
+                normalize_api_base_url(raw),
+                "https://coord.example",
+                "{raw}"
+            );
+            let api_env = vec![("ANYAGENTS_API_URL".into(), raw.into())];
+            assert_eq!(
+                resolve_api_base(&api_env, None).as_deref(),
+                Some("https://coord.example"),
+                "ANYAGENTS_API_URL={raw}"
+            );
+            let mcp_env = vec![("ANYAGENTS_MCP_URL".into(), raw.into())];
+            assert_eq!(
+                resolve_api_base(&mcp_env, None).as_deref(),
+                Some("https://coord.example"),
+                "ANYAGENTS_MCP_URL={raw}"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut env = vec![
+            (
+                "ANYAGENTS_AGENT_DATA_DIR".into(),
+                tmp.path().display().to_string(),
+            ),
+            (
+                "ANYAGENTS_API_URL".into(),
+                "https://coord.example/v1/webhooks".into(),
+            ),
+        ];
+        enrich_guest_env(&state, None, &mut env);
+        assert_eq!(
+            lookup_env("ANYAGENTS_API_URL", &env).as_deref(),
+            Some("https://coord.example")
         );
     }
 }

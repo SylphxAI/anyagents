@@ -1627,6 +1627,7 @@ mod tool_server_runtime_tests {
             },
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         });
         let mk = |a: &anyagents_core::Agent| {
             let r = AgentRef {
