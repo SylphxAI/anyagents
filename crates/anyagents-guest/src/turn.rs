@@ -5,7 +5,7 @@
 //!   `<state-dir>/turns/<turn-id>.log`), prints `{"status":"accepted","turn_id":"...","pid":N}`,
 //!   and exits `0` immediately (<100ms) so the coordinator HTTP request closes immediately.
 //! - The worker drives any of the supported CLI harnesses (`claude`, `codex`, `opencode`,
-//!   `gemini`, `omp`, `agy`, `muse`, `grok`, `dsh`, `spiron`) to completion, POSTing periodic
+//!   `gemini`, `omp`, `agy`, `muse`, `spiron`) to completion, POSTing periodic
 //!   heartbeats (with live `/proc` `inflight_children`), incremental `delta` events, and a final
 //!   `turn_complete` or `turn_failed` JSON payload with `Authorization: Bearer <callback-token>`
 //!   and bounded exponential-backoff retry (5 retries).
@@ -68,7 +68,7 @@ pub struct TurnArgs {
     /// Target AnyAgents agent identifier (`agt_...`).
     #[arg(long)]
     pub agent_id: String,
-    /// Target CLI harness (`claude`, `codex`, `opencode`, `gemini`, `omp`, `agy`, `muse`, `grok`, `dsh`, `spiron`).
+    /// Target CLI harness (`claude`, `codex`, `opencode`, `gemini`, `omp`, `agy`, `muse`, `spiron`).
     #[arg(long)]
     pub harness: Option<String>,
     /// Explicit path to the underlying vendor CLI binary inside the sandbox.
@@ -365,8 +365,6 @@ fn execute_turn_foreground(
     if harness_name == "agy" {
         prune_legacy_agy_tool_guard(state_dir);
     }
-    let guest_exe =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/anyagents-guest"));
     let pre_turn_auth = snapshot_syncable_auth_files(state_dir);
 
     let mut adapter = match launch_guest_harness(
@@ -379,7 +377,6 @@ fn execute_turn_foreground(
         &work_dir,
         &env,
         file_cfg.as_ref(),
-        &guest_exe,
     ) {
         Ok(a) => a,
         Err(err) => {

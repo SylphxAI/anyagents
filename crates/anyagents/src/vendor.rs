@@ -25,9 +25,6 @@ use serde::{Deserialize, Serialize};
 mod in_process;
 pub use in_process::InProcessRemoteHarness;
 
-use crate::dsh::DshHarness;
-use crate::grok::GrokHarness;
-
 /// One vendor adapter over its vendor process, in the process that hosts it:
 /// its keeper, or this one.
 pub enum LocalAdapter {
@@ -37,8 +34,6 @@ pub enum LocalAdapter {
     Agy(Box<AgyHarness>),
     Muse(Box<MuseHarness>),
     Omp(Box<OmpHarness>),
-    Dsh(Box<DshHarness>),
-    Grok(Box<GrokHarness>),
     /// The external Spiron CLI.
     Spiron(Box<SpironHarness>),
     Contract(Box<ContractHarness>),
@@ -146,34 +141,6 @@ impl VendorHarness {
             pointer,
             selector,
         } = planned;
-        if matches!(launch, AdapterLaunch::Spiron { .. }) {
-            // An agent never has two Spiron processes: one a launch record
-            // still names (left by a server that died) ends first.
-            crate::spiron_native::end_recorded(&request.data_dir, request.agent.id.as_str());
-            // Where processes outlive this server, a v2 Spiron is its own
-            // process and needs no keeper (ADR 0011 D9).
-            if matches!(host, HarnessHost::Keeper(_)) {
-                let mut labels = std::collections::BTreeMap::new();
-                labels.insert(LABEL_SELECTOR.to_string(), selector.clone());
-                if let Some(pointer) = &pointer {
-                    labels.insert(LABEL_POINTER.to_string(), pointer.display().to_string());
-                }
-                let at = crate::spiron_native::Launching {
-                    data: &request.data_dir,
-                    agent: request.agent.id.as_str(),
-                    harness: &request.agent.harness,
-                    model: request.agent.model.as_deref(),
-                    labels,
-                };
-                if let Some(started) = launch.start_listening(at) {
-                    return Ok(Self {
-                        host: Host::Local(started?),
-                        pointer: pointer.map(SessionPointer::from),
-                        selector,
-                    });
-                }
-            }
-        }
         let host = if matches!(
             launch,
             AdapterLaunch::InProcessCloud { .. } | AdapterLaunch::InProcessSandbox { .. }
@@ -259,25 +226,6 @@ impl VendorHarness {
         }
     }
 
-    /// A v2 Spiron an earlier server left, attached again: the pointer and
-    /// session record follow the labels its launch recorded.
-    pub(crate) fn native(
-        harness: SpironHarness,
-        labels: &std::collections::BTreeMap<String, String>,
-    ) -> Self {
-        Self {
-            host: Host::Local(LocalAdapter::Spiron(Box::new(harness))),
-            pointer: labels
-                .get(LABEL_POINTER)
-                .map(PathBuf::from)
-                .map(SessionPointer::from),
-            selector: labels
-                .get(LABEL_SELECTOR)
-                .cloned()
-                .unwrap_or_else(|| "spiron".to_string()),
-        }
-    }
-
     fn adapter(&self) -> &dyn Hosted {
         match &self.host {
             Host::Local(adapter) => adapter,
@@ -301,11 +249,8 @@ impl VendorHarness {
     /// Leave a kept harness running for the next kernel. One hosted here
     /// ends with this process anyway.
     pub(crate) fn detach(self) {
-        match self.host {
-            Host::Kept(remote) => (*remote).detach(),
-            // A v2 Spiron is its own process: only the connection closes.
-            Host::Local(LocalAdapter::Spiron(harness)) if harness.listening() => harness.detach(),
-            Host::Local(_) => {}
+        if let Host::Kept(remote) = self.host {
+            (*remote).detach();
         }
     }
 
@@ -325,20 +270,10 @@ impl VendorHarness {
 
     /// Keep `note` with a kept harness for the next kernel.
     pub(crate) fn set_note(&self, note: &str) {
-        match &self.host {
-            Host::Kept(remote) => {
-                if let Err(error) = remote.set_note(note) {
-                    eprintln!("anyagents-keeper: cannot keep the process note: {error}");
-                }
-            }
-            Host::Local(LocalAdapter::Spiron(harness)) => {
-                if let Some(record) = harness.record()
-                    && let Err(error) = crate::spiron_native::set_note(record, note)
-                {
-                    eprintln!("anyagents-spiron: cannot keep the process note: {error}");
-                }
-            }
-            Host::Local(_) => {}
+        if let Host::Kept(remote) = &self.host
+            && let Err(error) = remote.set_note(note)
+        {
+            eprintln!("anyagents-keeper: cannot keep the process note: {error}");
         }
     }
 
@@ -446,22 +381,6 @@ pub enum AdapterLaunch {
         env: Vec<(String, String)>,
         work_dir: PathBuf,
     },
-    Dsh {
-        program: PathBuf,
-        patch: Option<PathBuf>,
-        session: Option<String>,
-        env: Vec<(String, String)>,
-        work_dir: PathBuf,
-    },
-    Grok {
-        program: PathBuf,
-        model: Option<String>,
-        session: Option<String>,
-        env: Vec<(String, String)>,
-        work_dir: PathBuf,
-        exe: PathBuf,
-        mcp_args: Vec<String>,
-    },
     Spiron {
         program: PathBuf,
         config_dir: PathBuf,
@@ -542,54 +461,11 @@ impl AdapterLaunch {
             | Self::Agy { env, .. }
             | Self::Muse { env, .. }
             | Self::Omp { env, .. }
-            | Self::Dsh { env, .. }
-            | Self::Grok { env, .. }
             | Self::Spiron { env, .. }
             | Self::OpenCode { env, .. }
             | Self::Codex { env, .. }
             | Self::InProcessCloud { env, .. }
             | Self::InProcessSandbox { env, .. } => env,
-        }
-    }
-
-    /// Launch a Spiron that speaks `spiron.headless/v2` as a process of its
-    /// own that outlives this server (`spiron_native`). `None` when this is
-    /// not a Spiron launch.
-    fn start_listening(
-        &self,
-        at: crate::spiron_native::Launching<'_>,
-    ) -> Option<Result<LocalAdapter, String>> {
-        let Self::Spiron {
-            program,
-            config_dir,
-            work_dir,
-            agent_id,
-            agent_name,
-            model,
-            session,
-            env,
-        } = self
-        else {
-            return None;
-        };
-        let (launch, applied) = match spiron_launch(
-            program,
-            config_dir,
-            work_dir,
-            SpironAgent {
-                id: agent_id,
-                name: agent_name,
-                model: model.as_deref(),
-            },
-            session.as_deref(),
-            env,
-        ) {
-            Ok(launch) => launch,
-            Err(error) => return Some(Err(error)),
-        };
-        match crate::spiron_native::launch(launch, applied, at, SPIRON_READY_WAIT) {
-            Ok(harness) => Some(Ok(LocalAdapter::Spiron(Box::new(harness)))),
-            Err(anyagents_harness_spiron::ListenError::Failed(error)) => Some(Err(error)),
         }
     }
 
@@ -706,42 +582,6 @@ impl AdapterLaunch {
                 .map_err(|err| err.to_string())?;
                 LocalAdapter::Omp(Box::new(harness))
             }
-            Self::Dsh {
-                program,
-                patch,
-                session,
-                env,
-                work_dir,
-            } => LocalAdapter::Dsh(Box::new(
-                DshHarness::start(
-                    &program,
-                    patch.as_deref(),
-                    session.as_deref(),
-                    &pairs(&env),
-                    &work_dir,
-                )
-                .map_err(|err| err.to_string())?,
-            )),
-            Self::Grok {
-                program,
-                model,
-                session,
-                env,
-                work_dir,
-                exe,
-                mcp_args,
-            } => LocalAdapter::Grok(Box::new(
-                GrokHarness::start(
-                    &program,
-                    model.as_deref(),
-                    session.as_deref(),
-                    &pairs(&env),
-                    &work_dir,
-                    &exe,
-                    &mcp_args,
-                )
-                .map_err(|err| err.to_string())?,
-            )),
             Self::Spiron {
                 program,
                 config_dir,
@@ -839,8 +679,6 @@ pub(crate) fn declared_delivery(harness: &str) -> anyagents_harness::Delivery {
         "agy" => anyagents_harness_agy::DELIVERY,
         "muse" => anyagents_harness_muse::DELIVERY,
         "omp" => anyagents_harness_omp::DELIVERY,
-        "dsh" => crate::dsh::DELIVERY,
-        "grok" => crate::grok::DELIVERY,
         "spiron" => anyagents_harness_stream::SPIRON,
         "claude-code" => anyagents_harness_claude::DELIVERY,
         name if is_cloud_harness(name) => anyagents_harness_claude::CLOUD_DELIVERY,
@@ -1909,8 +1747,8 @@ fn plan_adapter(
             args.push(model);
         }
         if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-            let policy_path =
-                crate::grok::ensure_omp_policy(&omp_agent_dir).map_err(|err| err.to_string())?;
+            let policy_path = crate::mcp_config::ensure_omp_policy(&omp_agent_dir)
+                .map_err(|err| err.to_string())?;
             args.push("--config".to_string());
             args.push(policy_path.display().to_string());
             args.push("--no-extensions".to_string());
@@ -1930,46 +1768,6 @@ fn plan_adapter(
             },
             Some("omp-session-id"),
             "omp",
-        ))
-    } else if request.agent.harness == "dsh" {
-        let program = crate::install::program(root, &request.agent.harness);
-        let session = session_from_file(&request.config_dir, "dsh-session-id")?;
-        let patch_path = request.config_dir.join("dsh-mcp-patch.yml");
-        let patch = patch_path.is_file().then_some(patch_path);
-        Ok(planned(
-            AdapterLaunch::Dsh {
-                program,
-                patch,
-                session,
-                env,
-                work_dir: request.work_dir.clone(),
-            },
-            Some("dsh-session-id"),
-            "dsh",
-        ))
-    } else if request.agent.harness == "grok" {
-        let program = crate::install::program(root, &request.agent.harness);
-        let session = session_from_file(&request.config_dir, "grok-session-id")?;
-        let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
-        let mcp_args = vec![
-            "--data".to_string(),
-            request.data_dir.display().to_string(),
-            "mcp".to_string(),
-            "--config".to_string(),
-            request.config_dir.display().to_string(),
-        ];
-        Ok(planned(
-            AdapterLaunch::Grok {
-                program,
-                model: request.agent.model.clone(),
-                session,
-                env,
-                work_dir: request.work_dir.clone(),
-                exe,
-                mcp_args,
-            },
-            Some("grok-session-id"),
-            "grok",
         ))
     } else if effective_cloud {
         let canonical = if is_spiron_harness(&request.agent.harness) {
@@ -2356,26 +2154,22 @@ pub(crate) fn ensure_agy_steering_settings(
     let _ = std::fs::remove_file(hook_dir.join("anyagents-steer-hook.sh"));
     let _ = std::fs::remove_file(hook_dir.join("steer.jsonl"));
     let hooks_path = hook_dir.join("hooks.json");
-    let mut hooks_root = if hooks_path.exists() {
-        crate::mcp_config::read_candidates(std::slice::from_ref(&hooks_path))?
-    } else {
-        serde_json::json!({})
-    };
-    let hooks_map = hooks_root
-        .as_object_mut()
-        .ok_or_else(|| anyagents_core::Error::Message("AGY hooks.json is not an object".into()))?;
-    let mut hooks_changed = hooks_map.remove("anyagents-steer").is_some();
-    if hooks_map.remove("anyagents-native-tool-guard").is_some() {
-        hooks_changed = true;
-    }
-    if hooks_changed {
-        if hooks_map.is_empty() {
-            let _ = std::fs::remove_file(&hooks_path);
-        } else {
-            let mut body = serde_json::to_vec_pretty(&hooks_root)
-                .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-            body.push(b'\n');
-            crate::create::write_required_file(&hooks_path, &body, 0o664)?;
+    if hooks_path.exists() {
+        let mut hooks_root = crate::mcp_config::read_candidates(std::slice::from_ref(&hooks_path))?;
+        let hooks_map = hooks_root.as_object_mut().ok_or_else(|| {
+            anyagents_core::Error::Message("AGY hooks.json is not an object".into())
+        })?;
+        let removed_steer = hooks_map.remove("anyagents-steer").is_some();
+        let removed_guard = hooks_map.remove("anyagents-native-tool-guard").is_some();
+        if removed_steer || removed_guard {
+            if hooks_map.is_empty() {
+                let _ = std::fs::remove_file(&hooks_path);
+            } else {
+                let mut body = serde_json::to_vec_pretty(&hooks_root)
+                    .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+                body.push(b'\n');
+                crate::create::write_required_file(&hooks_path, &body, 0o664)?;
+            }
         }
     }
     Ok(())
@@ -2841,8 +2635,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.deliver(message),
             Self::Muse(harness) => harness.deliver(message),
             Self::Omp(harness) => harness.deliver(message),
-            Self::Dsh(harness) => harness.deliver(message),
-            Self::Grok(harness) => harness.deliver(message),
             Self::Spiron(harness) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
             Self::InProcessRemote(harness) => harness.deliver(message),
@@ -2857,8 +2649,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.proven(message_id),
             Self::Muse(harness) => harness.proven(message_id),
             Self::Omp(harness) => harness.proven(message_id),
-            Self::Dsh(harness) => harness.proven(message_id),
-            Self::Grok(harness) => harness.proven(message_id),
             Self::Spiron(harness) => harness.proven(message_id),
             Self::Contract(harness) => harness.proven(message_id),
             Self::InProcessRemote(harness) => harness.proven(message_id),
@@ -2873,8 +2663,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.stop(),
             Self::Muse(harness) => harness.stop(),
             Self::Omp(harness) => harness.stop(),
-            Self::Dsh(harness) => harness.stop(),
-            Self::Grok(harness) => harness.stop(),
             Self::Spiron(harness) => harness.stop(),
             Self::Contract(harness) => harness.stop(),
             Self::InProcessRemote(harness) => harness.stop(),
@@ -2889,8 +2677,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.stop_verified(),
             Self::Muse(harness) => harness.stop_verified(),
             Self::Omp(harness) => harness.stop_verified(),
-            Self::Dsh(harness) => harness.stop_verified(),
-            Self::Grok(harness) => harness.stop_verified(),
             Self::Spiron(harness) => harness.stop_verified(),
             Self::Contract(harness) => harness.stop_verified(),
             Self::InProcessRemote(harness) => harness.stop_verified(),
@@ -2905,8 +2691,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.background(),
             Self::Muse(harness) => harness.background(),
             Self::Omp(harness) => harness.background(),
-            Self::Dsh(harness) => harness.background(),
-            Self::Grok(harness) => harness.background(),
             Self::Spiron(harness) => harness.background(),
             Self::Contract(harness) => harness.background(),
             Self::InProcessRemote(harness) => harness.background(),
@@ -2921,8 +2705,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.resume(session),
             Self::Muse(harness) => harness.resume(session),
             Self::Omp(harness) => harness.resume(session),
-            Self::Dsh(harness) => harness.resume(session),
-            Self::Grok(harness) => harness.resume(session),
             Self::Spiron(harness) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
             Self::InProcessRemote(harness) => harness.resume(session),
@@ -2937,8 +2719,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.cancel(),
             Self::Muse(harness) => harness.cancel(),
             Self::Omp(harness) => harness.cancel(),
-            Self::Dsh(harness) => harness.cancel(),
-            Self::Grok(harness) => harness.cancel(),
             Self::Spiron(harness) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
             Self::InProcessRemote(harness) => harness.cancel(),
@@ -2961,8 +2741,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.health(),
             Self::Muse(harness) => harness.health(),
             Self::Omp(harness) => harness.health(),
-            Self::Dsh(harness) => harness.health(),
-            Self::Grok(harness) => harness.health(),
             Self::Spiron(harness) => harness.health(),
             Self::Contract(harness) => harness.health(),
             Self::InProcessRemote(harness) => harness.health(),
@@ -2977,8 +2755,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.pending_input_owner(),
             Self::Muse(harness) => harness.pending_input_owner(),
             Self::Omp(harness) => harness.pending_input_owner(),
-            Self::Dsh(harness) => harness.pending_input_owner(),
-            Self::Grok(harness) => harness.pending_input_owner(),
             Self::Spiron(harness) => harness.pending_input_owner(),
             Self::Contract(harness) => harness.pending_input_owner(),
             Self::InProcessRemote(harness) => harness.pending_input_owner(),
@@ -2993,8 +2769,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.input_ready(),
             Self::Muse(harness) => harness.input_ready(),
             Self::Omp(harness) => harness.input_ready(),
-            Self::Dsh(harness) => harness.input_ready(),
-            Self::Grok(harness) => harness.input_ready(),
             Self::Spiron(harness) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
             Self::InProcessRemote(harness) => harness.input_ready(),
@@ -3009,8 +2783,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.last_usage(),
             Self::Muse(harness) => harness.last_usage(),
             Self::Omp(harness) => harness.last_usage(),
-            Self::Dsh(harness) => harness.last_usage(),
-            Self::Grok(harness) => harness.last_usage(),
             Self::Spiron(harness) => harness.served_usage(),
             Self::Contract(harness) => harness.last_usage(),
             Self::InProcessRemote(harness) => harness.served_usage(),
@@ -3029,8 +2801,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.turns_served(),
             Self::Muse(harness) => harness.turns_served(),
             Self::Omp(harness) => harness.turns_served(),
-            Self::Dsh(harness) => harness.turns_served(),
-            Self::Grok(harness) => harness.turns_served(),
             Self::Spiron(harness) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
             Self::InProcessRemote(harness) => harness.turns_served(),
@@ -3045,8 +2815,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.quiet_for(id, quiet, patience),
             Self::Muse(harness) => harness.quiet_for(id, quiet, patience),
             Self::Omp(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Dsh(harness) => harness.quiet_for(id, quiet, patience),
-            Self::Grok(harness) => harness.quiet_for(id, quiet, patience),
             Self::Spiron(_) => false,
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
             Self::InProcessRemote(harness) => harness.quiet_for(id, quiet, patience),
@@ -3061,8 +2829,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.ends_on_quiet(),
             Self::Muse(harness) => harness.ends_on_quiet(),
             Self::Omp(harness) => harness.ends_on_quiet(),
-            Self::Dsh(harness) => harness.ends_on_quiet(),
-            Self::Grok(harness) => harness.ends_on_quiet(),
             Self::Spiron(_) => None,
             Self::Contract(harness) => harness.ends_on_quiet(),
             Self::InProcessRemote(harness) => harness.ends_on_quiet(),
@@ -3077,8 +2843,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.clear_quota(),
             Self::Muse(harness) => harness.clear_quota(),
             Self::Omp(harness) => harness.clear_quota(),
-            Self::Dsh(harness) => harness.clear_quota(),
-            Self::Grok(harness) => harness.clear_quota(),
             Self::Spiron(harness) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
             Self::InProcessRemote(harness) => harness.clear_quota(),
@@ -3093,8 +2857,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.process_id(),
             Self::Muse(harness) => harness.process_id(),
             Self::Omp(harness) => harness.process_id(),
-            Self::Dsh(harness) => harness.process_id(),
-            Self::Grok(harness) => harness.process_id(),
             Self::Spiron(harness) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
             Self::InProcessRemote(harness) => harness.process_id(),
@@ -3109,8 +2871,6 @@ impl Harness for LocalAdapter {
             Self::Agy(harness) => harness.watch_activity(notify),
             Self::Muse(harness) => harness.watch_activity(notify),
             Self::Omp(harness) => harness.watch_activity(notify),
-            Self::Dsh(harness) => harness.watch_activity(notify),
-            Self::Grok(harness) => harness.watch_activity(notify),
             Self::Spiron(harness) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
             Self::InProcessRemote(harness) => harness.watch_activity(notify),
@@ -3127,8 +2887,6 @@ impl Hosted for LocalAdapter {
             Self::Agy(harness) => harness.session_id(),
             Self::Muse(harness) => harness.session_id(),
             Self::Omp(harness) => harness.session_id(),
-            Self::Dsh(harness) => harness.session_id(),
-            Self::Grok(harness) => harness.session_id(),
             Self::Spiron(harness) => harness.session_id(),
             Self::Contract(_) => None,
             Self::InProcessRemote(harness) => harness.session_id(),

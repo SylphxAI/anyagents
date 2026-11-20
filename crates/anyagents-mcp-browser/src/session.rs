@@ -1,0 +1,525 @@
+//! Headless Chromium process lifecycle and CDP `Web` session management.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use agent_workstation::browser::Web;
+use agent_workstation::cdp::Cdp;
+use serde_json::{Value, json};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, MutexGuard};
+
+use crate::chromium::{discover_chromium, is_headless_shell_binary};
+use crate::config::BrowserServerConfig;
+
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
+
+/// Typed error returned by browser session operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl BrowserError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::new("INVALID_INPUT", message)
+    }
+
+    pub fn stale_target(message: impl Into<String>) -> Self {
+        Self::new("STALE_TARGET", message)
+    }
+
+    pub fn browser_not_found(message: impl Into<String>) -> Self {
+        Self::new("BROWSER_NOT_FOUND", message)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "code": self.code,
+            "error": self.message,
+        })
+    }
+}
+
+impl std::fmt::Display for BrowserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for BrowserError {}
+
+impl From<agent_workstation::Error> for BrowserError {
+    fn from(err: agent_workstation::Error) -> Self {
+        let code = match &err {
+            agent_workstation::Error::StaleRef(_) => "STALE_REF",
+            agent_workstation::Error::NotFound(_) => "NOT_FOUND",
+            agent_workstation::Error::InvalidInput(_) => "INVALID_INPUT",
+            agent_workstation::Error::Timeout(_) => "TIMEOUT",
+            agent_workstation::Error::Script(_) => "SCRIPT_ERROR",
+            agent_workstation::Error::Unsupported(_) => "UNSUPPORTED",
+            agent_workstation::Error::Process(_)
+            | agent_workstation::Error::Profile(_)
+            | agent_workstation::Error::Closed => "BROWSER_PROCESS_ERROR",
+            _ => "PROTOCOL_ERROR",
+        };
+        Self {
+            code,
+            message: err.to_string(),
+        }
+    }
+}
+
+/// Live Chromium child process + connected CDP controller.
+pub struct BrowserInstance {
+    pub child: Child,
+    pub ws_endpoint: String,
+    pub web: Web,
+    pub persistent_profile: bool,
+    _ephemeral_dir: Option<tempfile::TempDir>,
+}
+
+/// Exclusive lease over a live Chromium CDP controller.
+pub struct LiveWebGuard<'a> {
+    guard: MutexGuard<'a, Option<BrowserInstance>>,
+}
+
+impl LiveWebGuard<'_> {
+    /// Borrow the connected `agent_workstation::browser::Web` CDP client mutably.
+    pub fn web(&mut self) -> &mut Web {
+        &mut self
+            .guard
+            .as_mut()
+            .expect("LiveWebGuard always holds a live BrowserInstance")
+            .web
+    }
+}
+
+/// Thread-safe lazily-initialized Chromium session handle.
+#[derive(Clone)]
+pub struct BrowserSession {
+    config: Arc<BrowserServerConfig>,
+    inner: Arc<Mutex<Option<BrowserInstance>>>,
+}
+
+impl BrowserSession {
+    /// Create a new browser session manager (Chromium is started lazily on first tool call).
+    pub fn new(config: BrowserServerConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Borrow the underlying server configuration.
+    pub fn config(&self) -> &BrowserServerConfig {
+        &self.config
+    }
+
+    /// Acquire exclusive access to the live `Web` CDP client, launching Chromium
+    /// lazily if not yet running (or if the previous process exited).
+    pub async fn acquire(&self) -> Result<LiveWebGuard<'_>, BrowserError> {
+        let mut guard = self.inner.lock().await;
+        let alive = guard
+            .as_mut()
+            .is_some_and(|inst| matches!(inst.child.try_wait(), Ok(None)));
+        if !alive {
+            if let Some(mut dead) = guard.take() {
+                let _ = dead.child.kill().await;
+            }
+            let launched = launch_instance(&self.config).await?;
+            *guard = Some(launched);
+        }
+        Ok(LiveWebGuard { guard })
+    }
+
+    /// Gracefully stop the running Chromium instance, flushing profile data to disk.
+    ///
+    /// Returns `(was_running, profile_preserved)`.
+    pub async fn close(&self) -> (bool, bool) {
+        let persistent_configured = self.config.profile_dir.is_some();
+        let taken = {
+            let mut guard = self.inner.lock().await;
+            guard.take()
+        };
+        let Some(mut inst) = taken else {
+            return (false, persistent_configured);
+        };
+        shutdown_instance(&mut inst).await;
+        (true, inst.persistent_profile)
+    }
+}
+
+/// Resolve an optional explicit `target_id` against live tabs, failing closed
+/// with `STALE_TARGET` if the requested tab does not exist.
+pub async fn select_explicit_target(
+    web: &mut Web,
+    target_id: Option<&str>,
+) -> Result<Option<String>, BrowserError> {
+    let Some(raw) = target_id else {
+        return Ok(None);
+    };
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(BrowserError::invalid_input(
+            "browser `target_id` cannot be empty",
+        ));
+    }
+    let tabs = web.tabs().await?;
+    let Some(tab) = tabs.iter().find(|t| t.id == id) else {
+        let live = if tabs.is_empty() {
+            "none".to_string()
+        } else {
+            tabs.iter()
+                .take(8)
+                .map(|t| {
+                    let url = if t.url.is_empty() {
+                        "about:blank"
+                    } else {
+                        t.url.as_str()
+                    };
+                    format!("{} ({url})", t.id)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(BrowserError::stale_target(format!(
+            "browser target `{id}` does not exist (live targets: {live})"
+        )));
+    };
+    if !tab.active {
+        web.select_tab(&tab.id).await?;
+    }
+    Ok(Some(tab.id.clone()))
+}
+
+/// Build Chromium launch flags for standalone headless (or optional headful) operation.
+pub fn build_launch_args(
+    binary: &Path,
+    user_data_dir: &Path,
+    config: &BrowserServerConfig,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if !config.headful && !is_headless_shell_binary(binary) {
+        args.push("--headless=new".to_string());
+    }
+    args.push(format!("--user-data-dir={}", user_data_dir.display()));
+    args.push("--remote-debugging-port=0".to_string());
+    args.push("--remote-debugging-address=127.0.0.1".to_string());
+    args.push("--no-sandbox".to_string());
+    args.push("--disable-dev-shm-usage".to_string());
+    if !config.headful {
+        args.push("--disable-gpu".to_string());
+    }
+    args.push("--hide-crash-restore-bubble".to_string());
+    args.push("--no-first-run".to_string());
+    args.push("--no-default-browser-check".to_string());
+    args.push("--password-store=basic".to_string());
+    args.push("--disable-blink-features=AutomationControlled".to_string());
+    args.push(format!(
+        "--window-size={},{}",
+        config.viewport_width.max(320),
+        config.viewport_height.max(240)
+    ));
+    if let Some(proxy) = config
+        .proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        args.push(format!("--proxy-server={proxy}"));
+    }
+    args.extend(config.parsed_extra_args());
+    args.push("about:blank".to_string());
+    args
+}
+
+/// Parse Chromium's `<user-data-dir>/DevToolsActivePort` into a `ws://127.0.0.1:<port><path>` URL.
+pub fn parse_devtools_active_port(contents: &str) -> Option<(u16, String)> {
+    let mut lines = contents.lines();
+    let port: u16 = lines.next()?.trim().parse().ok()?;
+    let path = lines.next()?.trim();
+    if port == 0 || !path.starts_with("/devtools/browser/") {
+        return None;
+    }
+    Some((port, format!("ws://127.0.0.1:{port}{path}")))
+}
+
+/// Parse a `DevTools listening on ws://127.0.0.1:<port>/devtools/browser/...` line from Chromium logs.
+pub fn parse_devtools_stderr_url(log_text: &str) -> Option<(u16, String)> {
+    for line in log_text.lines() {
+        let Some((_, rest)) = line.split_once("DevTools listening on ") else {
+            continue;
+        };
+        let candidate = rest.trim();
+        let Ok(parsed) = url::Url::parse(candidate) else {
+            continue;
+        };
+        if matches!(parsed.scheme(), "ws" | "wss")
+            && let Some(port) = parsed.port()
+            && parsed.path().starts_with("/devtools/browser/")
+        {
+            return Some((port, candidate.to_string()));
+        }
+    }
+    None
+}
+
+async fn launch_instance(config: &BrowserServerConfig) -> Result<BrowserInstance, BrowserError> {
+    let binary = discover_chromium(config.chromium_bin.as_deref())
+        .map_err(BrowserError::browser_not_found)?;
+
+    let (user_data_dir, persistent_profile, ephemeral_dir): (
+        PathBuf,
+        bool,
+        Option<tempfile::TempDir>,
+    ) = match &config.profile_dir {
+        Some(dir) => (dir.join("user-data"), true, None),
+        None => {
+            let tmp = tempfile::Builder::new()
+                .prefix("anyagents-mcp-browser-")
+                .tempdir()
+                .map_err(|e| {
+                    BrowserError::new(
+                        "BROWSER_PROCESS_ERROR",
+                        format!("failed creating ephemeral browser profile directory: {e}"),
+                    )
+                })?;
+            let ud = tmp.path().join("user-data");
+            (ud, false, Some(tmp))
+        }
+    };
+
+    std::fs::create_dir_all(&user_data_dir).map_err(|e| {
+        BrowserError::new(
+            "BROWSER_PROCESS_ERROR",
+            format!(
+                "failed creating profile directory `{}`: {e}",
+                user_data_dir.display()
+            ),
+        )
+    })?;
+
+    #[cfg(target_os = "linux")]
+    agent_workstation::profile::clear_stale_singleton(&user_data_dir)?;
+
+    let port_file = user_data_dir.join("DevToolsActivePort");
+    if let Err(err) = std::fs::remove_file(&port_file)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(BrowserError::new(
+            "BROWSER_PROCESS_ERROR",
+            format!("failed clearing stale DevToolsActivePort: {err}"),
+        ));
+    }
+
+    let log_path = user_data_dir.join("devtools.log");
+    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+        BrowserError::new(
+            "BROWSER_PROCESS_ERROR",
+            format!("failed creating Chromium log `{}`: {e}", log_path.display()),
+        )
+    })?;
+    let log_stderr = log_file.try_clone().map_err(|e| {
+        BrowserError::new(
+            "BROWSER_PROCESS_ERROR",
+            format!("failed cloning Chromium log handle: {e}"),
+        )
+    })?;
+
+    let args = build_launch_args(&binary, &user_data_dir, config);
+    let mut cmd = Command::new(&binary);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_stderr))
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        BrowserError::new(
+            "BROWSER_PROCESS_ERROR",
+            format!("failed launching `{}`: {e}", binary.display()),
+        )
+    })?;
+
+    let ws_endpoint = wait_for_devtools(&mut child, &port_file, &log_path).await?;
+    let web = match Web::connect(&ws_endpoint).await {
+        Ok(web) => web,
+        Err(err) => {
+            let _ = child.kill().await;
+            return Err(err.into());
+        }
+    };
+
+    Ok(BrowserInstance {
+        child,
+        ws_endpoint,
+        web,
+        persistent_profile,
+        _ephemeral_dir: ephemeral_dir,
+    })
+}
+
+async fn wait_for_devtools(
+    child: &mut Child,
+    port_file: &Path,
+    log_path: &Path,
+) -> Result<String, BrowserError> {
+    let deadline = Instant::now() + LAUNCH_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| {
+            BrowserError::new(
+                "BROWSER_PROCESS_ERROR",
+                format!("failed checking Chromium process status: {e}"),
+            )
+        })? {
+            let snippet = std::fs::read_to_string(log_path)
+                .ok()
+                .map(|s| s.chars().take(600).collect::<String>())
+                .unwrap_or_default();
+            return Err(BrowserError::new(
+                "BROWSER_PROCESS_ERROR",
+                format!("Chromium exited during startup ({status}): {snippet}"),
+            ));
+        }
+
+        let discovered = std::fs::read_to_string(port_file)
+            .ok()
+            .and_then(|txt| parse_devtools_active_port(&txt))
+            .or_else(|| {
+                std::fs::read_to_string(log_path)
+                    .ok()
+                    .and_then(|txt| parse_devtools_stderr_url(&txt))
+            });
+
+        if let Some((port, ws_url)) = discovered
+            && tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+        {
+            return Ok(ws_url);
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill().await;
+            return Err(BrowserError::new(
+                "TIMEOUT",
+                "timed out waiting for Chromium DevTools endpoint",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn shutdown_instance(inst: &mut BrowserInstance) {
+    if let Ok(mut cdp) = Cdp::connect(&inst.ws_endpoint).await {
+        for page in cdp.pages().await.unwrap_or_default() {
+            if let Some(id) = page["targetId"].as_str() {
+                let _ = cdp
+                    .call_in(
+                        None,
+                        "Target.closeTarget",
+                        json!({ "targetId": id }),
+                        Duration::from_secs(2),
+                    )
+                    .await;
+            }
+        }
+        if tokio::time::timeout(SHUTDOWN_GRACE, inst.child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), cdp.call("Browser.close", json!({})))
+            .await;
+    }
+    if tokio::time::timeout(SHUTDOWN_GRACE, inst.child.wait())
+        .await
+        .is_err()
+    {
+        let _ = inst.child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_args_default_to_headless_new_with_sandbox_safe_flags() {
+        let cfg = BrowserServerConfig {
+            proxy: Some("http://127.0.0.1:8888".into()),
+            extra_args: Some("--mute-audio".into()),
+            ..Default::default()
+        };
+        let args = build_launch_args(Path::new("/usr/bin/chromium"), Path::new("/tmp/ud"), &cfg);
+        assert!(args.contains(&"--headless=new".to_string()));
+        assert!(args.contains(&"--no-sandbox".to_string()));
+        assert!(args.contains(&"--disable-dev-shm-usage".to_string()));
+        assert!(args.contains(&"--remote-debugging-port=0".to_string()));
+        assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
+        assert!(args.contains(&"--user-data-dir=/tmp/ud".to_string()));
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:8888".to_string()));
+        assert!(args.contains(&"--mute-audio".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("about:blank"));
+    }
+
+    #[test]
+    fn launch_args_omit_headless_flag_for_headful_or_headless_shell() {
+        let headful = BrowserServerConfig {
+            headful: true,
+            ..Default::default()
+        };
+        let args = build_launch_args(
+            Path::new("/usr/bin/chromium"),
+            Path::new("/tmp/ud"),
+            &headful,
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--headless")));
+        assert!(!args.contains(&"--disable-gpu".to_string()));
+
+        let headless_shell_args = build_launch_args(
+            Path::new("/opt/playwright/chromium_headless_shell-1180/chrome-linux/headless_shell"),
+            Path::new("/tmp/ud"),
+            &BrowserServerConfig::default(),
+        );
+        assert!(
+            !headless_shell_args
+                .iter()
+                .any(|a| a.starts_with("--headless"))
+        );
+    }
+
+    #[test]
+    fn parses_devtools_active_port_and_stderr_lines() {
+        let active = "42319\n/devtools/browser/abc-123\n";
+        assert_eq!(
+            parse_devtools_active_port(active),
+            Some((
+                42319,
+                "ws://127.0.0.1:42319/devtools/browser/abc-123".into()
+            ))
+        );
+        assert_eq!(parse_devtools_active_port("0\n/devtools/browser/abc"), None);
+
+        let stderr = "some log\nDevTools listening on ws://127.0.0.1:9222/devtools/browser/xyz-9\n";
+        assert_eq!(
+            parse_devtools_stderr_url(stderr),
+            Some((9222, "ws://127.0.0.1:9222/devtools/browser/xyz-9".into()))
+        );
+    }
+}

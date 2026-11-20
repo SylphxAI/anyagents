@@ -226,11 +226,6 @@ fn flush_busy_diagnostic_and_empty_reports_remain_readable() {
         "No usage records found.",
         data,
     );
-    human(
-        &run(data, true, &["outcomes"]),
-        "No outcomes recorded.",
-        data,
-    );
     human(&run(data, true, &["agents", "list"]), "worker", data);
     let json = run(data, true, &["agents", "inspect", "worker", "--json"]);
     assert!(

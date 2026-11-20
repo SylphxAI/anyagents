@@ -12,8 +12,8 @@
 //!   MCP URL, into the agent's config directory, where the adapter reads both
 //!   before each turn. The maintenance pass rotates the token before it
 //!   expires. The long-lived local mailbox capability never leaves this host.
-//! * A remote session token only ever gets the `remote` MCP profile
-//!   ([`crate::mcp::McpProfile::resolve_http`]).
+//! * Every remote session receives the exact same universal 7-tool MCP surface
+//!   ([`crate::mcp::UNIVERSAL_MCP_TOOLS`]) as local sessions.
 //! * `public_listen` in the same table binds the public listener: its own port,
 //!   serving readiness, Telegram webhooks and MCP for remote session tokens
 //!   only. Every local credential stays on the socket and the loopback API
@@ -83,7 +83,7 @@ struct ServerTable {
     public_url: Option<String>,
     public_listen: Option<String>,
     remote_session_ttl_secs: Option<u64>,
-    github_webhook_secret: Option<String>,
+    webhook_secret: Option<String>,
 }
 
 /// The server settings remote sessions depend on.
@@ -94,7 +94,7 @@ pub struct Settings {
     /// Where the public listener binds, when it is configured.
     pub public_listen: Option<SocketAddr>,
     pub remote_session_ttl: Duration,
-    github_webhook_secret: Option<String>,
+    webhook_secret: Option<String>,
 }
 
 impl std::fmt::Debug for Settings {
@@ -104,8 +104,8 @@ impl std::fmt::Debug for Settings {
             .field("public_listen", &self.public_listen)
             .field("remote_session_ttl", &self.remote_session_ttl)
             .field(
-                "github_webhook_secret",
-                &self.github_webhook_secret.as_ref().map(|_| "[redacted]"),
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[redacted]"),
             )
             .finish()
     }
@@ -117,7 +117,7 @@ impl Default for Settings {
             public_url: None,
             public_listen: None,
             remote_session_ttl: DEFAULT_TTL,
-            github_webhook_secret: None,
+            webhook_secret: None,
         }
     }
 }
@@ -224,17 +224,17 @@ impl Settings {
             public_url,
             public_listen,
             remote_session_ttl,
-            github_webhook_secret: file.server.github_webhook_secret,
+            webhook_secret: file.server.webhook_secret,
         })
     }
 
     /// Explicit config (including empty = disabled) overrides the environment.
-    pub fn github_webhook_secret(&self) -> Option<String> {
-        self.resolve_github_webhook_secret(std::env::var("ANYAGENTS_GITHUB_WEBHOOK_SECRET").ok())
+    pub fn webhook_secret(&self) -> Option<String> {
+        self.resolve_webhook_secret(std::env::var("ANYAGENTS_WEBHOOK_SECRET").ok())
     }
 
-    fn resolve_github_webhook_secret(&self, environment: Option<String>) -> Option<String> {
-        self.github_webhook_secret
+    fn resolve_webhook_secret(&self, environment: Option<String>) -> Option<String> {
+        self.webhook_secret
             .clone()
             .or(environment)
             .filter(|secret| !secret.is_empty())
@@ -757,42 +757,39 @@ remote_session_ttl_secs = 1800
 }
 
 #[cfg(test)]
-mod github_secret_tests {
+mod webhook_secret_tests {
     use super::*;
     #[test]
     fn config_overrides_environment_and_empty_disables() {
         let settings = Settings::parse(
             "[server]
-github_webhook_secret = 'configured-secret'",
+webhook_secret = 'configured-secret'",
             Path::new("config"),
         )
         .unwrap();
         assert_eq!(
             settings
-                .resolve_github_webhook_secret(Some("environment".into()))
+                .resolve_webhook_secret(Some("environment".into()))
                 .as_deref(),
             Some("configured-secret")
         );
         assert!(!format!("{settings:?}").contains("configured-secret"));
         let disabled = Settings::parse(
             "[server]
-github_webhook_secret = ''",
+webhook_secret = ''",
             Path::new("config"),
         )
         .unwrap();
         assert_eq!(
-            disabled.resolve_github_webhook_secret(Some("environment".into())),
+            disabled.resolve_webhook_secret(Some("environment".into())),
             None
         );
         assert_eq!(
             Settings::default()
-                .resolve_github_webhook_secret(Some("environment".into()))
+                .resolve_webhook_secret(Some("environment".into()))
                 .as_deref(),
             Some("environment")
         );
-        assert_eq!(
-            Settings::default().resolve_github_webhook_secret(None),
-            None
-        );
+        assert_eq!(Settings::default().resolve_webhook_secret(None), None);
     }
 }

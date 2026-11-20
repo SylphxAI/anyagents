@@ -1,5 +1,5 @@
 //! Host files the server opens because an agent named them: a local media
-//! path to upload, a screenshot path to write.
+//! path to upload.
 //!
 //! ADR 0010 D3: what the server does on an agent's behalf never uses the
 //! server's own access. A seat agent's file is opened by that seat (the
@@ -11,12 +11,10 @@
 //! rename between check and open can move the result.
 
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
 
 use anyagents_core::{Agent, Store};
-
-use crate::auth::Principal;
 
 /// The largest local file a send uploads: Telegram's own Bot API limit.
 pub(crate) const MEDIA_UPLOAD_LIMIT: u64 = 50 * 1024 * 1024;
@@ -41,19 +39,9 @@ pub(crate) struct Beneath {
     own: Vec<PathBuf>,
     /// Read-only roots: shared channel media and recipient-private copies.
     shared: Vec<PathBuf>,
-    /// Read only, `<profile>/screenshots/<file>` only: browser screenshots.
-    profiles: Option<PathBuf>,
 }
 
 impl FileAuthority {
-    /// The authority of an authenticated caller.
-    pub(crate) fn of(store: &Store, principal: &Principal) -> Self {
-        match principal {
-            Principal::Operator => Self::Own,
-            Principal::Agent { agent_id, .. } => Self::of_agent_id(store, agent_id),
-        }
-    }
-
     /// The authority of the agent `id`.
     pub(crate) fn of_agent_id(store: &Store, id: &anyagents_core::AgentId) -> Self {
         match store.agent(id) {
@@ -95,7 +83,6 @@ impl FileAuthority {
                 data.join(anyagents_harness::media::MEDIA_DIR),
                 data.join("inbound-media").join(agent.id.as_str()),
             ],
-            profiles: Some(crate::workstation::profiles_root(data)),
         })
     }
 
@@ -103,7 +90,7 @@ impl FileAuthority {
     pub(crate) fn read(&self, path: &Path, limit: u64) -> Result<Vec<u8>, String> {
         let shown = path.display();
         let file = self
-            .open(path, false)
+            .open(path)
             .map_err(|error| format!("cannot read {shown}: {error}"))?;
         let size = file
             .metadata()
@@ -126,21 +113,9 @@ impl FileAuthority {
         Ok(bytes)
     }
 
-    /// Write `bytes` as the regular file `path`, created or truncated.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
-        let shown = path.display();
-        let mut file = self
-            .open(path, true)
-            .map_err(|error| format!("cannot write {shown}: {error}"))?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("cannot write {shown}: {error}"))
-    }
-
-    fn open(&self, path: &Path, create: bool) -> io::Result<File> {
+    fn open(&self, path: &Path) -> io::Result<File> {
         match self {
-            Self::Own => open_own(path, create),
+            Self::Own => open_own(path),
             Self::Refused(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, why.clone())),
             Self::Seat { .. } | Self::Beneath(_) if !path.is_absolute() => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -153,25 +128,18 @@ impl FileAuthority {
                         "the seat launcher is not installed, so no file is opened as the seat",
                     )
                 })?;
-                crate::seat_tree::open_as_seat(&launcher, *uid, *gid, groups, path, create)
+                crate::seat_tree::open_as_seat(&launcher, *uid, *gid, groups, path, false)
             }
-            Self::Beneath(beneath) => beneath.open(path, create),
+            Self::Beneath(beneath) => beneath.open(path),
         }
     }
 }
 
 /// The caller's own access, following links as its own open would.
-fn open_own(path: &Path, create: bool) -> io::Result<File> {
+fn open_own(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut options = std::fs::OpenOptions::new();
-    if create {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        options.write(true).create(true).truncate(true);
-    } else {
-        options.read(true);
-    }
+    options.read(true);
     let file = options
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open(path)?;
@@ -182,14 +150,9 @@ fn open_own(path: &Path, create: bool) -> io::Result<File> {
 }
 
 impl Beneath {
-    fn open(&self, path: &Path, create: bool) -> io::Result<File> {
-        let mut candidates: Vec<(&Path, bool)> =
-            self.own.iter().map(|r| (r.as_path(), false)).collect();
-        if !create {
-            candidates.extend(self.shared.iter().map(|r| (r.as_path(), false)));
-            candidates.extend(self.profiles.iter().map(|r| (r.as_path(), true)));
-        }
-        for (root, screenshots_only) in candidates {
+    fn open(&self, path: &Path) -> io::Result<File> {
+        let candidates = self.own.iter().chain(self.shared.iter());
+        for root in candidates {
             // A root is the server's own choice, so it may be named through a
             // link; the agent's part below it never leaves it.
             for root in [Some(root.to_path_buf()), std::fs::canonicalize(root).ok()]
@@ -199,11 +162,8 @@ impl Beneath {
                 let Ok(relative) = path.strip_prefix(&root) else {
                     continue;
                 };
-                if screenshots_only && !is_profile_screenshot(relative) {
-                    continue;
-                }
                 match File::open(&root) {
-                    Ok(directory) => return open_beneath(&directory, relative, create),
+                    Ok(directory) => return open_beneath(&directory, relative),
                     // Roots nest (its directory holds its work directory).
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
@@ -217,30 +177,14 @@ impl Beneath {
     }
 }
 
-/// `<profile>/screenshots/<file>`.
-fn is_profile_screenshot(relative: &Path) -> bool {
-    let parts: Vec<_> = relative.components().collect();
-    matches!(
-        parts.as_slice(),
-        [Component::Normal(_), Component::Normal(dir), Component::Normal(_)] if *dir == "screenshots"
-    )
-}
-
 /// `relative` opened beneath `directory`: no `..`, absolute link or magic
 /// link may leave it, and the final component is never a link.
-fn open_beneath(directory: &File, relative: &Path, create: bool) -> io::Result<File> {
+fn open_beneath(directory: &File, relative: &Path) -> io::Result<File> {
     if relative.as_os_str().is_empty() {
         return Err(io::Error::other("not a regular file"));
     }
-    let flags = libc::O_NOFOLLOW
-        | libc::O_NONBLOCK
-        | libc::O_NOCTTY
-        | libc::O_CLOEXEC
-        | if create {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
-        } else {
-            libc::O_RDONLY
-        };
+    let flags =
+        libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_RDONLY;
     let file = open_beneath_raw(directory, relative, flags)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));
@@ -339,51 +283,35 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    fn beneath(own: &Path, shared: &Path, profiles: &Path) -> FileAuthority {
+    fn beneath(own: &Path, shared: &Path) -> FileAuthority {
         FileAuthority::Beneath(Beneath {
             own: vec![own.to_path_buf()],
             shared: vec![shared.to_path_buf()],
-            profiles: Some(profiles.to_path_buf()),
         })
     }
 
-    /// A seatless agent reads its own files, inbound media and browser
-    /// screenshots, and nothing else the server could: not the operator
-    /// token, not through a link, not through `..`.
+    /// A seatless agent reads its own files and inbound media, and nothing else
+    /// the server could: not the operator token, not through a link, not
+    /// through `..`.
     #[test]
     fn a_seatless_agent_reads_only_beneath_its_own_directories() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let work = data.join("agents/a1/work");
         let media = data.join("media");
-        let profiles = data.join("browser-profiles");
-        for dir in [
-            &work,
-            &media,
-            &profiles.join("p/screenshots"),
-            &data.join("secrets"),
-        ] {
+        for dir in [&work, &media, &data.join("secrets")] {
             std::fs::create_dir_all(dir).unwrap();
         }
         let token = data.join("secrets/operator-token");
         std::fs::write(&token, b"operator-secret").unwrap();
         std::fs::write(work.join("photo.png"), b"png").unwrap();
         std::fs::write(media.join("in.jpg"), b"jpg").unwrap();
-        std::fs::write(profiles.join("p/screenshots/shot.png"), b"shot").unwrap();
-        std::fs::write(profiles.join("p/Cookies"), b"cookies").unwrap();
-        let files = beneath(&work, &media, &profiles);
+        let files = beneath(&work, &media);
 
         assert_eq!(files.read(&work.join("photo.png"), 100).unwrap(), b"png");
         assert_eq!(files.read(&media.join("in.jpg"), 100).unwrap(), b"jpg");
-        assert_eq!(
-            files
-                .read(&profiles.join("p/screenshots/shot.png"), 100)
-                .unwrap(),
-            b"shot"
-        );
         for refused in [
             token.clone(),
-            profiles.join("p/Cookies"),
             work.join("../../../secrets/operator-token"),
             PathBuf::from("photo.png"),
         ] {
@@ -397,12 +325,6 @@ mod tests {
         files
             .read(&work.join("secrets-link/operator-token"), 100)
             .unwrap_err();
-        // Shared media and screenshots are read, never written.
-        files.write(&media.join("out.png"), b"x").unwrap_err();
-        files.write(&work.join("out.png"), b"out").unwrap();
-        assert_eq!(std::fs::read(work.join("out.png")).unwrap(), b"out");
-        files.write(&work.join("token-link"), b"x").unwrap_err();
-        assert_eq!(std::fs::read(&token).unwrap(), b"operator-secret");
         // A FIFO is not a file, and opening one never waits.
         let fifo = work.join("fifo");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();

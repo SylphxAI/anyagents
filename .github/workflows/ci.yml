@@ -137,9 +137,6 @@ jobs:
           binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/prod-build.json")
           echo "ANYAGENTS_PROD_BIN=$binary" >> "$GITHUB_ENV"
       - name: Test
-        env:
-          # The browser jail's acceptance fails, never skips, without Landlock.
-          ANYAGENTS_REQUIRE_LANDLOCK_TEST: '1'
         run: |
           set -euo pipefail
           cargo nextest run --workspace --locked --no-fail-fast
@@ -150,22 +147,6 @@ jobs:
           cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/unit-test-build.json"
           test_binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/unit-test-build.json")
           echo "ANYAGENTS_UNIT_TEST_BIN=$test_binary" >> "$GITHUB_ENV"
-      # A real desktop session: headless Wayland (sway), the VNC server behind
-      # takeover (wayvnc) and the runner's Chrome, driven through the browser
-      # and computer tools. It also proves an existing profile opens with its
-      # cookies and local storage.
-      - name: Desktop packages
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -yq --no-install-recommends sway wayvnc fonts-dejavu-core
-      - name: Desktop session (headful)
-        env:
-          ANYAGENTS_DESKTOP_HEADFUL: '1'
-          ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
-        run: |
-          set -euo pipefail
-          "$ANYAGENTS_UNIT_TEST_BIN" workstation::headful_tests --list | grep -q ': test$'
-          "$ANYAGENTS_UNIT_TEST_BIN" workstation::headful_tests --nocapture
 
       # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.

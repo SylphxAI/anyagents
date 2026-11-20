@@ -274,9 +274,7 @@ impl Client {
     }
 
     /// The agent this capability authenticates, as the server resolved it.
-    pub(super) async fn whoami_with_harness(
-        &self,
-    ) -> Result<(AgentRef, Option<String>, Option<CodeLimits>), String> {
+    pub(super) async fn whoami_with_harness(&self) -> Result<(AgentRef, Option<String>), String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let who: serde_json::Value = self
@@ -309,11 +307,6 @@ impl Client {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let limits = who.get("code_limits").and_then(|value| {
-            serde_json::from_value::<CodeLimits>(value.clone())
-                .ok()
-                .map(|l| CodeLimits::from_parts(Some(l.default_ms), Some(l.max_ms)))
-        });
         Ok((
             AgentRef {
                 id: AgentId::parse(id).map_err(|err| err.to_string())?,
@@ -321,7 +314,6 @@ impl Client {
                 workdir,
             },
             harness,
-            limits,
         ))
     }
 
@@ -585,9 +577,6 @@ pub(super) static SERVED_HARNESS: std::sync::OnceLock<Option<String>> = std::syn
 pub(super) struct Call {
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     wait: SocketWait,
-    /// The commands of the `code` call this tool call runs inside, which
-    /// end with it.
-    children: Option<Arc<code_children::CodeChildren>>,
 }
 
 impl Call {
@@ -601,21 +590,6 @@ impl Call {
         Self {
             cancelled,
             wait: SocketWait::new(RESTART_WAIT).until(until),
-            children: None,
-        }
-    }
-
-    /// This call, serving a `code` call whose commands are `children`.
-    pub(super) fn with_children(mut self, children: Arc<code_children::CodeChildren>) -> Self {
-        self.children = Some(children);
-        self
-    }
-
-    /// What a blocking tool thread needs to stop a command this call started.
-    pub(super) fn scope(&self) -> code_children::Scope {
-        code_children::Scope {
-            children: self.children.clone(),
-            cancelled: Some(Arc::clone(&self.cancelled)),
         }
     }
 
@@ -627,7 +601,6 @@ impl Call {
         Self {
             cancelled,
             wait: SocketWait::new(budget),
-            children: None,
         }
     }
 }
@@ -731,11 +704,6 @@ pub(super) async fn as_call<F: std::future::Future>(call: Call, body: F) -> F::O
     CALL.scope(call, body).await
 }
 
-/// The current call, to carry into a task it spawns.
-pub(super) fn current_call() -> Call {
-    CALL.try_with(Call::clone)
-        .unwrap_or_else(|_| Call::new(Arc::new(|| false)))
-}
 /// How often a missing or refusing socket is tried again.
 pub(super) const RECONNECT_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1527,232 +1495,5 @@ mod client_link_tests {
             ["first", "first", "second", "third-and-longer", "at-start"]
         );
         server.abort();
-    }
-
-    #[test]
-    fn remote_sandbox_files_supports_glob_grep_and_patch() {
-        use agent_tools::{ExecOutput, WorkspaceBackend, resolve_workspace_path};
-        use std::collections::BTreeMap;
-        use std::sync::Mutex;
-
-        struct MockRemoteFs {
-            root: PathBuf,
-            files: Mutex<BTreeMap<String, Vec<u8>>>,
-        }
-
-        impl WorkspaceBackend for MockRemoteFs {
-            fn kind(&self) -> &'static str {
-                "cloud-sandbox"
-            }
-            fn base_path(&self) -> &Path {
-                self.root.as_path()
-            }
-            fn exec(
-                &self,
-                command: &str,
-                _cwd: Option<&str>,
-                _timeout_ms: Option<u64>,
-            ) -> Result<ExecOutput, String> {
-                if let Some(target) = command.strip_prefix("rm -f -- '")
-                    && let Some(clean) = target.strip_suffix('\'')
-                {
-                    let clean = clean.replace("'\"'\"'", "'");
-                    self.files.lock().unwrap().remove(&clean);
-                    return Ok(ExecOutput {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: 0,
-                    });
-                }
-                Ok(ExecOutput {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 1,
-                })
-            }
-            fn read_file_bytes(&self, path: Option<&str>) -> Result<(String, Vec<u8>), String> {
-                let resolved = resolve_workspace_path(&self.root, path, true)?;
-                let guard = self.files.lock().unwrap();
-                let bytes = guard
-                    .get(&resolved)
-                    .cloned()
-                    .ok_or_else(|| format!("ENOENT: {resolved}"))?;
-                Ok((resolved, bytes))
-            }
-            fn write_file_bytes(
-                &self,
-                path: Option<&str>,
-                content: &[u8],
-                append: bool,
-                overwrite: bool,
-            ) -> Result<(String, usize, String), String> {
-                let resolved = resolve_workspace_path(&self.root, path, true)?;
-                let mut guard = self.files.lock().unwrap();
-                let final_bytes = if append {
-                    let mut v = guard.get(&resolved).cloned().unwrap_or_default();
-                    v.extend_from_slice(content);
-                    v
-                } else {
-                    if !overwrite && guard.contains_key(&resolved) {
-                        return Err("exists".into());
-                    }
-                    content.to_vec()
-                };
-                let sha = sha256_hex(&final_bytes);
-                let len = final_bytes.len();
-                guard.insert(resolved.clone(), final_bytes);
-                Ok((resolved, len, sha))
-            }
-            fn list_dir(
-                &self,
-                path: Option<&str>,
-                include_hidden: bool,
-                max_results: usize,
-            ) -> Result<serde_json::Value, String> {
-                let resolved = resolve_workspace_path(&self.root, path, false)?;
-                let guard = self.files.lock().unwrap();
-                if guard.contains_key(&resolved) {
-                    return Err("not a directory".into());
-                }
-                let prefix = format!("{}/", resolved.trim_end_matches('/'));
-                let mut seen: BTreeMap<String, (&'static str, usize)> = BTreeMap::new();
-                for (k, v) in guard.iter() {
-                    if let Some(rest) = k.strip_prefix(&prefix)
-                        && !rest.is_empty()
-                    {
-                        if let Some((dir, _)) = rest.split_once('/') {
-                            if include_hidden || !dir.starts_with('.') {
-                                seen.insert(dir.to_string(), ("dir", 0));
-                            }
-                        } else if include_hidden || !rest.starts_with('.') {
-                            seen.insert(rest.to_string(), ("file", v.len()));
-                        }
-                    }
-                }
-                let mut entries: Vec<serde_json::Value> = seen
-                    .into_iter()
-                    .take(max_results)
-                    .map(|(name, (kind, bytes))| {
-                        serde_json::json!({
-                            "name": name,
-                            "path": format!("{prefix}{name}"),
-                            "kind": kind,
-                            "bytes": bytes,
-                        })
-                    })
-                    .collect();
-                let count = entries.len();
-                Ok(serde_json::json!({
-                    "action": "list",
-                    "path": resolved,
-                    "entries": std::mem::take(&mut entries),
-                    "count": count,
-                    "truncated": false,
-                }))
-            }
-        }
-
-        let mut initial = BTreeMap::new();
-        initial.insert("/ws/.gitignore".into(), b"ignored.rs\n".to_vec());
-        initial.insert(
-            "/ws/src/main.rs".into(),
-            b"fn main() {\n    println!(\"hello\");\n}\n".to_vec(),
-        );
-        initial.insert(
-            "/ws/src/ignored.rs".into(),
-            b"// should skip\nfn hidden_match() {}\n".to_vec(),
-        );
-        initial.insert("/ws/README.md".into(), b"# Project\n".to_vec());
-        let backend = MockRemoteFs {
-            root: PathBuf::from("/ws"),
-            files: Mutex::new(initial),
-        };
-
-        // 1. Remote `glob` skips .gitignore and matches pattern.
-        let glob_res = execute_remote_files_tool_with_media(
-            &backend,
-            FilesArgs {
-                action: Some("glob".into()),
-                pattern: Some("**/*.rs".into()),
-                ..Default::default()
-            },
-            CodeLimits::current(),
-        )
-        .unwrap()
-        .0;
-        assert_eq!(glob_res["files"], serde_json::json!(["src/main.rs"]));
-
-        // 2. Remote `grep` searches file contents + context lines.
-        let grep_res = execute_remote_files_tool_with_media(
-            &backend,
-            FilesArgs {
-                action: Some("grep".into()),
-                query: Some("hello".into()),
-                glob: Some("*.rs".into()),
-                context_lines: Some(1),
-                ..Default::default()
-            },
-            CodeLimits::current(),
-        )
-        .unwrap()
-        .0;
-        assert_eq!(grep_res["count"], 1);
-        assert_eq!(grep_res["matches"][0]["path"], "src/main.rs");
-        assert_eq!(grep_res["matches"][0]["line"], 2);
-        assert_eq!(grep_res["matches"][0]["context_before"][0], "fn main() {");
-
-        // 3. Remote `patch` supports V4A add/update/delete.
-        let v4a = concat!(
-            "*** Begin Patch\n",
-            "*** Add File: src/lib.rs\n",
-            "+pub fn greet() {}\n",
-            "*** Update File: src/main.rs\n",
-            "@@\n",
-            " fn main() {\n",
-            "-    println!(\"hello\");\n",
-            "+    println!(\"patched\");\n",
-            " }\n",
-            "*** Delete File: README.md\n",
-            "*** End Patch\n",
-        );
-        let patch_res = execute_remote_files_tool_with_media(
-            &backend,
-            FilesArgs {
-                action: Some("patch".into()),
-                patch: Some(v4a.into()),
-                ..Default::default()
-            },
-            CodeLimits::current(),
-        )
-        .unwrap()
-        .0;
-        assert_eq!(patch_res["count"], 3);
-        let main_bytes = backend.read_file_bytes(Some("src/main.rs")).unwrap().1;
-        assert!(String::from_utf8_lossy(&main_bytes).contains("patched"));
-        assert!(backend.read_file_bytes(Some("src/lib.rs")).is_ok());
-        assert!(backend.read_file_bytes(Some("README.md")).is_err());
-
-        // 4. Unified diff also works remotely.
-        let udiff = concat!(
-            "--- a/src/lib.rs\n",
-            "+++ b/src/lib.rs\n",
-            "@@ -1,1 +1,2 @@\n",
-            " pub fn greet() {}\n",
-            "+pub fn extra() {}\n",
-        );
-        let udiff_res = execute_remote_files_tool_with_media(
-            &backend,
-            FilesArgs {
-                action: Some("patch".into()),
-                patch: Some(udiff.into()),
-                ..Default::default()
-            },
-            CodeLimits::current(),
-        )
-        .unwrap()
-        .0;
-        assert_eq!(udiff_res["count"], 1);
-        let lib_bytes = backend.read_file_bytes(Some("src/lib.rs")).unwrap().1;
-        assert!(String::from_utf8_lossy(&lib_bytes).contains("extra"));
     }
 }

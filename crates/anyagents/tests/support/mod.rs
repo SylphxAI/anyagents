@@ -280,8 +280,6 @@ pub fn managed_harnesses(dir: &Path) {
         "agy",
         "muse",
         "omp",
-        "dsh",
-        "grok",
     ] {
         config.push_str(&format!(
             "[harness.{id}]\nsource = {{ kind = \"local\", version = \"0.0.0\", path = {}, sha256 = \"{digest}\" }}\nlauncher = \"bin/harness\"\nruntime = \"\"\n\n",

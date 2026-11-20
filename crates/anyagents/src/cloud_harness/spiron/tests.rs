@@ -194,7 +194,7 @@ fn attaches_exact_mcp_schema_and_refreshes_remote_capability() {
             .unwrap();
         assert_eq!(
             post.body["mcp_servers"],
-            json!([{"name":"anyagents","url":"https://callback.example/v1/webhooks/mcp?profile=remote","bearer_token":token}])
+            json!([{"name":"anyagents","url":"https://callback.example/v1/webhooks/mcp","bearer_token":token}])
         );
     }
     mock.consumed();
@@ -342,7 +342,7 @@ fn paginates_conversation_pages_and_deduplicates_outputs() {
     assert_eq!(requests[0].method, Method::POST);
     assert_eq!(
         requests[0].body["mcp_servers"][0]["url"],
-        json!("http://127.0.0.1:8787/v1/webhooks/mcp?profile=remote")
+        json!("http://127.0.0.1:8787/v1/webhooks/mcp")
     );
     assert_eq!(
         requests[1].uri,

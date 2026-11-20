@@ -473,23 +473,20 @@ fn default_remote_program(harness: &str) -> &'static str {
         "agy" => "agy",
         "muse" => "muse",
         "omp" => "omp",
-        "dsh" => "dsh",
-        "grok" => "grok",
         _ => "claude",
     }
 }
 
-/// Write the sandbox's `.mcp.json`: the server's public MCP URL under the
-/// `remote` profile and the agent's current remote session token. Returns the
-/// token written, so a caller rewrites the file only after a rotation. The
-/// agent's local mailbox capability never enters the sandbox.
+/// Write the sandbox's `.mcp.json`: the server's public MCP URL and the
+/// agent's current remote session token. Returns the token written, so a
+/// caller rewrites the file only after a rotation. The agent's local mailbox
+/// capability never enters the sandbox.
 pub fn materialize_remote_mcp_config(
     sbx: &SandboxConfig,
     config_dir: &Path,
 ) -> Result<String, String> {
     let capability = crate::remote::session_token(config_dir)?;
-    let mcp_base = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
-    let mcp_url = crate::cloud_harness::mcp_url_with_profile(&mcp_base, "remote");
+    let mcp_url = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
     let mcp_doc = json!({
         "mcpServers": {
             "anyagents": {
@@ -1975,8 +1972,7 @@ fn collect_agent_bundle_entries(
     }
 
     // 3. Remote MCP token + harness configs targeting `<state_root>` & `mcp-proxy`.
-    let mcp_base = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
-    let mcp_url = crate::cloud_harness::mcp_url_with_profile(&mcp_base, "full");
+    let mcp_url = crate::cloud_harness::resolve_public_mcp_url(config_dir)?;
     let mcp_token = crate::remote::session_token(config_dir)?;
     let token_path_in_vm = format!("{state_root}/.mcp-token");
     uploads.push((
@@ -2002,30 +1998,9 @@ fn collect_agent_bundle_entries(
     }))
     .map_err(|e| e.to_string())?;
     stdio_mcp_bytes.push(b'\n');
-    for target in [".mcp.json", ".claude.json", "mcp.json"] {
+    for target in [".mcp.json", ".claude.json", "mcp.json", "spiron-mcp.json"] {
         uploads.push((target.to_string(), stdio_mcp_bytes.clone()));
     }
-    // Durable `spiron` natively embeds `agent-tools`, `agent-workstation`, and skill loading,
-    // so mount only coordination + unified `agent-memory` to avoid duplicate tool schemas.
-    let spiron_mcp_url =
-        crate::cloud_harness::mcp_url_with_profile(&mcp_base, "coordination-memory");
-    let mut spiron_mcp_bytes = serde_json::to_vec_pretty(&json!({
-        "mcpServers": {
-            "anyagents": {
-                "command": guest_bin,
-                "args": [
-                    "mcp-proxy",
-                    "--url",
-                    spiron_mcp_url,
-                    "--token-file",
-                    token_path_in_vm,
-                ],
-            }
-        }
-    }))
-    .map_err(|e| e.to_string())?;
-    spiron_mcp_bytes.push(b'\n');
-    uploads.push(("spiron-mcp.json".to_string(), spiron_mcp_bytes));
     dirs_to_create.insert(format!("{state_root}/.gemini/config"));
     uploads.push((
         ".gemini/config/mcp_config.json".to_string(),
@@ -2036,11 +2011,6 @@ fn collect_agent_bundle_entries(
 
     let toml_cfg = build_sandbox_toml_config(&guest_bin, &mcp_url, &token_path_in_vm);
     uploads.push(("config.toml".to_string(), toml_cfg.as_bytes().to_vec()));
-    dirs_to_create.insert(format!("{state_root}/.grok"));
-    uploads.push((
-        ".grok/config.toml".to_string(),
-        toml_cfg.as_bytes().to_vec(),
-    ));
 
     let opencode_mcp_entry = json!({
         "type": "local",
@@ -2080,11 +2050,6 @@ fn collect_agent_bundle_entries(
     ));
     dirs_to_create.insert(format!("{state_root}/opencode"));
     uploads.push(("opencode/opencode.json".to_string(), opencode_json));
-
-    let dsh_patch = format!(
-        "mcpServers:\n  anyagents:\n    command: {guest_bin}\n    args:\n      - mcp-proxy\n      - --url\n      - {mcp_url}\n      - --token-file\n      - {token_path_in_vm}\n"
-    );
-    uploads.push(("dsh-mcp-patch.yml".to_string(), dsh_patch.into_bytes()));
 
     // 4. Sync agent config & upstream OAuth/subscription credential files from `config_dir`
     //    while causally excluding host-only secrets (`provider.json`, `gateway-token.txt`,
@@ -3706,7 +3671,7 @@ mod tests {
             mcp_files[0]
                 .pointer("/mcpServers/anyagents/url")
                 .and_then(Value::as_str),
-            Some("https://mcp.example.test/mcp?profile=remote")
+            Some("https://mcp.example.test/mcp")
         );
         assert_eq!(
             mcp_files[0]
@@ -4064,12 +4029,11 @@ mod tests {
         let mcp_json_raw =
             String::from_utf8(files["/home/user/agent-state/.mcp.json"].clone()).unwrap();
         assert!(mcp_json_raw.contains("mcp-proxy"));
-        assert!(mcp_json_raw.contains("profile=full"));
+        assert!(!mcp_json_raw.contains("profile="));
 
         let spiron_mcp_raw =
             String::from_utf8(files["/home/user/agent-state/spiron-mcp.json"].clone()).unwrap();
-        assert!(spiron_mcp_raw.contains("mcp-proxy"));
-        assert!(spiron_mcp_raw.contains("profile=coordination-memory"));
+        assert_eq!(spiron_mcp_raw, mcp_json_raw);
 
         assert!(files.contains_key("/home/user/agent-state/repo-spec.json"));
         // Custom provider config + key files sync and merge `mcp.anyagents` across all opencode paths.
@@ -4658,12 +4622,13 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dockerfile = std::fs::read_to_string(root.join("Dockerfile.sandbox")).unwrap();
         assert!(dockerfile.contains("-p anyagents-guest --bin anyagents-guest"));
+        assert!(dockerfile.contains("-p anyagents-mcp-browser --bin anyagents-mcp-browser"));
+        assert!(dockerfile.contains("-p anyagents-mcp-web --bin anyagents-mcp-web"));
+        assert!(dockerfile.contains("/usr/local/bin/anyagents-mcp-web"));
+        assert!(dockerfile.contains("/usr/local/bin/anyagents-mcp-browser"));
         assert!(dockerfile.contains("select(.name == \"agent-tools\")"));
         assert!(dockerfile.contains("--bin agent-code-mode"));
-        assert!(dockerfile.contains("select(.name == \"agent-workstation\")"));
-        assert!(dockerfile.contains("--bin agent-workstation"));
         assert!(dockerfile.contains("/usr/local/bin/agent-code-mode"));
-        assert!(dockerfile.contains("/usr/local/bin/agent-workstation"));
         assert!(dockerfile.contains("FROM sandbox-base AS sandbox-dev"));
         assert!(dockerfile.contains("https://sh.rustup.rs"));
         assert!(dockerfile.contains("COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun"));

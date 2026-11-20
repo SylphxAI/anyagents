@@ -1,15 +1,14 @@
 //! Long-lived sandbox guest supervisor (`anyagents-guest`).
 //!
 //! Runs inside an isolated sandbox microVM/container:
-//! - `serve`: embeds all 9 local harness adapters with streaming `stream-json`,
+//! - `serve`: embeds local harness adapters with streaming `stream-json`,
 //!   mid-turn `steer`, `cancel`, `TurnUsage`, git repo checkout, session persistence,
 //!   and periodic remote activity heartbeats (`inflight_children`, `active_turns`).
-//! - `mcp-proxy`: bridges stdio JSON-RPC to the coordinator's HTTPS `/mcp?profile=full`
+//! - `mcp-proxy`: bridges stdio JSON-RPC to the coordinator's HTTPS `/mcp`
 //!   endpoint with dynamic bearer capability token reload.
 //! - `health`: readiness & live activity probe.
 
 pub mod activity;
-mod dsh_grok;
 mod gemini;
 mod guest;
 mod mcp_proxy;

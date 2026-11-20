@@ -1,8 +1,9 @@
 //! Per-agent self-scheduled wakes (`at`, `every`) and event watches (`watch`).
 //!
 //! Every agent on any harness can schedule its own one-off wake (`at`), recurring
-//! wake (`every`), or event watch (`watch`: GitHub PR/check terminal state, Spiron
-//! promise state change pulled from the public API, or an AnyAgents agent going idle).
+//! wake (`every`), or event watch (`watch`: generic webhook/event trigger
+//! `webhook:<topic>`, an AnyAgents agent going idle, a local process exiting, or
+//! a local file changing).
 //!
 //! A due tick or a triggered watch is written to the owner's mailbox at once, like
 //! any other message. Mailbox delivery alone decides when the owner sees it: it is
@@ -11,11 +12,11 @@
 //! still undelivered, so missed recurring ticks coalesce into one. Cancelling a
 //! schedule takes effect immediately.
 //!
-//! The server's loops ([`start_loops`]) hold active schedules in memory and wake
+//! The server's loop ([`start_loops`]) holds active schedules in memory and wakes
 //! reactively on schedule mutations, kernel `inotify`/`pidfd` events for local
-//! paths and processes, [`Store`]/[`HealthBoard`] state-change feeds for
-//! `agent:idle` and turn-ownership blocks, and authenticated GitHub webhooks,
-//! keeping periodic probes strictly for disconnected or unsupported fallbacks.
+//! paths and processes, and [`Store`]/[`HealthBoard`] state-change feeds for
+//! `agent:idle` and turn-ownership blocks; authenticated webhook deliveries fire
+//! matching `webhook:<topic>` watches directly via [`fire_webhook_event`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,39 +24,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use anyagents_core::{
-    Agent, AgentId, AgentSchedule, Incoming, NewOutcome, NewSchedule, OutcomeKind, Store,
-};
+use anyagents_core::{Agent, AgentId, AgentSchedule, Incoming, NewSchedule, Store};
 use anyagents_supervisor::HealthBoard;
 
 use crate::api::ScheduleView;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WatchTarget {
-    GitHubPr {
-        owner: String,
-        repo: String,
-        number: u64,
-    },
-    GitHubCheck {
-        owner: String,
-        repo: String,
-        reference: String,
-        check_name: Option<String>,
-    },
-    SpironPromise {
-        id: String,
-        kind: String,
-    },
-    AgentIdle {
-        target: String,
-    },
-    ProcessExit {
-        pid: u32,
-    },
-    PathChanged {
-        path: String,
-    },
+    Webhook { topic: String },
+    AgentIdle { target: String },
+    ProcessExit { pid: u32 },
+    PathChanged { path: String },
 }
 
 /// Parse a duration string such as `"1m"`, `"30s"`, `"2h"`, `"1d"`, `"daily"`, `"hourly"`.
@@ -226,22 +205,27 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
     if s.is_empty() {
         return Err("`watch` cannot be empty".to_string());
     }
-    // URL form: https://github.com/<owner>/<repo>/pull/<number>
-    if let Some(rest) = s
-        .strip_prefix("https://github.com/")
-        .or_else(|| s.strip_prefix("http://github.com/"))
+
+    // Generic webhook / event trigger forms:
+    // "webhook:<topic>", "event:<topic>"
+    if let Some(topic) = s
+        .strip_prefix("webhook:")
+        .or_else(|| s.strip_prefix("event:"))
     {
-        let parts: Vec<&str> = rest.trim_matches('/').split('/').collect();
-        if parts.len() >= 4
-            && (parts[2] == "pull" || parts[2] == "pulls")
-            && let Ok(num) = parts[3].parse::<u64>()
+        let clean = topic.trim();
+        if clean.is_empty()
+            || clean.len() > 128
+            || !clean.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'*')
+            })
         {
-            return Ok(WatchTarget::GitHubPr {
-                owner: parts[0].to_string(),
-                repo: parts[1].to_string(),
-                number: num,
-            });
+            return Err(format!(
+                "invalid webhook topic `{clean}`; expected 1-128 ASCII letters, digits, or `-`, `_`, `.`, `:`, `/`, `*`"
+            ));
         }
+        return Ok(WatchTarget::Webhook {
+            topic: clean.to_string(),
+        });
     }
 
     // Agent idle forms:
@@ -271,70 +255,6 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
                 target: clean.to_string(),
             });
         }
-    }
-
-    // Spiron promise / task forms:
-    // "spiron:promise:<id>", "promise:<id>", "spiron:task:<id>", "spiron:<id>"
-    if let Some(id) = s
-        .strip_prefix("spiron:promise:")
-        .or_else(|| s.strip_prefix("promise:"))
-    {
-        let clean = id.trim();
-        if clean.is_empty() {
-            return Err("`spiron:promise:<id>` requires a promise id".to_string());
-        }
-        return Ok(WatchTarget::SpironPromise {
-            id: clean.to_string(),
-            kind: "promise".to_string(),
-        });
-    }
-    if let Some(id) = s.strip_prefix("spiron:task:") {
-        let clean = id.trim();
-        if clean.is_empty() {
-            return Err("`spiron:task:<id>` requires a task id".to_string());
-        }
-        return Ok(WatchTarget::SpironPromise {
-            id: clean.to_string(),
-            kind: "task".to_string(),
-        });
-    }
-    if let Some(id) = s.strip_prefix("spiron:") {
-        let clean = id.trim();
-        if clean.is_empty() {
-            return Err("`spiron:<id>` requires a promise or task id".to_string());
-        }
-        return Ok(WatchTarget::SpironPromise {
-            id: clean.to_string(),
-            kind: "promise".to_string(),
-        });
-    }
-
-    // GitHub check forms:
-    // "github:check:owner/repo@ref", "github:checks:owner/repo#41", "gh:check:...", "check:..."
-    if let Some(spec) = s
-        .strip_prefix("github:checks:")
-        .or_else(|| s.strip_prefix("github:check:"))
-        .or_else(|| s.strip_prefix("gh:checks:"))
-        .or_else(|| s.strip_prefix("gh:check:"))
-        .or_else(|| s.strip_prefix("checks:"))
-        .or_else(|| s.strip_prefix("check:"))
-    {
-        return parse_gh_check_coords(spec.trim());
-    }
-
-    // GitHub PR forms:
-    // "github:pr:owner/repo#41", "gh:pr:owner/repo#41", "pr:owner/repo#41", "github:owner/repo#41"
-    if let Some(spec) = s
-        .strip_prefix("github:pr:")
-        .or_else(|| s.strip_prefix("gh:pr:"))
-        .or_else(|| s.strip_prefix("pr:"))
-        .or_else(|| s.strip_prefix("github:"))
-        .or_else(|| s.strip_prefix("gh:"))
-    {
-        if spec.contains('@') {
-            return parse_gh_check_coords(spec.trim());
-        }
-        return parse_gh_pr_coords(spec.trim());
     }
 
     // Local process exit forms:
@@ -370,90 +290,12 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
     }
 
     Err(format!(
-        "unsupported watch spec `{raw}`; expected `github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name>`, `pid:<pid>`, or `file:<path>`"
-    ))
-}
-
-fn parse_gh_pr_coords(spec: &str) -> Result<WatchTarget, String> {
-    if let Some((repo_part, num_part)) = spec.split_once('#')
-        && let Some((owner, repo)) = repo_part.split_once('/')
-        && let Ok(num) = num_part.trim().parse::<u64>()
-        && !owner.trim().is_empty()
-        && !repo.trim().is_empty()
-    {
-        return Ok(WatchTarget::GitHubPr {
-            owner: owner.trim().to_string(),
-            repo: repo.trim().to_string(),
-            number: num,
-        });
-    }
-    let parts: Vec<&str> = spec.trim_matches('/').split('/').collect();
-    if parts.len() == 3
-        && let Ok(num) = parts[2].parse::<u64>()
-    {
-        return Ok(WatchTarget::GitHubPr {
-            owner: parts[0].to_string(),
-            repo: parts[1].to_string(),
-            number: num,
-        });
-    }
-    if parts.len() == 4
-        && (parts[2] == "pull" || parts[2] == "pulls")
-        && let Ok(num) = parts[3].parse::<u64>()
-    {
-        return Ok(WatchTarget::GitHubPr {
-            owner: parts[0].to_string(),
-            repo: parts[1].to_string(),
-            number: num,
-        });
-    }
-    Err(format!(
-        "invalid GitHub PR watch spec `{spec}`; expected `<owner>/<repo>#<number>`"
-    ))
-}
-
-fn parse_gh_check_coords(spec: &str) -> Result<WatchTarget, String> {
-    let (coords, check_name) = if spec.contains('@') {
-        match spec.split_once('#') {
-            Some((coords, name)) if !name.trim().is_empty() => {
-                (coords, Some(name.trim().to_string()))
-            }
-            Some(_) => return Err("GitHub check name cannot be empty".to_string()),
-            None => (spec, None),
-        }
-    } else if let Some((repo_part, rest)) = spec.split_once('#')
-        && let Some((pr_part, name)) = rest.split_once('#')
-    {
-        if name.trim().is_empty() {
-            return Err("GitHub check name cannot be empty".to_string());
-        }
-        (
-            &spec[..repo_part.len() + 1 + pr_part.len()],
-            Some(name.trim().to_string()),
-        )
-    } else {
-        (spec, None)
-    };
-    if let Some((repo_part, ref_part)) = coords.split_once('@').or_else(|| coords.split_once('#'))
-        && let Some((owner, repo)) = repo_part.split_once('/')
-        && !owner.trim().is_empty()
-        && !repo.trim().is_empty()
-        && !ref_part.trim().is_empty()
-    {
-        return Ok(WatchTarget::GitHubCheck {
-            owner: owner.trim().to_string(),
-            repo: repo.trim().to_string(),
-            reference: ref_part.trim().to_string(),
-            check_name,
-        });
-    }
-    Err(format!(
-        "invalid GitHub check watch spec `{spec}`; expected `<owner>/<repo>@<sha_or_ref>` or `<owner>/<repo>#<pr>`"
+        "unsupported watch spec `{raw}`; expected `webhook:<topic>`, `event:<topic>`, `agent:idle:<name>`, `pid:<pid>`, or `file:<path>`"
     ))
 }
 
 /// One correct call, quoted in every schedule error.
-const SCHEDULE_EXAMPLE: &str = "`{action: \"create\", watch: \"github:pr:owner/repo#12\", prompt: \"PR 12 finished; review it\"}`";
+const SCHEDULE_EXAMPLE: &str = "`{action: \"create\", watch: \"webhook:deploy-ready\", prompt: \"Deploy finished; verify it\"}`";
 
 /// What a schedule call does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -547,7 +389,7 @@ fn is_create_word(word: &str) -> bool {
 
 fn is_watch_spec(value: &str) -> bool {
     [
-        "github:", "spiron:", "agent:", "pid:", "process:", "file:", "path:",
+        "webhook:", "event:", "agent:", "pid:", "process:", "file:", "path:",
     ]
     .iter()
     .any(|scheme| value.starts_with(scheme))
@@ -572,7 +414,7 @@ mod call_shape_tests {
             (
                 "watch",
                 ScheduleTrigger {
-                    watch: Some("github:pr:o/r#1".into()),
+                    watch: Some("webhook:deploy-ready".into()),
                     ..Default::default()
                 },
             ),
@@ -636,12 +478,12 @@ mod call_shape_tests {
         let (verb, resolved) = resolve(
             Some("create"),
             ScheduleTrigger {
-                spec: Some("github:check:o/r@abc".into()),
+                spec: Some("event:ci.finished".into()),
                 ..Default::default()
             },
         );
         assert_eq!(verb, Ok(ScheduleVerb::Create));
-        assert_eq!(resolved.watch.as_deref(), Some("github:check:o/r@abc"));
+        assert_eq!(resolved.watch.as_deref(), Some("event:ci.finished"));
     }
 
     #[test]
@@ -734,7 +576,7 @@ pub fn create_agent_schedule(
     .collect();
     if set.is_empty() {
         return Err(format!(
-            "a schedule needs one trigger: `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch` (\"github:pr:owner/repo#12\", \"github:check:owner/repo@sha\", \"agent:idle:<name>\"), e.g. {SCHEDULE_EXAMPLE}"
+            "a schedule needs one trigger: `at` (\"20m\" or an ISO time), `every` (\"15m\") or `watch` (\"webhook:<topic>\", \"agent:idle:<name>\", \"pid:<pid>\", \"file:<path>\"), e.g. {SCHEDULE_EXAMPLE}"
         ));
     }
     if set.len() > 1 {
@@ -846,9 +688,7 @@ fn initial_watch_baseline(
     now: i64,
 ) -> Option<String> {
     match target {
-        WatchTarget::SpironPromise { id, kind } => {
-            Some(probe_spiron_state(id, kind).unwrap_or_else(|err| err.observation().into()))
-        }
+        WatchTarget::Webhook { .. } => Some("listening".to_string()),
         WatchTarget::AgentIdle { target } => {
             if let Ok(found) = store.agent_by_name(target) {
                 Some(initial_agent_idle_baseline(store, health, &found, now))
@@ -856,8 +696,6 @@ fn initial_watch_baseline(
                 None
             }
         }
-        WatchTarget::GitHubPr { .. } => Some("pending".to_string()),
-        WatchTarget::GitHubCheck { .. } => Some("pending".to_string()),
         WatchTarget::ProcessExit { pid } => Some(
             if probe_process_alive(*pid) {
                 "running"
@@ -1008,9 +846,8 @@ fn agent_effective_quota(
         .filter(|&ms| ms > now)
 }
 
-fn spiron_lock_busy(store: &Store, health: &HealthBoard, agent: &Agent) -> bool {
-    crate::vendor::is_spiron_harness(&agent.harness)
-        && health.get(&agent.id).is_none_or(|live| !live.process_alive)
+fn agent_lock_busy(store: &Store, health: &HealthBoard, agent: &Agent) -> bool {
+    health.get(&agent.id).is_none_or(|live| !live.process_alive)
         && store.try_lock_agent(&agent.id).is_err()
 }
 
@@ -1022,7 +859,7 @@ fn agent_errored_state(
     agent: &Agent,
     now: i64,
 ) -> Option<(String, i64)> {
-    if in_live_turn(health, &agent.id) || spiron_lock_busy(store, health, agent) {
+    if in_live_turn(health, &agent.id) || agent_lock_busy(store, health, agent) {
         return None;
     }
     if agent_effective_quota(store, health, agent, now).is_some() {
@@ -1050,10 +887,7 @@ fn agent_errored_state(
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let (_, persisted) = persisted_agent_fault(&cfg, &agent.harness, now);
     let live_entry = health.get(&agent.id);
-    let live_err = live_entry
-        .as_ref()
-        .filter(|live| !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive)
-        .and_then(|live| live.last_error.clone());
+    let live_err = live_entry.as_ref().and_then(|live| live.last_error.clone());
     if let Some(err) = live_err
         && !err.trim().is_empty()
         && !crate::host_memory::is_migration_wait(&err)
@@ -1105,8 +939,8 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, _now: i
     if in_live_turn(health, &agent.id) {
         return true;
     }
-    // Check first-party turn ownership even before health has been published.
-    if spiron_lock_busy(store, health, agent) {
+    // Check turn lock ownership even before health has been published.
+    if agent_lock_busy(store, health, agent) {
         return true;
     }
     match store.agent_turn_snapshot(&agent.id) {
@@ -1128,10 +962,6 @@ fn in_live_turn(health: &HealthBoard, agent_id: &AgentId) -> bool {
 /// Probe cadence of a local watch (file, process, agent idle): none has a change
 /// event this process can wait on.
 const LOCAL_WATCH_PROBE_MS: i64 = 1_000;
-/// Probe cadence of a Spiron watch, and recheck cadence of a triggered external
-/// watch held by its undelivered previous wake. GitHub probes follow their own
-/// adaptive per-target interval in [`github`].
-const EXTERNAL_RECHECK_MS: i64 = 3_000;
 /// Spacing before a due tick or triggered watch whose wake was not written (a
 /// held lifecycle lock, a store error) is tried again.
 const RETRY_MS: i64 = 1_000;
@@ -1181,29 +1011,16 @@ pub fn schedules_changed(data_dir: &Path) {
     }
 }
 
-/// Start the server's schedule timers: one for local timers and watches (with
-/// the turn-ownership guard), one for network-backed watches, so an in-flight
-/// external request cannot delay a local tick. Both step at once at startup,
-/// then each sleeps until its earliest due time or a schedule change.
-///
-/// Both end once `stopping` turns true (or its sender is gone): a sleep ends at
-/// once, and a step in progress stops before its next entry, so a pass of
-/// external probes cannot outlive a server stop by more than the one probe in
-/// flight, which the stopping runtime abandons.
+/// Start the server's schedule timer loop (local timers, watches, and the
+/// turn-ownership guard). Steps at once at startup, then sleeps until its
+/// earliest due time, a schedule change, or a kernel/store/health wakeup.
 pub fn start_loops(
     store: Arc<Store>,
     health: HealthBoard,
     stopping: tokio::sync::watch::Receiver<bool>,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) -> tokio::task::JoinHandle<()> {
     let feed = change_feed(store.data_dir());
-    let local = spawn_local_timer(
-        Arc::clone(&store),
-        health.clone(),
-        feed.subscribe(),
-        stopping.clone(),
-    );
-    let external = spawn_external_timer(store, health, feed.subscribe(), stopping);
-    (local, external)
+    spawn_local_timer(store, health, feed.subscribe(), stopping)
 }
 
 fn spawn_local_timer(
@@ -1307,54 +1124,12 @@ fn spawn_local_timer(
     })
 }
 
-fn spawn_external_timer(
-    store: Arc<Store>,
-    health: HealthBoard,
-    mut changes: tokio::sync::watch::Receiver<u64>,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    let timer = Timer::external();
-    let stop = Arc::clone(&timer.stop);
-    let timer = Arc::new(Mutex::new(timer));
-    tokio::spawn(async move {
-        loop {
-            let generation = *changes.borrow_and_update();
-            let (st, hb, tm) = (Arc::clone(&store), health.clone(), Arc::clone(&timer));
-            let step = tokio::task::spawn_blocking(move || {
-                let mut timer = tm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                timer
-                    .step(&st, &hb, generation, anyagents_core::now_ms())
-                    .deadline
-            });
-            let deadline = tokio::select! {
-                biased;
-                _ = stopping.wait_for(|stop| *stop) => break,
-                step = step => step.unwrap_or_else(|err| {
-                    eprintln!("Schedule pass failed: {err}");
-                    anyagents_core::now_ms().saturating_add(RETRY_MS)
-                }),
-            };
-            let wait = deadline
-                .saturating_sub(anyagents_core::now_ms())
-                .clamp(0, SAFETY_NET_MS);
-            tokio::select! {
-                biased;
-                _ = stopping.wait_for(|stop| *stop) => break,
-                () = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
-                Ok(()) = changes.changed() => {}
-            }
-        }
-        stop.store(true, Ordering::SeqCst);
-    })
-}
-
-/// One of the server's schedule timers. A step does work only when an entry is
-/// due, the guard is due, or an event/schedule feed woke it.
+/// The server's schedule timer. A step does work only when an entry is due,
+/// the guard is due, or an event/schedule feed woke it.
 struct Timer {
     plan: Plan,
-    /// The local timer also runs the turn-ownership guard.
+    /// The timer also runs the turn-ownership guard.
     guard: Option<TurnGuard>,
-    restored: bool,
     deadline: i64,
     /// Set when the server stops: a step in progress evaluates no further entry.
     stop: Arc<AtomicBool>,
@@ -1363,9 +1138,8 @@ struct Timer {
 impl Timer {
     fn local() -> Self {
         Self {
-            plan: Plan::new(false, false),
+            plan: Plan::new(false),
             guard: Some(TurnGuard::default()),
-            restored: false,
             deadline: i64::MIN,
             stop: Arc::default(),
         }
@@ -1373,19 +1147,8 @@ impl Timer {
 
     fn local_event_driven() -> Self {
         Self {
-            plan: Plan::new(false, true),
+            plan: Plan::new(true),
             guard: Some(TurnGuard::default()),
-            restored: false,
-            deadline: i64::MIN,
-            stop: Arc::default(),
-        }
-    }
-
-    fn external() -> Self {
-        Self {
-            plan: Plan::new(true, true),
-            guard: None,
-            restored: true,
             deadline: i64::MIN,
             stop: Arc::default(),
         }
@@ -1399,13 +1162,6 @@ impl Timer {
         generation: u64,
         now: i64,
     ) -> Option<Vec<WatchTarget>> {
-        if !self.restored {
-            self.restored = restore_legacy_pr_watches_once(store);
-            if !self.restored {
-                self.deadline = now.saturating_add(RETRY_MS);
-                return None;
-            }
-        }
         if !self.plan.stale(generation, now) {
             return None;
         }
@@ -1502,15 +1258,6 @@ impl Timer {
         if now < self.deadline && generation == self.plan.generation {
             return step;
         }
-        if !self.restored {
-            step.worked = true;
-            self.restored = restore_legacy_pr_watches_once(store);
-            if !self.restored {
-                self.deadline = now.saturating_add(RETRY_MS);
-                step.deadline = self.deadline;
-                return step;
-            }
-        }
         if self.plan.stale(generation, now) {
             step.worked = true;
             self.plan.reload(store, generation, now);
@@ -1567,40 +1314,9 @@ fn tick_local_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> u
     Timer::local().step(store, health, 0, now).fired
 }
 
-/// Evaluate network-backed watches: one full census of the store. Slow external
-/// services cannot delay a later local tick or consume a timer's due transition.
-#[cfg(test)]
-fn tick_external_watches_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    Timer::external().step(store, health, 0, now).fired
-}
-
-// Retain the complete single-pass fixture for existing cross-class contracts;
-// production never serializes the two partitions through this helper.
 #[cfg(test)]
 fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
-    tick_local_schedules_once(store, health, now) + tick_external_watches_once(store, health, now)
-}
-
-/// Reopen the PR watches an earlier release retired when checks completed, once
-/// per database in this process. No current path retires a PR watch that way, so
-/// the repair (a full scan of every schedule ever made) has nothing to do after
-/// its first run. Returns false while the store cannot run it.
-fn restore_legacy_pr_watches_once(store: &Store) -> bool {
-    static DONE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
-    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if done.contains(store.data_dir()) {
-        return true;
-    }
-    match store.restore_checks_completed_pr_watches() {
-        Ok(_) => {
-            done.insert(store.data_dir().to_path_buf());
-            true
-        }
-        Err(err) => {
-            eprintln!("Schedule recovery unavailable: {err}");
-            false
-        }
-    }
+    tick_local_schedules_once(store, health, now)
 }
 
 /// One full turn-ownership pass over the live fleet, as a census would run it.
@@ -1863,7 +1579,7 @@ fn guard_family(memo: &mut GuardMemo<'_>, family: &Family) -> GuardOutcome {
                 .collect::<Vec<_>>()
                 .join(", ");
             let body = format!(
-                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, judge its work with `agents(action: \"verdict\", name: \"<name>\", verdict: \"accepted\" | \"rework\" | \"rejected\" | \"abandoned\", reason: \"...\")`, then either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")`."
+                "[Sub-Agent Turn Ownership Guard] The following `lifecycle: task` sub-agent(s) reported to you and are idle with no active schedules (`waiting_parent`): {formatted}. The ball is in your court: for each sub-agent, review its report and either send a follow-up instruction via `send` if work remains, or close it via `agents(action: \"archive\", name: \"<name>\")`."
             );
             if send_guard_message(store, &parent.id, body, reminder_key, now) {
                 out.actions += 1;
@@ -2035,28 +1751,8 @@ struct Entry {
     idle_target: Option<AgentId>,
 }
 
-impl Entry {
-    fn is_github(&self) -> bool {
-        matches!(
-            self.watch,
-            Some(WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })
-        )
-    }
-}
-
-fn is_external_target(target: &WatchTarget) -> bool {
-    matches!(
-        target,
-        WatchTarget::GitHubPr { .. }
-            | WatchTarget::GitHubCheck { .. }
-            | WatchTarget::SpironPromise { .. }
-    )
-}
-
-/// The active schedules of one partition: local timers and watches, or
-/// network-backed watches.
+/// The active schedules managed by the schedule timer loop.
 struct Plan {
-    external: bool,
     event_driven: bool,
     local_fallback: HashSet<WatchTarget>,
     entries: Vec<Entry>,
@@ -2087,9 +1783,8 @@ impl EntryOutcome {
 }
 
 impl Plan {
-    fn new(external: bool, event_driven: bool) -> Self {
+    fn new(event_driven: bool) -> Self {
         Self {
-            external,
             event_driven,
             local_fallback: HashSet::new(),
             entries: Vec::new(),
@@ -2150,9 +1845,6 @@ impl Plan {
             } else {
                 None
             };
-            if watch.as_ref().is_some_and(is_external_target) != self.external {
-                continue;
-            }
             if sched.kind == "watch" {
                 if live.is_none() {
                     live = Some(
@@ -2176,9 +1868,8 @@ impl Plan {
             let prior = previous.get(sched.id.as_str()).copied();
             let check_at = if sched.kind == "watch" {
                 match watch.as_ref() {
-                    Some(
-                        target @ (WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. }),
-                    ) if github::next_probe_at(target) == Some(0) => i64::MIN,
+                    // Webhook watches are push-triggered via `fire_webhook_event`.
+                    Some(WatchTarget::Webhook { .. }) => i64::MAX,
                     _ => prior.map_or(i64::MIN, |p| p.check_at),
                 }
             } else {
@@ -2218,21 +1909,9 @@ impl Plan {
         now: i64,
         stop: &AtomicBool,
     ) -> PassOutcome {
-        if self.external {
-            github::begin_cycle(
-                self.entries
-                    .iter()
-                    .filter_map(|e| Some((e.sched.id.as_str(), e.watch.as_ref()?))),
-                now,
-            );
-        }
-        let (mut order, rest): (Vec<usize>, Vec<usize>) =
-            (0..self.entries.len()).partition(|&i| self.entries[i].check_at <= now);
-        // GitHub answers come from one cache per target. Once a due watch has
-        // probed its target, every other watch of it sees that answer now.
-        if order.iter().any(|&i| self.entries[i].is_github()) {
-            order.extend(rest.into_iter().filter(|&i| self.entries[i].is_github()));
-        }
+        let order: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| self.entries[i].check_at <= now)
+            .collect();
         let mut outcome = PassOutcome::default();
         for i in order {
             if stop.load(Ordering::SeqCst) {
@@ -2390,14 +2069,8 @@ fn watch_probe_at(
     now: i64,
 ) -> i64 {
     match watch {
-        // A spec never changes, so an invalid one is looked at once.
-        None => i64::MAX,
-        Some(WatchTarget::SpironPromise { .. }) => now.saturating_add(EXTERNAL_RECHECK_MS),
-        Some(target @ (WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })) => {
-            github::next_probe_at(target)
-                .unwrap_or(0)
-                .max(now.saturating_add(RETRY_MS))
-        }
+        // A spec never changes, and webhook watches are push-triggered only.
+        None | Some(WatchTarget::Webhook { .. }) => i64::MAX,
         Some(WatchTarget::AgentIdle { .. }) => {
             if event_driven {
                 i64::MAX
@@ -2432,11 +2105,7 @@ fn evaluate_watch_entry(
         now,
     );
     entry.check_at = watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now);
-    let recheck_at = now.saturating_add(if entry.watch.as_ref().is_some_and(is_external_target) {
-        EXTERNAL_RECHECK_MS
-    } else {
-        LOCAL_WATCH_PROBE_MS
-    });
+    let recheck_at = now.saturating_add(LOCAL_WATCH_PROBE_MS);
     let sched = &entry.sched;
     let changed = eval
         .baseline
@@ -2471,20 +2140,11 @@ fn evaluate_watch_entry(
         entry.check_at = entry.check_at.min(recheck_at);
         return EntryOutcome::default();
     };
-    // A pull request outcome is a fact about GitHub, not about the wake: it is
-    // stored when first seen, even while an earlier wake waits, and always
-    // before the wake that reports it is claimed.
-    let watch = entry.watch.as_ref();
-    let fact = || pull_request_outcome(store, &agent, sched, watch, &eval, now);
     if previous_pending {
         // Record the latest observation without consuming the transition or
         // moving the baseline; it is written once the pending wake is taken.
         entry.check_at = entry.check_at.min(recheck_at);
         if eval.observed.is_some() && eval.observed != sched.last_observed {
-            if !record_outcome(store, sched, fact()) {
-                entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
-                return EntryOutcome::default();
-            }
             if let Err(err) = store.update_schedule_watch_observation(
                 &sched.id,
                 sched.watch_baseline.as_deref(),
@@ -2494,10 +2154,6 @@ fn evaluate_watch_entry(
             }
             return EntryOutcome::WROTE;
         }
-        return EntryOutcome::default();
-    }
-    if !record_outcome(store, sched, fact()) {
-        entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
         return EntryOutcome::default();
     }
     let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
@@ -2525,61 +2181,6 @@ fn evaluate_watch_entry(
         entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
     }
     EntryOutcome { fired, wrote: true }
-}
-
-/// The outcome a pull request watch transition records for its owner
-/// (ADR 0008): a merge, a close, or a review failure on one head.
-fn pull_request_outcome(
-    store: &Store,
-    agent: &Agent,
-    sched: &AgentSchedule,
-    target: Option<&WatchTarget>,
-    eval: &WatchEval,
-    now: i64,
-) -> Option<NewOutcome> {
-    let Some(WatchTarget::GitHubPr {
-        owner,
-        repo,
-        number,
-    }) = target
-    else {
-        return None;
-    };
-    let kind = match eval.transition.as_deref()? {
-        "merged" => OutcomeKind::PrMerged,
-        "closed" => OutcomeKind::PrClosed,
-        "review_failed" => OutcomeKind::ReviewFailed,
-        _ => return None,
-    };
-    let (_, head) = parse_pr_baseline(eval.baseline.as_deref());
-    let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    Some(NewOutcome::pull_request(
-        agent.id.clone(),
-        owner,
-        repo,
-        *number,
-        kind,
-        head,
-        sched.created_at_ms,
-        now,
-        crate::create::bound_profile_name(&config),
-    ))
-}
-
-/// Store `fact`, if there is one. False when it could not be stored: the
-/// caller then leaves the transition unconsumed, so a later pass stores it
-/// before anything else happens.
-fn record_outcome(store: &Store, sched: &AgentSchedule, fact: Option<NewOutcome>) -> bool {
-    let Some(fact) = fact else {
-        return true;
-    };
-    match store.record_outcome(fact) {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Schedule {} outcome not recorded: {err}", sched.id);
-            false
-        }
-    }
 }
 
 fn deliver_scheduled_wake(
@@ -2726,54 +2327,11 @@ fn evaluate_watch(
         );
     };
     match target {
+        WatchTarget::Webhook { .. } => {
+            WatchEval::pending(sched.watch_baseline.clone(), sched.last_observed.clone())
+        }
         WatchTarget::AgentIdle { target } => {
             evaluate_agent_idle_watch(store, health, sched, target, idle_target, now)
-        }
-        WatchTarget::SpironPromise { id, kind } => {
-            let current = match probe_spiron_state(id, kind) {
-                Ok(current) => current,
-                Err(err) => {
-                    return WatchEval::pending(
-                        sched.watch_baseline.clone(),
-                        Some(err.observation().into()),
-                    );
-                }
-            };
-            evaluate_spiron_observation(sched.watch_baseline.as_deref(), current)
-        }
-        WatchTarget::GitHubPr {
-            owner,
-            repo,
-            number,
-        } => {
-            let Some((_, state_desc, head_sha)) =
-                probe_github_pr_state(owner, repo, *number, sched.agent_id.as_str(), now)
-            else {
-                return WatchEval::pending(sched.watch_baseline.clone(), None);
-            };
-            evaluate_pr_observation(sched, state_desc, head_sha)
-        }
-        WatchTarget::GitHubCheck {
-            owner,
-            repo,
-            reference,
-            check_name,
-        } => {
-            let Some((is_terminal, state_desc)) = probe_github_check_terminal(
-                owner,
-                repo,
-                reference,
-                check_name.as_deref(),
-                sched.agent_id.as_str(),
-                now,
-            ) else {
-                return WatchEval::pending(sched.watch_baseline.clone(), None);
-            };
-            if is_terminal {
-                WatchEval::fired(sched.watch_baseline.clone(), Some(state_desc))
-            } else {
-                WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc))
-            }
         }
         WatchTarget::ProcessExit { pid } => {
             if probe_process_alive(*pid) {
@@ -2805,80 +2363,6 @@ fn evaluate_watch(
             }
         }
     }
-}
-
-fn parse_pr_baseline(baseline: Option<&str>) -> (&str, Option<&str>) {
-    match baseline {
-        None => ("pending", None),
-        Some(raw) => match raw.split_once('@') {
-            Some((state, head)) if !head.is_empty() => (state, Some(head)),
-            _ => (raw, None),
-        },
-    }
-}
-
-fn format_pr_baseline(state: &str, head_sha: Option<&str>) -> String {
-    match head_sha {
-        Some(head) if !head.is_empty() => format!("{state}@{head}"),
-        _ => state.to_string(),
-    }
-}
-
-fn evaluate_pr_observation(
-    sched: &AgentSchedule,
-    state_desc: String,
-    head_sha: Option<String>,
-) -> WatchEval {
-    if state_desc.starts_with("probe_error:") {
-        return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
-    }
-    if state_desc == "merged" || state_desc == "closed" {
-        return WatchEval {
-            triggered: true,
-            next_state: "fired",
-            transition: Some(state_desc.clone()),
-            observed: Some(state_desc.clone()),
-            baseline: Some(state_desc),
-        };
-    }
-    let (raw_prev, prev_head) = parse_pr_baseline(sched.watch_baseline.as_deref());
-    let head_changed = match (prev_head, head_sha.as_deref()) {
-        (Some(prev), Some(curr)) => prev != curr,
-        _ => false,
-    };
-    let effective_head = head_sha.as_deref().filter(|h| !h.is_empty()).or(prev_head);
-    let next_baseline = format_pr_baseline(&state_desc, effective_head);
-    if raw_prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
-        return WatchEval {
-            triggered: true,
-            next_state: "active",
-            transition: Some("evicted".to_string()),
-            observed: Some(format!("evicted:{state_desc}")),
-            baseline: Some(next_baseline),
-        };
-    }
-    // A new head commit invalidates any prior check/review baseline for the
-    // previous SHA so checks_completed -> checks_completed still wakes.
-    let prev = if head_changed { "pending" } else { raw_prev };
-    if state_desc == "review_failed" && prev != "review_failed" {
-        return WatchEval {
-            triggered: true,
-            next_state: "active",
-            transition: Some("review_failed".to_string()),
-            observed: Some("review_failed".to_string()),
-            baseline: Some(next_baseline),
-        };
-    }
-    if state_desc == "checks_completed" && prev != "checks_completed" {
-        return WatchEval {
-            triggered: true,
-            next_state: "active",
-            transition: Some("checks_completed".to_string()),
-            observed: Some("checks_completed".to_string()),
-            baseline: Some(next_baseline),
-        };
-    }
-    WatchEval::pending(Some(next_baseline), Some(state_desc))
 }
 
 fn probe_process_alive(pid: u32) -> bool {
@@ -2925,131 +2409,94 @@ fn probe_path_fingerprint(path: &str) -> String {
     }
 }
 
-/// Failed initial probes are visible diagnostics, not provider lifecycle states.
-/// Recovery establishes the first valid baseline rather than inventing a transition.
-fn evaluate_spiron_observation(baseline: Option<&str>, current: String) -> WatchEval {
-    match baseline.filter(|base| !base.starts_with("probe_error:")) {
-        Some(base) if current != base => {
-            WatchEval::fired(Some(base.into()), Some(format!("{base}->{current}")))
-        }
-        Some(base) => WatchEval::pending(Some(base.into()), Some(current)),
-        None if is_spiron_terminal(&current) => {
-            WatchEval::fired(Some(current.clone()), Some(current))
-        }
-        None => WatchEval::pending(Some(current.clone()), Some(current)),
+/// Result of delivering a generic authenticated webhook event against active
+/// `webhook:<topic>` watches.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WebhookDispatch {
+    pub matched: usize,
+    pub fired_agents: Vec<AgentId>,
+}
+
+const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 8 * 1024;
+
+/// Fire every active `watch` schedule subscribed to `webhook:<topic>` (exact
+/// topic match or wildcard `*`).
+///
+/// Each matching watch receives one mailbox wake containing the event topic,
+/// delivery ID, and truncated JSON payload, keyed by `delivery_id` so retried
+/// deliveries remain idempotent.
+pub fn fire_webhook_event(
+    store: &Store,
+    topic: &str,
+    delivery_id: &str,
+    payload: &serde_json::Value,
+    now: i64,
+) -> Result<WebhookDispatch, anyagents_core::Error> {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Ok(WebhookDispatch::default());
     }
-}
-
-fn is_spiron_terminal(state: &str) -> bool {
-    matches!(
-        state.to_ascii_lowercase().as_str(),
-        "passed"
-            | "failed"
-            | "dropped"
-            | "completed"
-            | "complete"
-            | "done"
-            | "succeeded"
-            | "success"
-            | "error"
-            | "canceled"
-            | "cancelled"
-            | "expired"
-            | "rejected"
-    )
-}
-
-fn spiron_api_key() -> Option<String> {
-    if let Ok(k) = std::env::var("SPIRON_API_KEY")
-        && !k.trim().is_empty()
-    {
-        return Some(k.trim().to_string());
-    }
-    let key_file = std::env::var("SPIRON_KEY_FILE").ok()?;
-    std::fs::read_to_string(key_file)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum SpironProbeError {
-    NotFound,
-    Auth,
-    Http,
-    Transport,
-    Payload,
-}
-impl SpironProbeError {
-    fn observation(&self) -> &'static str {
-        match self {
-            Self::NotFound => "probe_error:not_found",
-            Self::Auth => "probe_error:auth",
-            Self::Http => "probe_error:http",
-            Self::Transport => "probe_error:transport",
-            Self::Payload => "probe_error:payload",
+    let schedules = store.list_schedules(None, true)?;
+    let mut dispatch = WebhookDispatch::default();
+    let payload_snippet = format_webhook_payload(payload);
+    for sched in schedules {
+        if sched.kind != "watch" {
+            continue;
+        }
+        let Ok(WatchTarget::Webhook { topic: watched }) = parse_watch_spec(&sched.spec) else {
+            continue;
+        };
+        if watched != topic && watched != "*" {
+            continue;
+        }
+        let agent = match schedule_owner(store, &sched) {
+            Owner::Live(agent) => agent,
+            Owner::Gone => {
+                cancel_for_gone_owner(store, &sched);
+                continue;
+            }
+            Owner::Unknown => continue,
+        };
+        dispatch.matched += 1;
+        let wake_prompt = format!(
+            "[webhook: {topic} delivery={delivery_id}]\n{}\n\nPayload:\n{payload_snippet}",
+            sched.prompt
+        );
+        let source_key = format!("schedule:{}:webhook:{topic}:{delivery_id}", sched.id);
+        let observed = format!("event:{topic}:{delivery_id}");
+        if claim_and_deliver_scheduled_wake(
+            store,
+            &agent,
+            &sched,
+            None,
+            "fired",
+            None,
+            sched.watch_baseline.as_deref(),
+            Some(&observed),
+            &wake_prompt,
+            &source_key,
+            now,
+        ) && !dispatch.fired_agents.contains(&agent.id)
+        {
+            dispatch.fired_agents.push(agent.id);
         }
     }
-}
-
-/// Distinguish a valid pending state from an unavailable observation.
-pub fn probe_spiron_state(id: &str, kind: &str) -> Result<String, SpironProbeError> {
-    let base = std::env::var("SPIRON_API_BASE").unwrap_or_else(|_| "https://api.spiron.ai".into());
-    probe_spiron_at(&base, spiron_api_key().as_deref(), id, kind)
-}
-
-/// One client for every Spiron probe, so repeated probes reuse its pooled
-/// keep-alive connections instead of a new TLS handshake per watch per pass.
-static SPIRON_HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(5)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
-});
-
-fn probe_spiron_at(
-    base: &str,
-    key: Option<&str>,
-    id: &str,
-    kind: &str,
-) -> Result<String, SpironProbeError> {
-    let agent = &*SPIRON_HTTP;
-    let kinds = if kind == "task" {
-        ["tasks", "promises"]
-    } else {
-        ["promises", "tasks"]
-    };
-    for resource in kinds {
-        let url = format!("{}/v1/{resource}/{id}", base.trim_end_matches('/'));
-        let mut req = agent.get(&url).header("accept", "application/json");
-        if let Some(token) = key {
-            req = req.header("authorization", &format!("Bearer {token}"));
-        }
-        let response = req.call().map_err(|_| SpironProbeError::Transport)?;
-        match response.status().as_u16() {
-            404 => continue,
-            401 | 403 => return Err(SpironProbeError::Auth),
-            200 => {}
-            _ => return Err(SpironProbeError::Http),
-        }
-        let body = response
-            .into_body()
-            .read_to_string()
-            .map_err(|_| SpironProbeError::Transport)?;
-        let val: serde_json::Value =
-            serde_json::from_str(&body).map_err(|_| SpironProbeError::Payload)?;
-        return val
-            .get("state")
-            .or_else(|| val.get("status"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|state| !state.is_empty())
-            .map(str::to_string)
-            .ok_or(SpironProbeError::Payload);
+    if dispatch.matched > 0 {
+        schedules_changed(store.data_dir());
     }
-    Err(SpironProbeError::NotFound)
+    Ok(dispatch)
+}
+
+fn format_webhook_payload(payload: &serde_json::Value) -> String {
+    let raw = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+    if raw.len() <= MAX_WEBHOOK_PAYLOAD_BYTES {
+        return raw;
+    }
+    let mut end = MAX_WEBHOOK_PAYLOAD_BYTES;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...(truncated)", &raw[..end])
 }
 
 fn evaluate_agent_idle_watch(
@@ -3076,7 +2523,7 @@ fn evaluate_agent_idle_watch(
     };
     *idle_target = Some(found.id.clone());
     let base = IdleBaseline::parse(sched.watch_baseline.as_deref());
-    if in_live_turn(health, &found.id) || spiron_lock_busy(store, health, &found) {
+    if in_live_turn(health, &found.id) || agent_lock_busy(store, health, &found) {
         let next_base = if let Some(mut b) = base {
             if !b.await_turn
                 && let Ok(snap) = store.agent_turn_snapshot(&found.id)
@@ -3147,71 +2594,7 @@ fn evaluate_agent_idle_watch(
     }
 }
 
-mod github;
 mod local;
-
-/// Apply an authenticated GitHub delivery; caller notifies schedules_changed.
-pub fn github_event(
-    event: &str,
-    payload: &serde_json::Value,
-    delivery: &str,
-    now: i64,
-) -> Result<bool, String> {
-    github::event(event, payload, delivery, now)
-}
-
-fn probe_github_pr_state(
-    owner: &str,
-    repo: &str,
-    number: u64,
-    agent_id: &str,
-    now_ms: i64,
-) -> Option<(bool, String, Option<String>)> {
-    github::probe_pr(owner, repo, &number.to_string(), agent_id, now_ms)
-}
-
-fn probe_github_pr_terminal(
-    owner: &str,
-    repo: &str,
-    number: u64,
-    agent_id: &str,
-    now_ms: i64,
-) -> Option<(bool, String)> {
-    github::probe(owner, repo, &number.to_string(), true, agent_id, now_ms)
-}
-
-fn check_item_is_terminal(item: &serde_json::Value) -> bool {
-    if let Some(status) = item.get("status").and_then(serde_json::Value::as_str) {
-        return status.eq_ignore_ascii_case("COMPLETED");
-    }
-    if let Some(state) = item.get("state").and_then(serde_json::Value::as_str) {
-        return matches!(
-            state.to_ascii_uppercase().as_str(),
-            "SUCCESS" | "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "SKIPPED" | "NEUTRAL"
-        );
-    }
-    false
-}
-
-fn probe_github_check_terminal(
-    owner: &str,
-    repo: &str,
-    reference: &str,
-    check_name: Option<&str>,
-    agent_id: &str,
-    now_ms: i64,
-) -> Option<(bool, String)> {
-    if let Some(name) = check_name {
-        return github::probe_selected(owner, repo, reference, name, agent_id, now_ms);
-    }
-    let clean_ref = reference.strip_prefix('#').unwrap_or(reference);
-    if clean_ref.chars().all(|c| c.is_ascii_digit())
-        && let Ok(pr_num) = clean_ref.parse::<u64>()
-    {
-        return probe_github_pr_terminal(owner, repo, pr_num, agent_id, now_ms);
-    }
-    github::probe(owner, repo, clean_ref, false, agent_id, now_ms)
-}
 
 #[cfg(test)]
 mod tests {
@@ -3252,20 +2635,26 @@ mod tests {
         assert_eq!(parse_duration_ms("daily").unwrap(), 86_400_000);
 
         assert_eq!(
-            parse_watch_spec("github:pr:AnotherOrg/anyagents#41").unwrap(),
-            WatchTarget::GitHubPr {
-                owner: "AnotherOrg".to_string(),
-                repo: "anyagents".to_string(),
-                number: 41,
+            parse_watch_spec("webhook:deploy/prod").unwrap(),
+            WatchTarget::Webhook {
+                topic: "deploy/prod".to_string(),
             }
         );
         assert_eq!(
-            parse_watch_spec("spiron:promise:prm_12345").unwrap(),
-            WatchTarget::SpironPromise {
-                id: "prm_12345".to_string(),
-                kind: "promise".to_string(),
+            parse_watch_spec("event:build.done").unwrap(),
+            WatchTarget::Webhook {
+                topic: "build.done".to_string(),
             }
         );
+        assert_eq!(
+            parse_watch_spec("webhook:*").unwrap(),
+            WatchTarget::Webhook {
+                topic: "*".to_string(),
+            }
+        );
+        assert!(parse_watch_spec("github:pr:AnotherOrg/anyagents#41").is_err());
+        assert!(parse_watch_spec("spiron:promise:prm_12345").is_err());
+        assert!(parse_watch_spec("webhook:").is_err());
         assert_eq!(
             parse_watch_spec("agent:idle:worker-1").unwrap(),
             WatchTarget::AgentIdle {
@@ -3282,116 +2671,6 @@ mod tests {
                 path: "/tmp/out.json".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn first_tick_admits_local_watches_and_timers_before_older_external_probes() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::Arc;
-        let _env = crate::server::tests::env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        let health = HealthBoard::default();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let external_owner = store
-            .create_agent(NewAgent::new("external", "codex"))
-            .unwrap();
-        store
-            .set_agent_running(&external_owner.id, "/work")
-            .unwrap();
-        let external = store
-            .create_schedule(NewSchedule {
-                agent_id: external_owner.id,
-                kind: "watch".into(),
-                spec: "github:pr:example-org/project#1".into(),
-                prompt: "external".into(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("pending".into()),
-            })
-            .unwrap();
-        // Make the external watch strictly older, independent of clock resolution.
-        rusqlite::Connection::open(dir.path().join("state.db"))
-            .unwrap()
-            .execute(
-                "UPDATE agent_schedules SET created_at_ms=1 WHERE id=?1",
-                [external.id.as_str()],
-            )
-            .unwrap();
-        let target = store
-            .create_agent(NewAgent::new("idle-target", "codex"))
-            .unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        assert!(child.wait().unwrap().success());
-        let path = dir.path().join("ready");
-        std::fs::write(&path, "ready").unwrap();
-        let now = anyagents_core::now_ms();
-        let mut owners = Vec::new();
-        for (label, kind, spec) in [
-            ("file", "watch", format!("file:{}", path.display())),
-            ("process", "watch", format!("pid:{pid}")),
-            ("idle", "watch", format!("agent:idle:{}", target.name)),
-            ("timer", "at", "due".into()),
-            ("interval", "every", "1s".into()),
-        ] {
-            let owner = store.create_agent(NewAgent::new(label, "codex")).unwrap();
-            store.set_agent_running(&owner.id, "/work").unwrap();
-            store
-                .create_schedule(NewSchedule {
-                    agent_id: owner.id.clone(),
-                    kind: kind.into(),
-                    spec,
-                    prompt: label.into(),
-                    interval_ms: (kind == "every").then_some(1000),
-                    next_fire_at_ms: (kind != "watch").then_some(now - 1),
-                    watch_baseline: (label == "file").then(|| "missing".into()),
-                })
-                .unwrap();
-            owners.push(owner.id);
-        }
-        assert_eq!(store.list_schedules(None, true).unwrap()[0].id, external.id);
-        let observing_store = Arc::clone(&store);
-        let observed_owners = owners.clone();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            // This is the start of an actual external HTTP probe, before it
-            // can finish or release the scheduler. Local admission must be done.
-            let counts: Vec<_> = observed_owners
-                .iter()
-                .map(|id| observing_store.inbox(id, None).unwrap().len())
-                .collect();
-            stream
-                .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .unwrap();
-            counts
-        });
-        // SAFETY: serialized with all other process-wide GitHub API overrides.
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
-        }
-        let fired = tick_schedules_once(&store, &health, now);
-        unsafe {
-            std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
-        }
-        let counts_at_external_start = server.join().unwrap();
-        assert_eq!(fired, 5);
-        assert_eq!(counts_at_external_start, vec![1; 5]);
-        for owner in owners {
-            assert_eq!(store.inbox(&owner, None).unwrap().len(), 1);
-        }
     }
 
     #[test]
@@ -3528,19 +2807,6 @@ mod tests {
     }
 
     #[test]
-    fn github_check_selectors_preserve_existing_syntax() {
-        assert!(
-            matches!(parse_gh_check_coords("owner/repo@main#build linux").unwrap(), WatchTarget::GitHubCheck { reference, check_name: Some(name), .. } if reference == "main" && name == "build linux")
-        );
-        assert!(
-            matches!(parse_gh_check_coords("owner/repo#452").unwrap(), WatchTarget::GitHubCheck { reference, check_name: None, .. } if reference == "452")
-        );
-        for invalid in ["owner/repo@main#", "owner/repo@#build", "owner/repo@main# "] {
-            assert!(parse_gh_check_coords(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    #[test]
     fn overdue_at_enters_mailbox_while_owner_busy_or_paused() {
         for reason in ["busy", "paused"] {
             let dir = tempfile::tempdir().unwrap();
@@ -3594,7 +2860,15 @@ mod tests {
 
     #[test]
     fn local_schedule_watch_fires_with_delivery_loop_lock_held() {
-        for harness in ["agy", "claude-code", "codex", "opencode", "muse", "omp"] {
+        for harness in [
+            "agy",
+            "claude-code",
+            "codex",
+            "opencode",
+            "spiron",
+            "muse",
+            "omp",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path().join("state.db")).unwrap();
             let health = HealthBoard::default();
@@ -3651,27 +2925,19 @@ mod tests {
     }
 
     #[test]
-    fn spiron_schedule_owner_is_busy_while_turn_lock_is_held() {
+    fn schedule_owner_is_busy_while_turn_lock_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
-        let mut owner = store
-            .create_agent(NewAgent::new("owner", "spiron"))
-            .unwrap();
+        let mut owner = store.create_agent(NewAgent::new("owner", "codex")).unwrap();
         let now = anyagents_core::now_ms();
-        for selector in [
-            "spiron",
-            "sylphx",
-            "sylphx-agent",
-            "sylphx_agent",
-            "sylphx/default",
-        ] {
-            owner.harness = selector.into();
-            assert!(!is_agent_busy(&store, &health, &owner, now));
+        for harness in ["agy", "claude-code", "codex", "opencode", "spiron"] {
+            owner.harness = harness.into();
+            assert!(!is_agent_busy(&store, &health, &owner, now), "{harness}");
             let lock = store.try_lock_agent(&owner.id).unwrap();
-            assert!(is_agent_busy(&store, &health, &owner, now));
+            assert!(is_agent_busy(&store, &health, &owner, now), "{harness}");
             drop(lock);
-            assert!(!is_agent_busy(&store, &health, &owner, now));
+            assert!(!is_agent_busy(&store, &health, &owner, now), "{harness}");
         }
     }
 
@@ -3966,673 +3232,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_queue_eviction_and_rate_errors_keep_existing_wake_semantics() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let owner = store
-            .create_agent(NewAgent::new("legacy-pr-watch", "codex"))
-            .unwrap();
-        let mut sched = store
-            .create_schedule(NewSchedule {
-                agent_id: owner.id,
-                kind: "watch".to_string(),
-                spec: "github:pr:o/r#42".to_string(),
-                prompt: "verify".to_string(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("merge_queue:queued".to_string()),
-            })
-            .unwrap();
-        let error = evaluate_pr_observation(&sched, "probe_error:rate_limited".to_string(), None);
-        assert!(!error.triggered);
-        assert_eq!(error.baseline, sched.watch_baseline);
-        let evicted = evaluate_pr_observation(&sched, "checks_completed".to_string(), None);
-        assert!(evicted.triggered);
-        assert_eq!(evicted.transition.as_deref(), Some("evicted"));
-        assert_eq!(evicted.next_state, "active");
-        sched.watch_baseline = evicted.baseline;
-        assert!(!evaluate_pr_observation(&sched, "checks_completed".to_string(), None).triggered);
-    }
-
-    #[test]
-    fn pr_watch_head_sha_transition_rules_and_legacy_baselines() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let owner = store
-            .create_agent(NewAgent::new("pr-head-sha-watch", "codex"))
-            .unwrap();
-        let mut sched = store
-            .create_schedule(NewSchedule {
-                agent_id: owner.id,
-                kind: "watch".to_string(),
-                spec: "github:pr:o/r#42".to_string(),
-                prompt: "verify".to_string(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("pending".to_string()),
-            })
-            .unwrap();
-
-        // Initial completion on sha1 triggers and encodes sha1 in baseline.
-        let first = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha1".to_string()),
-        );
-        assert!(first.triggered);
-        assert_eq!(first.transition.as_deref(), Some("checks_completed"));
-        assert_eq!(first.observed.as_deref(), Some("checks_completed"));
-        assert_eq!(first.baseline.as_deref(), Some("checks_completed@sha1"));
-        sched.watch_baseline = first.baseline;
-
-        // Same head_sha staying checks_completed does NOT re-trigger.
-        let same_head = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha1".to_string()),
-        );
-        assert!(!same_head.triggered);
-        assert_eq!(same_head.baseline.as_deref(), Some("checks_completed@sha1"));
-
-        // New head_sha reaching checks_completed after an earlier checks_completed DOES trigger.
-        let new_head = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha2".to_string()),
-        );
-        assert!(new_head.triggered);
-        assert_eq!(new_head.transition.as_deref(), Some("checks_completed"));
-        assert_eq!(new_head.observed.as_deref(), Some("checks_completed"));
-        assert_eq!(new_head.baseline.as_deref(), Some("checks_completed@sha2"));
-        sched.watch_baseline = new_head.baseline;
-
-        // New head_sha still in progress resets baseline to checks_in_progress@sha3 without waking,
-        // then triggers when sha3 reaches checks_completed.
-        let new_head_pending = evaluate_pr_observation(
-            &sched,
-            "checks_in_progress".to_string(),
-            Some("sha3".to_string()),
-        );
-        assert!(!new_head_pending.triggered);
-        assert_eq!(
-            new_head_pending.baseline.as_deref(),
-            Some("checks_in_progress@sha3")
-        );
-        sched.watch_baseline = new_head_pending.baseline;
-        let new_head_done = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha3".to_string()),
-        );
-        assert!(new_head_done.triggered);
-        assert_eq!(
-            new_head_done.baseline.as_deref(),
-            Some("checks_completed@sha3")
-        );
-
-        // Legacy baseline without head_sha (e.g. "checks_completed") adopts the observed head_sha
-        // without spurious re-triggering, then triggers when a newer head_sha completes.
-        sched.watch_baseline = Some("checks_completed".to_string());
-        let legacy_same = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha4".to_string()),
-        );
-        assert!(!legacy_same.triggered);
-        assert_eq!(
-            legacy_same.baseline.as_deref(),
-            Some("checks_completed@sha4")
-        );
-        sched.watch_baseline = legacy_same.baseline;
-        let legacy_next = evaluate_pr_observation(
-            &sched,
-            "checks_completed".to_string(),
-            Some("sha5".to_string()),
-        );
-        assert!(legacy_next.triggered);
-        assert_eq!(
-            legacy_next.baseline.as_deref(),
-            Some("checks_completed@sha5")
-        );
-    }
-
-    #[test]
-    fn signed_github_events_wake_each_selected_schedule_without_waiting_for_rest() {
-        use axum::http::{HeaderMap, HeaderValue};
-        use serde_json::json;
-        let _env_guard = crate::server::tests::env_lock();
-        github::reset_probes_for_test();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                github::reset_probes_for_test();
-            }
-        }
-        let _reset = Reset;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let now = anyagents_core::now_ms();
-        let mut agents = Vec::new();
-        for (name, check) in [("build-a", "build"), ("build-b", "build"), ("lint", "lint")] {
-            let agent = store.create_agent(NewAgent::new(name, "codex")).unwrap();
-            store.set_agent_running(&agent.id, "/work").unwrap();
-            let watch = format!("github:check:org/repo@7#{check}");
-            create_agent_schedule(
-                &store,
-                &health,
-                &agent,
-                None,
-                None,
-                Some(&watch),
-                "report selected completion",
-            )
-            .unwrap();
-            agents.push(agent);
-        }
-        let watches = store.list_schedules(None, true).unwrap();
-        let targets: Vec<_> = watches
-            .iter()
-            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
-            .collect();
-        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
-        let build_target = parse_watch_spec("github:check:org/repo@7#build").unwrap();
-        let lint_target = parse_watch_spec("github:check:org/repo@7#lint").unwrap();
-        let receive = |name: &str, status: &str, delivery: &str, at: i64| {
-            let body = serde_json::to_vec(&json!({
-                "repository":{"full_name":"ORG/repo"},
-                "check_run":{"id":if name == "build" {1} else {2}, "name":name,
-                    "app":{"id":1}, "status":status, "conclusion":"success",
-                    "head_sha":"abc", "pull_requests":[{"number":7}]}
-            }))
-            .unwrap();
-            let signature = format!(
-                "sha256={}",
-                crate::github_webhook::hmac_sha256_hex(b"secret", &body)
-            );
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "x-hub-signature-256",
-                HeaderValue::from_str(&signature).unwrap(),
-            );
-            headers.insert("x-github-event", HeaderValue::from_static("check_run"));
-            headers.insert(
-                "x-github-delivery",
-                HeaderValue::from_str(delivery).unwrap(),
-            );
-            crate::github_webhook::receive(
-                Some("secret"),
-                &headers,
-                &body,
-                |event, payload, delivery| github_event(event, payload, delivery, at),
-            )
-            .unwrap()
-        };
-        assert!(receive("build", "in_progress", "build-start", now));
-        assert!(receive("lint", "in_progress", "lint-start", now));
-        let tick =
-            |at| github::with_completion_clock(at, || tick_schedules_once(&store, &health, at));
-        assert_eq!(tick(now), 0);
-        assert!(receive("build", "completed", "build-done", now + 1));
-        assert_eq!(github::next_probe_at(&build_target), Some(0));
-        assert_ne!(github::next_probe_at(&lint_target), Some(0));
-        assert_eq!(tick(now + 1), 2);
-        for agent in &agents[..2] {
-            let pending = store.inbox(&agent.id, None).unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].text, "report selected completion");
-            assert!(
-                store
-                    .list_schedules(Some(&agent.id), true)
-                    .unwrap()
-                    .is_empty()
-            );
-            let retired = &store.list_schedules(Some(&agent.id), false).unwrap()[0];
-            assert_eq!(retired.state, "fired");
-            assert_eq!(retired.last_observed.as_deref(), Some("checks_completed"));
-        }
-        assert!(store.inbox(&agents[2].id, None).unwrap().is_empty());
-        assert!(!receive("build", "completed", "build-done", now + 2));
-        assert!(!receive("build", "completed", "same-observation", now + 2));
-        assert_eq!(tick(now + 2), 0);
-        let lint_active = store.list_schedules(Some(&agents[2].id), true).unwrap();
-        assert_eq!(lint_active.len(), 1);
-        assert_eq!(
-            lint_active[0].last_observed.as_deref(),
-            Some("checks_in_progress")
-        );
-    }
-
-    #[test]
-    fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
-        let _env = crate::server::tests::env_lock();
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stage = Arc::new(Mutex::new(0));
-        let server_stage = Arc::clone(&stage);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let server_calls = Arc::clone(&calls);
-        let server = std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = [0u8; 2048];
-                let len = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..len]);
-                let stage = *server_stage.lock().unwrap();
-                if stage == 99 {
-                    break;
-                }
-                server_calls.fetch_add(1, Ordering::SeqCst);
-                if stage == 5 {
-                    let body = r#"{"message":"You have exceeded a secondary rate limit."}"#;
-                    write!(stream, "HTTP/1.1 403 Forbidden\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                    continue;
-                }
-                let body = if request.contains("/pulls/") {
-                    if stage == 4 {
-                        r#"{"state":"closed","merged":true,"head":{"sha":"abc"}}"#
-                    } else {
-                        r#"{"state":"open","merged":false,"head":{"sha":"abc"}}"#
-                    }
-                } else if request.contains("/check-runs") {
-                    match stage {
-                        0 => {
-                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"in_progress","conclusion":null}]}"#
-                        }
-                        2 => {
-                            r#"{"total_count":1,"check_runs":[{"id":2,"name":"review","status":"completed","conclusion":"failure"}]}"#
-                        }
-                        _ => {
-                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"completed","conclusion":"success"}]}"#
-                        }
-                    }
-                } else if request.contains("/status?") {
-                    r#"{"statuses":[]}"#
-                } else {
-                    panic!("unexpected REST request: {request}");
-                };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-            }
-        });
-        github::reset_probes_for_test();
-        // This is the only test using this process-wide override.
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("owner-pr-watch", "codex"))
-            .unwrap();
-        store.set_agent_running(&owner.id, "/work").unwrap();
-        let sched = create_agent_schedule(
-            &store,
-            &health,
-            &owner,
-            None,
-            None,
-            Some("github:pr:ExampleOrg/project#452"),
-            "verify PR 452",
-        )
-        .unwrap();
-        let now = anyagents_core::now_ms();
-        let watched = store.list_schedules(None, true).unwrap();
-        let targets: Vec<_> = watched
-            .iter()
-            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
-            .collect();
-        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
-        let barrier = Arc::new(std::sync::Barrier::new(101));
-        let handles: Vec<_> = (0..100)
-            .map(|i| {
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    // Agent identity must not fragment the single-flight cache.
-                    probe_github_check_terminal(
-                        "ExampleOrg",
-                        "project",
-                        "#452",
-                        None,
-                        &format!("agent{i}"),
-                        now,
-                    )
-                })
-            })
-            .collect();
-        barrier.wait();
-        for handle in handles {
-            assert_eq!(handle.join().unwrap().unwrap().1, "checks_in_progress");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-        // Keep the manually advanced tick and subprocess completion clocks in
-        // one time domain; production reads the wall clock after every probe.
-        let now = anyagents_core::now_ms();
-        let tick = |store: &Store, health: &HealthBoard, at| {
-            github::with_completion_clock(at, || tick_schedules_once(store, health, at))
-        };
-        assert_eq!(tick(&store, &health, now), 0);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-        for (stage_num, transition) in [
-            (1, "checks_completed"),
-            (2, "review_failed"),
-            (3, "checks_completed"),
-        ] {
-            *stage.lock().unwrap() = stage_num;
-            let at = now + i64::from(stage_num) * 900_000;
-            assert_eq!(tick(&store, &health, at), 1);
-            let inbox = store.inbox(&owner.id, None).unwrap();
-            let last = inbox.last().unwrap();
-            assert!(last.text.starts_with(&format!("[watch: github:pr:ExampleOrg/project#452 transition={transition}]\nverify PR 452")), "{}", last.text);
-            store.note_delivered(&owner.id, last.seq).unwrap();
-            store.note_turn_completed(&owner.id).unwrap();
-            assert_eq!(tick(&store, &health, at + 1_000), 0);
-            let active = store.list_schedules(Some(&owner.id), true).unwrap();
-            assert_eq!(active.len(), 1);
-        }
-        // A shared secondary-limit window records one typed error, retains
-        // the successful baseline, and rereads the terminal state on recovery.
-        *stage.lock().unwrap() = 5;
-        assert_eq!(tick(&store, &health, now + 3_600_000), 0);
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(
-            active[0].watch_baseline.as_deref(),
-            Some("checks_completed@abc")
-        );
-        assert_eq!(
-            active[0].last_observed.as_deref(),
-            Some("probe_error:rate_limited")
-        );
-        let before = calls.load(Ordering::SeqCst);
-        *stage.lock().unwrap() = 4;
-        for at in [3_600_001, 3_660_000, 3_719_999, 3_720_000, 3_721_000] {
-            assert_eq!(tick(&store, &health, now + at), 0);
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), before);
-        // Recovery is jittered across reset+60..300 seconds, not reset itself.
-        assert_eq!(tick(&store, &health, now + 4_020_000), 1);
-        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
-        let inbox = store.inbox(&owner.id, None).unwrap();
-        assert!(inbox.last().unwrap().text.contains("transition=merged]"));
-        assert!(
-            store
-                .list_schedules(Some(&owner.id), true)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store.list_schedules(Some(&owner.id), false).unwrap()[0].id,
-            sched.id
-        );
-        // The review failure and the merge are outcomes of the owner's work.
-        let outcomes = store
-            .outcome_report(
-                std::slice::from_ref(&owner.id),
-                None,
-                now + 4_060_000,
-                anyagents_core::OutcomeGroupBy::Agent,
-            )
-            .unwrap();
-        let group = &outcomes.groups[0];
-        assert_eq!(group.events.get("review_failed"), Some(&1));
-        assert_eq!(group.events.get("pr_merged"), Some(&1));
-        assert_eq!(
-            (group.succeeded, group.reworked, group.recovered),
-            (1, 1, 1)
-        );
-        *stage.lock().unwrap() = 99;
-        let _ = std::net::TcpStream::connect(addr);
-        server.join().unwrap();
-        github::reset_probes_for_test();
-        unsafe {
-            std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
-        }
-    }
-
-    #[test]
-    fn pull_request_merge_is_recorded_while_an_earlier_wake_waits() {
-        let _env = crate::server::tests::env_lock();
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = [0u8; 2048];
-                let len = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..len]);
-                if request.contains("/stop") {
-                    break;
-                }
-                assert!(request.contains("/pulls/"), "{request}");
-                let body = r#"{"state":"closed","merged":true,"head":{"sha":"abc"}}"#;
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-            }
-        });
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                github::reset_probes_for_test();
-                unsafe {
-                    std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
-                }
-            }
-        }
-        github::reset_probes_for_test();
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
-        }
-        let _guard = EnvGuard;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("owner-pending-merge", "codex"))
-            .unwrap();
-        store.set_agent_running(&owner.id, "/work").unwrap();
-        let sched = create_agent_schedule(
-            &store,
-            &health,
-            &owner,
-            None,
-            None,
-            Some("github:pr:ExampleOrg/project#454"),
-            "verify PR 454",
-        )
-        .unwrap();
-        // An earlier wake from this watch is still in the mailbox.
-        let mut earlier = Incoming::new("[watch: earlier]");
-        earlier.sender = Some(schedule_sender(&sched.id));
-        store.receive(&owner.id, earlier).unwrap();
-
-        let now = anyagents_core::now_ms();
-        let watched = store.list_schedules(None, true).unwrap();
-        let targets: Vec<_> = watched
-            .iter()
-            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
-            .collect();
-        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
-        let tick =
-            |at| github::with_completion_clock(at, || tick_schedules_once(&store, &health, at));
-        let merged = |until| {
-            store
-                .outcome_report(
-                    std::slice::from_ref(&owner.id),
-                    None,
-                    until,
-                    anyagents_core::OutcomeGroupBy::Agent,
-                )
-                .unwrap()
-                .groups
-                .first()
-                .and_then(|group| group.events.get("pr_merged").copied())
-        };
-
-        assert_eq!(tick(now), 0);
-        assert_eq!(merged(now), Some(1));
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active[0].last_observed.as_deref(), Some("merged"));
-
-        // Once the earlier wake is taken, the merge wakes the owner; the fact
-        // stays one row.
-        let pending = store.inbox(&owner.id, None).unwrap();
-        store.note_delivered(&owner.id, pending[0].seq).unwrap();
-        store.note_turn_completed(&owner.id).unwrap();
-        assert_eq!(tick(now + 60_000), 1);
-        assert!(
-            store
-                .inbox(&owner.id, None)
-                .unwrap()
-                .last()
-                .unwrap()
-                .text
-                .contains("transition=merged]")
-        );
-        assert_eq!(merged(now + 60_000), Some(1));
-
-        let _ = std::net::TcpStream::connect(addr)
-            .and_then(|mut stream| stream.write_all(b"GET /stop HTTP/1.1\r\n\r\n"));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn github_pr_watch_wakes_on_new_head_sha_checks_completed() {
-        let _env = crate::server::tests::env_lock();
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::{Arc, Mutex};
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stage = Arc::new(Mutex::new(0));
-        let server_stage = Arc::clone(&stage);
-        let server = std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = [0u8; 2048];
-                let len = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..len]);
-                let stage = *server_stage.lock().unwrap();
-                if stage == 99 {
-                    break;
-                }
-                let sha = if stage == 0 { "sha111" } else { "sha222" };
-                let body = if request.contains("/pulls/") {
-                    format!(r#"{{"state":"open","merged":false,"head":{{"sha":"{sha}"}}}}"#)
-                } else if request.contains("/check-runs") {
-                    r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"completed","conclusion":"success"}]}"#.to_string()
-                } else if request.contains("/status?") {
-                    r#"{"statuses":[]}"#.to_string()
-                } else {
-                    panic!("unexpected REST request: {request}");
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
-            }
-        });
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                github::reset_probes_for_test();
-                unsafe {
-                    std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
-                }
-            }
-        }
-        github::reset_probes_for_test();
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
-        }
-        let _guard = EnvGuard;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("owner-head-sha-pr", "codex"))
-            .unwrap();
-        store.set_agent_running(&owner.id, "/work").unwrap();
-        create_agent_schedule(
-            &store,
-            &health,
-            &owner,
-            None,
-            None,
-            Some("github:pr:ExampleOrg/project#453"),
-            "verify PR 453",
-        )
-        .unwrap();
-
-        let now = anyagents_core::now_ms();
-        let watched = store.list_schedules(None, true).unwrap();
-        let targets: Vec<_> = watched
-            .iter()
-            .map(|s| (s.id.as_str(), parse_watch_spec(&s.spec).unwrap()))
-            .collect();
-        github::begin_cycle(targets.iter().map(|(id, t)| (*id, t)), now);
-        let tick = |store: &Store, health: &HealthBoard, at| {
-            github::with_completion_clock(at, || tick_schedules_once(store, health, at))
-        };
-
-        // Initial checks_completed on sha111 wakes the agent.
-        assert_eq!(tick(&store, &health, now), 1);
-        let inbox = store.inbox(&owner.id, None).unwrap();
-        let first = inbox.last().unwrap();
-        assert!(first.text.contains("transition=checks_completed]"));
-        assert_eq!(
-            store.list_schedules(Some(&owner.id), true).unwrap()[0]
-                .watch_baseline
-                .as_deref(),
-            Some("checks_completed@sha111")
-        );
-        store.note_delivered(&owner.id, first.seq).unwrap();
-        store.note_turn_completed(&owner.id).unwrap();
-
-        // Same head_sha staying checks_completed does not re-trigger.
-        assert_eq!(tick(&store, &health, now + 60_000), 0);
-        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
-
-        // New head_sha (sha222) also finishing as checks_completed triggers a new wake.
-        *stage.lock().unwrap() = 1;
-        assert_eq!(tick(&store, &health, now + 900_000), 1);
-        let inbox = store.inbox(&owner.id, None).unwrap();
-        assert_eq!(inbox.len(), 2);
-        assert!(
-            inbox
-                .last()
-                .unwrap()
-                .text
-                .contains("transition=checks_completed]")
-        );
-        assert_eq!(
-            store.list_schedules(Some(&owner.id), true).unwrap()[0]
-                .watch_baseline
-                .as_deref(),
-            Some("checks_completed@sha222")
-        );
-
-        *stage.lock().unwrap() = 99;
-        let _ = std::net::TcpStream::connect(addr);
-        server.join().unwrap();
-    }
-
-    #[test]
     fn selected_timer_and_watch_cannot_overwrite_a_fresh_archive() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -4733,133 +3332,6 @@ Connection: close
         assert!(!is_agent_busy(&store, &health, &agent, 1));
     }
     #[test]
-    fn spiron_failed_observations_are_typed_and_no_auth_fallback() {
-        use std::io::{Read, Write};
-        for (statuses, body, expected) in [
-            (vec![200], r#"{"state":"pending"}"#, Ok("pending".into())),
-            (vec![200], r#"{"state":"complete"}"#, Ok("complete".into())),
-            (vec![401], "{}", Err(SpironProbeError::Auth)),
-            (vec![404, 404], "{}", Err(SpironProbeError::NotFound)),
-            (vec![200], "not json", Err(SpironProbeError::Payload)),
-            (vec![200], "{}", Err(SpironProbeError::Payload)),
-            (vec![503], "{}", Err(SpironProbeError::Http)),
-            (
-                vec![404, 200],
-                r#"{"status":"running"}"#,
-                Ok("running".into()),
-            ),
-        ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let body = body.to_string();
-            let task = std::thread::spawn(move || {
-                for status in statuses {
-                    let (mut socket, _) = listener.accept().unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    while !bytes.ends_with(b"\r\n\r\n") {
-                        let mut b = [0];
-                        socket.read_exact(&mut b).unwrap();
-                        bytes.push(b[0]);
-                    }
-                    write!(socket,"HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
-                }
-            });
-            assert_eq!(probe_spiron_at(&base, None, "id", "promise"), expected);
-            task.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn spiron_probes_share_one_keep_alive_connection() {
-        use std::io::{BufRead, BufReader, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        // The peer accepts exactly one connection and answers two requests on
-        // it; a probe that dialed again would find no listener and fail.
-        let peer = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            drop(listener);
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(socket.try_clone().unwrap());
-            let mut writer = socket;
-            for state in ["pending", "complete"] {
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
-                    line.clear();
-                }
-                let body = format!(r#"{{"state":"{state}"}}"#);
-                write!(
-                    writer,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        assert_eq!(
-            probe_spiron_at(&base, None, "id", "promise"),
-            Ok("pending".into())
-        );
-        assert_eq!(
-            probe_spiron_at(&base, None, "id", "promise"),
-            Ok("complete".into())
-        );
-        peer.join().unwrap();
-    }
-
-    #[test]
-    fn legacy_pr_watch_repair_runs_once_per_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("state.db");
-        let store = Store::open(&db).unwrap();
-        let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("legacy-owner", "codex"))
-            .unwrap();
-        let watch = store
-            .create_schedule(NewSchedule {
-                agent_id: owner.id.clone(),
-                kind: "watch".into(),
-                spec: "github:pr:o/r#7".into(),
-                prompt: "verify".into(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("pending".into()),
-            })
-            .unwrap();
-        let retire = |conn: &rusqlite::Connection| {
-            conn.execute(
-                "UPDATE agent_schedules SET state='fired', last_observed='checks_completed' WHERE id=?1",
-                [watch.id.as_str()],
-            )
-            .unwrap();
-        };
-        let raw = rusqlite::Connection::open(&db).unwrap();
-        retire(&raw);
-        // The first local pass reopens what an earlier release retired.
-        assert!(restore_legacy_pr_watches_once(&store));
-        let reopened = store.get_schedule(&watch.id).unwrap().unwrap();
-        assert_eq!(reopened.state, "active");
-        assert_eq!(reopened.watch_baseline.as_deref(), Some("checks_completed"));
-        // Later passes, including from a reopened handle, never rescan.
-        retire(&raw);
-        drop(store);
-        let store = Store::open(&db).unwrap();
-        for at in 0..3 {
-            tick_local_schedules_once(&store, &health, anyagents_core::now_ms() + at);
-        }
-        assert_eq!(
-            store.get_schedule(&watch.id).unwrap().unwrap().state,
-            "fired"
-        );
-    }
-
-    #[test]
     fn failed_wake_insert_rolls_back_timer_claim_and_retries_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -4896,22 +3368,6 @@ Connection: close
         assert_eq!(tick_schedules_once(&store, &health, now + 2), 0);
         assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
     }
-    #[test]
-    fn spiron_probe_recovery_is_not_a_fabricated_state_change() {
-        for baseline in [
-            None,
-            Some("probe_error:auth"),
-            Some("probe_error:not_found"),
-        ] {
-            let pending = evaluate_spiron_observation(baseline, "pending".into());
-            assert!(!pending.triggered);
-            assert_eq!(pending.baseline.as_deref(), Some("pending"));
-            assert!(evaluate_spiron_observation(baseline, "completed".into()).triggered);
-        }
-        assert!(!evaluate_spiron_observation(Some("pending"), "pending".into()).triggered);
-        assert!(evaluate_spiron_observation(Some("running"), "completed".into()).triggered);
-    }
-
     #[test]
     fn held_lifecycle_lock_defers_only_that_agent_without_blocking_other_schedules() {
         let dir = tempfile::tempdir().unwrap();
@@ -5305,7 +3761,7 @@ Connection: close
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let (_stopping, stopped) = tokio::sync::watch::channel(false);
-            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stopped);
+            let local = start_loops(Arc::clone(&store), health.clone(), stopped);
             // The startup step fires what is already due.
             let started = std::time::Instant::now();
             while store.inbox(&first.id, None).unwrap().is_empty() {
@@ -5350,58 +3806,8 @@ Connection: close
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             local.abort();
-            external.abort();
         });
         runtime.shutdown_timeout(Duration::from_secs(5));
-    }
-
-    #[test]
-    fn external_timer_sleeps_until_the_github_target_can_be_probed() {
-        let _env = crate::server::tests::env_lock();
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = closed.local_addr().unwrap();
-        drop(closed);
-        let previous = std::env::var_os("ANYAGENTS_GITHUB_API_BASE");
-        // SAFETY: serialized with all other process-wide GitHub API overrides.
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let owner = store
-            .create_agent(NewAgent::new("pr-owner", "codex"))
-            .unwrap();
-        store
-            .create_schedule(NewSchedule {
-                agent_id: owner.id.clone(),
-                kind: "watch".into(),
-                spec: "github:pr:example-org/sleepy#9".into(),
-                prompt: "pr".into(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("pending".into()),
-            })
-            .unwrap();
-        let mut timer = Timer::external();
-        let now = anyagents_core::now_ms();
-        let step = github::with_completion_clock(now, || timer.step(&store, &health, 0, now));
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ANYAGENTS_GITHUB_API_BASE", value),
-                None => std::env::remove_var("ANYAGENTS_GITHUB_API_BASE"),
-            }
-        }
-        assert!(step.worked);
-        // The unreachable API is an observation; its target is not probed again
-        // for a minute, and the external timer sleeps that long, not 3 s.
-        let saved = &store.list_schedules(Some(&owner.id), true).unwrap()[0];
-        assert_eq!(
-            saved.last_observed.as_deref(),
-            Some("probe_error:transport")
-        );
-        assert_eq!(step.deadline, now + 60_000);
-        assert!(!timer.step(&store, &health, 0, now + 3_000).worked);
     }
 
     #[test]
@@ -5618,7 +4024,7 @@ Connection: close
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stop_rx);
+            let local = start_loops(Arc::clone(&store), health.clone(), stop_rx);
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert!(store.inbox(&parent.id, None).unwrap().is_empty());
 
@@ -5645,7 +4051,6 @@ Connection: close
                 "[watch: agent:idle:causal-child transition=idle]\nslice finished"
             );
             local.abort();
-            external.abort();
         });
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
@@ -5682,7 +4087,7 @@ Connection: close
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stop_rx);
+            let local = start_loops(Arc::clone(&store), health.clone(), stop_rx);
             tokio::time::sleep(Duration::from_millis(120)).await;
 
             // A quota hold with rate-limit error text is not an errored turn.
@@ -5780,7 +4185,6 @@ Connection: close
                 "[watch: agent:idle:err-child transition=idle]\nretry done"
             );
             local.abort();
-            external.abort();
         });
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
@@ -5789,13 +4193,6 @@ Connection: close
     #[test]
     fn start_loops_wakes_kernel_path_and_pid_watches_sub_second() {
         use std::sync::Arc;
-        assert!(matches!(
-            parse_gh_check_coords("owner/repo#42#Verify").unwrap(),
-            WatchTarget::GitHubCheck { ref reference, check_name: Some(ref name), .. }
-            if reference == "42" && name == "Verify"
-        ));
-        assert!(parse_gh_check_coords("owner/repo#42#").is_err());
-
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let health = HealthBoard::default();
@@ -5820,7 +4217,7 @@ Connection: close
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stop_rx);
+            let local = start_loops(Arc::clone(&store), health.clone(), stop_rx);
             create_agent_schedule(
                 &store,
                 &health,
@@ -5856,235 +4253,84 @@ Connection: close
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             local.abort();
-            external.abort();
         });
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
     #[test]
-    fn running_external_loop_wakes_at_once_on_github_webhook_and_reconciles_new_head() {
-        use serde_json::json;
-        use std::io::{Read, Write};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        let _env = crate::server::tests::env_lock();
-        github::reset_probes_for_test();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                github::reset_probes_for_test();
-            }
-        }
-        let _reset = Reset;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let sha2_done = Arc::new(AtomicBool::new(false));
-        let sha1_calls = Arc::new(AtomicUsize::new(0));
-        let server_stop = Arc::new(AtomicBool::new(false));
-        let sha2_flag = Arc::clone(&sha2_done);
-        let sha1_counter = Arc::clone(&sha1_calls);
-        let stop_flag = Arc::clone(&server_stop);
-        let mock = std::thread::spawn(move || {
-            while !stop_flag.load(Ordering::Relaxed) {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let first = req.lines().next().unwrap_or("");
-                if first.contains("sha1") {
-                    sha1_counter.fetch_add(1, Ordering::SeqCst);
-                }
-                let done = sha2_flag.load(Ordering::SeqCst);
-                let body = if first.contains("/pulls/77") {
-                    if done {
-                        json!({"state":"open","head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}})
-                    } else {
-                        json!({"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
-                    }
-                } else if first.contains("/status") {
-                    json!({"statuses":[]})
-                } else if first.contains("sha1") {
-                    json!({"total_count":2,"check_runs":[
-                        {"id":10,"name":"fast-check","app":{"id":1},"status":"in_progress"},
-                        {"id":11,"name":"slow-suite","app":{"id":1},"status":"in_progress"}
-                    ]})
-                } else if done {
-                    json!({"total_count":1,"check_runs":[
-                        {"id":20,"name":"ci","app":{"id":1},"status":"completed","conclusion":"success","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
-                    ]})
-                } else {
-                    json!({"total_count":1,"check_runs":[
-                        {"id":19,"name":"ci","app":{"id":1},"status":"in_progress","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-                    ]})
-                };
-                let s = body.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}",
-                    s.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
-        });
-
-        let prev_base = std::env::var_os("ANYAGENTS_GITHUB_API_BASE");
-        let prev_tok = std::env::var_os("GITHUB_TOKEN");
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
-            std::env::set_var("GITHUB_TOKEN", "test-token");
-        }
-
+    fn fire_webhook_event_wakes_matching_and_wildcard_watches_idempotently() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
-        let check_owner = store
-            .create_agent(NewAgent::new("gh-check-owner", "codex"))
+        let exact_owner = store
+            .create_agent(NewAgent::new("deploy-watcher", "codex"))
             .unwrap();
-        store.set_agent_running(&check_owner.id, "/work").unwrap();
-        let pr_owner = store
-            .create_agent(NewAgent::new("gh-pr-owner", "codex"))
+        let wildcard_owner = store
+            .create_agent(NewAgent::new("all-events", "codex"))
             .unwrap();
-        store.set_agent_running(&pr_owner.id, "/work").unwrap();
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            create_agent_schedule(
-                &store,
-                &health,
-                &check_owner,
-                None,
-                None,
-                Some("github:check:example-org/example-repo@sha1#fast-check"),
-                "fast check done",
-            )
+        let other_owner = store
+            .create_agent(NewAgent::new("other-watcher", "codex"))
             .unwrap();
-            create_agent_schedule(
-                &store,
-                &health,
-                &pr_owner,
-                None,
-                None,
-                Some("github:pr:example-org/example-repo#77"),
-                "pr updated",
-            )
-            .unwrap();
-            let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-            let (local, external) = start_loops(Arc::clone(&store), health.clone(), stop_rx);
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let initial_sha1_calls = sha1_calls.load(Ordering::SeqCst);
-            assert!(initial_sha1_calls >= 1);
-            assert!(store.inbox(&check_owner.id, None).unwrap().is_empty());
-            assert!(store.inbox(&pr_owner.id, None).unwrap().is_empty());
-
-            // Named check completes via webhook while slow-suite is still in_progress:
-            // external timer invalidates its 15-minute sleep and wakes at once with 0 REST calls.
-            let t1 = std::time::Instant::now();
-            assert!(
-                github_event(
-                    "check_run",
-                    &json!({
-                        "repository": {"full_name": "example-org/example-repo"},
-                        "check_run": {
-                            "id": 10,
-                            "name": "fast-check",
-                            "app": {"id": 1},
-                            "status": "completed",
-                            "conclusion": "success",
-                            "head_sha": "sha1",
-                            "updated_at": "2026-11-17T04:00:00Z"
-                        }
-                    }),
-                    "deliv-fast-1",
-                    anyagents_core::now_ms()
-                )
-                .unwrap()
-            );
-            schedules_changed(store.data_dir());
-            while store.inbox(&check_owner.id, None).unwrap().is_empty() {
-                assert!(
-                    t1.elapsed() < Duration::from_millis(600),
-                    "named check webhook did not wake external loop promptly"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(sha1_calls.load(Ordering::SeqCst), initial_sha1_calls);
-
-            // Aggregate PR receives synchronize push (new head) + workflow_run completed:
-            // reconciles over REST immediately instead of waiting 15m DISCONNECTED_INTERVAL.
-            sha2_done.store(true, Ordering::SeqCst);
-            assert!(
-                github_event(
-                    "pull_request",
-                    &json!({
-                        "repository": {"full_name": "example-org/example-repo"},
-                        "pull_request": {
-                            "id": 770,
-                            "number": 77,
-                            "state": "open",
-                            "head": {"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "feat"},
-                            "updated_at": "2026-11-17T04:01:00Z"
-                        }
-                    }),
-                    "deliv-sync-1",
-                    anyagents_core::now_ms()
-                )
-                .unwrap()
-            );
-            let t2 = std::time::Instant::now();
-            assert!(
-                github_event(
-                    "workflow_run",
-                    &json!({
-                        "repository": {"full_name": "example-org/example-repo"},
-                        "workflow_run": {
-                            "id": 900,
-                            "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                            "head_branch": "feat",
-                            "status": "completed",
-                            "conclusion": "success",
-                            "updated_at": "2026-11-17T04:02:00Z"
-                        }
-                    }),
-                    "deliv-wf-1",
-                    anyagents_core::now_ms()
-                )
-                .unwrap()
-            );
-            schedules_changed(store.data_dir());
-            while store.inbox(&pr_owner.id, None).unwrap().is_empty() {
-                assert!(
-                    t2.elapsed() < Duration::from_millis(800),
-                    "aggregate PR webhook completion did not reconcile promptly"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let pr_inbox = store.inbox(&pr_owner.id, None).unwrap();
-            assert!(
-                pr_inbox[0]
-                    .text
-                    .starts_with("[watch: github:pr:example-org/example-repo#77 transition=checks_completed]")
-            );
-            local.abort();
-            external.abort();
-        });
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        server_stop.store(true, Ordering::SeqCst);
-        let _ = mock.join();
-        unsafe {
-            match prev_base {
-                Some(v) => std::env::set_var("ANYAGENTS_GITHUB_API_BASE", v),
-                None => std::env::remove_var("ANYAGENTS_GITHUB_API_BASE"),
-            }
-            match prev_tok {
-                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
-                None => std::env::remove_var("GITHUB_TOKEN"),
-            }
+        for a in [&exact_owner, &wildcard_owner, &other_owner] {
+            store.set_agent_running(&a.id, "/work").unwrap();
         }
+        create_agent_schedule(
+            &store,
+            &health,
+            &exact_owner,
+            None,
+            None,
+            Some("webhook:deploy/prod"),
+            "verify deploy",
+        )
+        .unwrap();
+        create_agent_schedule(
+            &store,
+            &health,
+            &wildcard_owner,
+            None,
+            None,
+            Some("event:*"),
+            "audit event",
+        )
+        .unwrap();
+        create_agent_schedule(
+            &store,
+            &health,
+            &other_owner,
+            None,
+            None,
+            Some("webhook:billing/invoice"),
+            "check invoice",
+        )
+        .unwrap();
+
+        let now = anyagents_core::now_ms();
+        let payload = serde_json::json!({"release": "v2.0.0", "status": "ok"});
+        let dispatch = fire_webhook_event(&store, "deploy/prod", "dlv-1", &payload, now).unwrap();
+        assert_eq!(dispatch.matched, 2);
+        assert_eq!(dispatch.fired_agents.len(), 2);
+
+        let exact_inbox = store.inbox(&exact_owner.id, None).unwrap();
+        assert_eq!(exact_inbox.len(), 1);
+        assert!(
+            exact_inbox[0]
+                .text
+                .contains("[webhook: deploy/prod delivery=dlv-1]")
+        );
+        assert!(exact_inbox[0].text.contains("verify deploy"));
+        assert!(exact_inbox[0].text.contains("v2.0.0"));
+
+        let wild_inbox = store.inbox(&wildcard_owner.id, None).unwrap();
+        assert_eq!(wild_inbox.len(), 1);
+        assert!(wild_inbox[0].text.contains("audit event"));
+
+        assert!(store.inbox(&other_owner.id, None).unwrap().is_empty());
+
+        // Retrying the same delivery after the one-shot watch fired is a no-op.
+        let retry =
+            fire_webhook_event(&store, "deploy/prod", "dlv-1", &payload, now + 1000).unwrap();
+        assert_eq!(retry.matched, 0);
+        assert_eq!(store.inbox(&exact_owner.id, None).unwrap().len(), 1);
     }
 }

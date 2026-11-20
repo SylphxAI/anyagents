@@ -140,7 +140,6 @@ fn a2a_media_fixture(data: &Path, native: bool) {
         assert_eq!(std::fs::read(&p).unwrap(), bytes);
         let authority = crate::agent_file::FileAuthority::of_agent_id(&store, &recipient.id);
         assert_eq!(authority.read(&p, 100).unwrap(), bytes);
-        assert!(authority.write(&p, b"changed").is_err());
         assert_eq!(std::fs::read(&p).unwrap(), bytes);
         p
     };

@@ -359,12 +359,6 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
             true,
         ),
         (
-            "nested",
-            "code",
-            json!({"code": "return await anyagents.send({to:['parent'],text:'nested send'});"}),
-            true,
-        ),
-        (
             "untagged",
             "send",
             json!({"to": ["parent"], "text": "unscoped send"}),
@@ -423,13 +417,8 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
             .unwrap()
             .unwrap();
         let result: serde_json::Value = ok_json(result);
-        let sent = if tool == "code" {
-            &result["result"]
-        } else {
-            &result
-        };
         assert_eq!(
-            sent["deliveries"].as_array().map(Vec::len),
+            result["deliveries"].as_array().map(Vec::len),
             Some(1),
             "{result:?}"
         );
@@ -444,7 +433,7 @@ async fn stdio_turn_metadata_scopes_direct_and_nested_parent_sends() {
         );
     }
     let rows = store.inbox(&parent.id, None).unwrap();
-    for text in ["direct send", "nested send", "unscoped send"] {
+    for text in ["direct send", "unscoped send"] {
         assert_eq!(
             rows.iter().filter(|row| row.text == text).count(),
             1,
@@ -624,24 +613,18 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(
         names,
         [
+            "agents",
             "send",
             "inbox",
-            "agents",
-            "groups",
-            "schedules",
             "conversation",
-            "code",
-            "web_search",
-            "web_fetch",
             "memory",
-            "skills",
-            "browser",
-            "computer",
+            "schedules",
+            "groups",
         ]
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>(),
-        "expected Full MCP profile tools on claude-code stdio session, got {names:?}"
+        "expected universal 7-tool MCP surface on stdio session, got {names:?}"
     );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
@@ -1858,224 +1841,6 @@ async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     drop(server);
 }
 
-#[tokio::test]
-async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_snapshot_refs() {
-    let dir = support::physical_tempdir();
-    let created = bin()
-        .env("PATH", machine_path(dir.path()))
-        .arg("--data")
-        .arg(dir.path())
-        .args(["agents", "create", "sage"])
-        .output()
-        .unwrap();
-    assert!(
-        created.status.success(),
-        "{}",
-        String::from_utf8_lossy(&created.stderr)
-    );
-    let server = start_server(dir.path());
-    let client = connect(dir.path(), "sage").await;
-
-    let code_res: serde_json::Value = ok_json(
-        call(
-            &client,
-            "code",
-            serde_json::json!({
-                "code": r##"
-                // 1. First-class anyagents.memory SDK
-                const w = await anyagents.memory.write({
-                    topic: "arch-decisions",
-                    description: "Pure Code Mode architecture",
-                    content: "# Pure Code Mode\nOnly `code` is exposed in list_tools."
-                });
-                const r = await anyagents.memory.read("arch-decisions");
-                const list = await anyagents.memory.list();
-                const search = await anyagents.memory.search("Pure Code Mode");
-                const del = await anyagents.memory.delete("arch-decisions");
-
-                // 2. Enhanced workspace SDK: write, 4-stage edit, patch, list, exec
-                await workspace.write("src/demo.rs", "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n");
-                // Indentation-different edit (stage 3)
-                const edited = await workspace.edit({
-                    path: "src/demo.rs",
-                    target: "let x = 1;\nprintln!(\"{}\", x);",
-                    replacement: "let x = 42;\n    println!(\"val={}\", x);"
-                });
-                // V4A patch
-                const patched = await workspace.patch([
-                    "*** Begin Patch",
-                    "*** Update File: src/demo.rs",
-                    "@@",
-                    "-    let x = 42;",
-                    "+    let x = 99;",
-                    "*** Add File: src/extra.txt",
-                    "+hello patch",
-                    "*** End Patch"
-                ].join("\n"));
-                const listed = await workspace.list("src");
-                const execOut = await workspace.exec({ cmd: "printf 'exec-ok'" });
-
-                // 3. Semantic Accessibility Snapshot & STALE_REF guard on host tools.computer
-                const snap = await tools.computer.snapshot({ display: ":0" });
-                const windows = await tools.computer.list_windows({ display: ":0" });
-                let staleCaught = false;
-                try {
-                    await tools.computer.click({ ref: "@e1", display: ":0" });
-                } catch (err: any) {
-                    staleCaught = String(err).includes("STALE_REF") && String(err).includes("stale_ref");
-                }
-
-                return {
-                    memTopic: r.topic,
-                    memHasContent: r.content.includes("Only `code` is exposed"),
-                    memCountBeforeDelete: list.count,
-                    memSearchCount: search.count,
-                    memDeleted: del.deleted,
-                    editReplacements: edited.replacements_made,
-                    patchCount: patched.count,
-                    listCount: listed.count,
-                    execStdout: execOut.stdout,
-                    snapshotIdPrefix: snap.snapshot_id.startsWith("s"),
-                    firstRef: snap.elements[0]?.ref_id,
-                    snapshotRole: snap.elements[0]?.role,
-                    windowCount: windows.count,
-                    staleCaught,
-                };
-            "##
-            }),
-        )
-        .await,
-    );
-
-    let res = &code_res["result"];
-    assert_eq!(res["memTopic"], "arch-decisions", "{code_res:?}");
-    assert_eq!(res["memHasContent"], true, "{code_res:?}");
-    assert!(
-        res["memCountBeforeDelete"].as_u64().unwrap_or(0) >= 1,
-        "{code_res:?}"
-    );
-    assert!(
-        res["memSearchCount"].as_u64().unwrap_or(0) >= 1,
-        "{code_res:?}"
-    );
-    assert_eq!(res["memDeleted"], true, "{code_res:?}");
-    assert_eq!(res["editReplacements"], 1, "{code_res:?}");
-    assert_eq!(res["patchCount"], 2, "{code_res:?}");
-    assert_eq!(res["listCount"], 2, "{code_res:?}");
-    assert_eq!(res["execStdout"], "exec-ok", "{code_res:?}");
-    assert_eq!(res["snapshotIdPrefix"], true, "{code_res:?}");
-    assert!(
-        res["firstRef"].as_str().unwrap_or("").contains(":e1"),
-        "{code_res:?}"
-    );
-    assert_eq!(res["snapshotRole"], "desktop", "{code_res:?}");
-    assert_eq!(res["windowCount"], 0, "{code_res:?}");
-    assert_eq!(res["staleCaught"], true, "{code_res:?}");
-
-    client.cancel().await.unwrap();
-    drop(server);
-}
-
-#[tokio::test]
-async fn skill_reads_verdicts_and_outcomes_share_the_authenticated_api() {
-    use anyagents_core::{NewAgent, Store, agent_config_dir};
-    let dir = support::physical_tempdir();
-    let store = Store::open(dir.path().join("state.db")).unwrap();
-    let lead = store
-        .create_agent(NewAgent::new("quality-lead", "spiron"))
-        .unwrap();
-    let mut input = NewAgent::new("quality-worker", "claude-code");
-    input.parent_id = Some(lead.id.clone());
-    let worker = store.create_agent(input).unwrap();
-    for agent in [&lead, &worker] {
-        store.set_agent_state(&agent.id, "paused").unwrap();
-    }
-    let skill = dir.path().join("skills").join("prove-it");
-    std::fs::create_dir_all(&skill).unwrap();
-    std::fs::write(
-        skill.join("SKILL.md"),
-        "---\nname: prove-it\ndescription: verify before claiming\n---\nCheck the live state.\n",
-    )
-    .unwrap();
-    let _server = start_server(dir.path());
-    let worker_mcp = connect(dir.path(), &worker.name).await;
-    let lead_mcp = connect(dir.path(), &lead.name).await;
-
-    let read: serde_json::Value = ok_json(
-        call(
-            &worker_mcp,
-            "skills",
-            serde_json::json!({"name": "prove-it"}),
-        )
-        .await,
-    );
-    assert!(
-        read["content"]
-            .as_str()
-            .unwrap()
-            .contains("Check the live state.")
-    );
-    let own = call(
-        &worker_mcp,
-        "agents",
-        serde_json::json!({"action": "verdict", "name": worker.name, "verdict": "accepted"}),
-    )
-    .await;
-    assert!(error_text(&own).contains("its own work"), "{own:?}");
-    let verdict: serde_json::Value = ok_json(
-        call(
-            &lead_mcp,
-            "agents",
-            serde_json::json!({
-                "action": "verdict",
-                "name": worker.name,
-                "verdict": "accepted",
-                "reason": "tests pass",
-            }),
-        )
-        .await,
-    );
-    assert_eq!(verdict["kind"], "accepted");
-    assert_eq!(verdict["actor"], "agent:quality-lead");
-
-    let report: serde_json::Value = ok_json(
-        call(
-            &lead_mcp,
-            "agents",
-            serde_json::json!({"action": "outcomes", "group_by": "skill"}),
-        )
-        .await,
-    );
-    let groups = report["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 1, "{report}");
-    assert_eq!(groups[0]["skill"], "prove-it");
-    assert_eq!(groups[0]["succeeded"], 1);
-    assert_eq!(groups[0]["events"]["accepted"], 1);
-    // No usage was recorded: the ratio is unknown, never zero.
-    assert!(groups[0]["cost_per_success_micros"].is_null());
-
-    let cli = bin()
-        .env("ANYAGENTS_AGENT_ID", lead.id.as_str())
-        .env(
-            "ANYAGENTS_AGENT_CONFIG",
-            agent_config_dir(dir.path(), &lead.id),
-        )
-        .arg("--data")
-        .arg(dir.path())
-        .args(["outcomes", "--group-by", "skill"])
-        .output()
-        .unwrap();
-    assert!(
-        cli.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cli.stderr)
-    );
-    let text = String::from_utf8(cli.stdout).unwrap();
-    assert!(text.starts_with("prove-it\t1\t1\t0\t0\t0\t0\t"), "{text}");
-    worker_mcp.cancel().await.unwrap();
-    lead_mcp.cancel().await.unwrap();
-}
-
 /// The shapes agents were seen writing reach the call they meant, and a shape
 /// that cannot be read names the one that can.
 #[tokio::test]
@@ -2126,7 +1891,7 @@ async fn tool_contracts_accept_the_shapes_agents_write() {
     );
     assert!(
         unknown.contains("unknown schedule action `update`")
-            && unknown.contains("{action: \"create\", watch: \"github:pr:owner/repo#12\""),
+            && unknown.contains("{action: \"create\", watch: \"webhook:deploy-ready\""),
         "{unknown}"
     );
     let two = error_text(
@@ -2228,44 +1993,6 @@ async fn tool_contracts_accept_the_shapes_agents_write() {
         "with parent: {with_parent}\nall: {everything}"
     );
     beta.cancel().await.unwrap();
-    drop(server);
-}
-
-/// The `code` limits come from the server's environment, handed to the tool
-/// server in `whoami`; nothing in the data directory sets them.
-#[tokio::test]
-async fn code_limits_come_from_the_server_environment() {
-    let dir = support::physical_tempdir();
-    let created = bin()
-        .env("PATH", machine_path(dir.path()))
-        .arg("--data")
-        .arg(dir.path())
-        .args(["agents", "create", "alpha"])
-        .output()
-        .unwrap();
-    assert!(created.status.success(), "{created:?}");
-    // A file an agent could plant is not read.
-    std::fs::write(
-        dir.path().join("tool-limits.json"),
-        r#"{"code_timeout_ms": 100, "code_max_timeout_ms": 1000}"#,
-    )
-    .unwrap();
-    let server = start_server_with_env(
-        dir.path(),
-        &[
-            ("ANYAGENTS_CODE_TIMEOUT_MS", "45000"),
-            ("ANYAGENTS_CODE_MAX_TIMEOUT_MS", "900000"),
-        ],
-    );
-    let alpha = connect(dir.path(), "alpha").await;
-    let tools = alpha.list_all_tools().await.unwrap();
-    let code = tools.iter().find(|t| t.name == "code").expect("code tool");
-    let description = code.description.as_deref().unwrap_or_default();
-    assert!(
-        description.contains("`timeout_ms`: default 45000, max 900000."),
-        "{description}"
-    );
-    alpha.cancel().await.unwrap();
     drop(server);
 }
 

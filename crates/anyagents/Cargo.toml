@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
-description = "Server, command line, and MCP entry point for long-lived coding agents"
+description = "Server, command line, and MCP entry point for long-lived autonomous agents"
 
 [dependencies]
 anyagents-channel-telegram = { path = "../anyagents-channel-telegram" }
@@ -26,7 +26,6 @@ anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
 agent-memory = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0", features = ["service"] }
 agent-tools = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0" }
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "c4470c9a095f46f6bdb6af2f1fc39359104f2fe4" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -53,7 +52,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
-subtle = "2.6"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
@@ -62,13 +60,6 @@ toml = "0.9"
 ureq = { version = "3", features = ["json"] }
 url = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
-roxmltree = "0.21"
-
-# Desktop sessions (headless Wayland) exist on Linux only; other hosts answer
-# session calls with a typed `UNSUPPORTED` error. Host desktop accessibility
-# (`agent_workstation::PlatformAdapter`) compiles across Linux, macOS, and Windows.
-[target.'cfg(target_os = "linux")'.dependencies]
-tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["background_threads_runtime_support"] }

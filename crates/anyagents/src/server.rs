@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -657,8 +657,6 @@ async fn serve(
                     {
                         eprintln!("anyagents-host-history: deferred full verification: {error}");
                     }
-                    #[cfg(target_os = "linux")]
-                    crate::workstation::session::reap_idle(&root);
                     if let Err(error) = crate::remote::rotate_due(&store) {
                         eprintln!("anyagents-remote: session rotation deferred: {error}");
                     }
@@ -957,8 +955,6 @@ async fn serve(
             serve_result
         }
     };
-    #[cfg(target_os = "linux")]
-    crate::workstation::session::stop_all().await;
     let preserve_webhook = preserve_webhooks_on_shutdown(data);
     let released = if preserve_webhook {
         Ok(())
@@ -1444,58 +1440,101 @@ async fn public_healthz() -> impl IntoResponse {
     )
 }
 
-/// `POST /v1/webhooks/github`: GitHub signs original bytes, not reserialized JSON.
-async fn github_webhook(
+/// `POST /v1/webhooks/events/{*topic}`: generic authenticated event trigger for
+/// `webhook:<topic>` / `event:<topic>` watches.
+///
+/// Authenticates raw request bytes against `[server].webhook_secret` (or
+/// `ANYAGENTS_WEBHOOK_SECRET`) via HMAC-SHA256 (`x-anyagents-signature-256` or
+/// `x-hub-signature-256`) or `Authorization: Bearer <secret>`.
+async fn event_webhook(
     State(state): State<AppState>,
+    AxumPath(topic): AxumPath<String>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> StatusCode {
+) -> Response {
     let settings = match crate::remote::Settings::load(state.store.data_dir()) {
         Ok(settings) => settings,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let result = crate::github_webhook::receive(
-        settings.github_webhook_secret().as_deref(),
-        &headers,
-        &body,
-        |event, payload, delivery| {
-            crate::schedule::github_event(event, payload, delivery, anyagents_core::now_ms())
-        },
-    );
-    match result {
-        Ok(changed) => {
-            if changed {
-                crate::schedule::schedules_changed(state.store.data_dir());
-                if serverless::is_serverless_mode() {
-                    let store = Arc::clone(&state.store);
-                    let health = state.health.clone();
-                    let (_, fired_agents) = spawn_store(move || {
-                        Ok::<_, ApiError>(crate::schedule::tick_serverless_schedules(
-                            &store,
-                            &health,
-                            anyagents_core::now_ms(),
-                        ))
-                    })
-                    .await
-                    .unwrap_or_default();
-                    for agent_id in fired_agents {
-                        if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
-                            Arc::clone(&state.store),
-                            &agent_id,
-                        )
-                        .await
-                        {
-                            eprintln!(
-                                "anyagents-serverless: github schedule dispatch failed for {agent_id}: {err}"
-                            );
-                        }
-                    }
-                }
-            }
-            StatusCode::ACCEPTED
-        }
-        Err(status) => status,
+    let Some(secret) = settings.webhook_secret() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let hmac_valid = headers
+        .get("x-anyagents-signature-256")
+        .or_else(|| headers.get("x-hub-signature-256"))
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|sig| {
+            anyagents_core::verify_hmac_sha256_signature(secret.as_bytes(), &body, sig)
+        });
+    let bearer_valid = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            trimmed
+                .strip_prefix("Bearer ")
+                .or_else(|| trimmed.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .is_some_and(|token| anyagents_core::constant_time_eq(token.as_bytes(), secret.as_bytes()));
+    if !hmac_valid && !bearer_valid {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(val) => val,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let delivery_id = headers
+        .get("x-anyagents-delivery")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("evt-{}-{}", anyagents_core::now_ms(), body.len()));
+    let topic = topic.trim().trim_start_matches('/').to_string();
+    if topic.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let store = Arc::clone(&state.store);
+    let dispatch_topic = topic.clone();
+    let dispatch = match spawn_store(move || {
+        crate::schedule::fire_webhook_event(
+            &store,
+            &dispatch_topic,
+            &delivery_id,
+            &payload,
+            anyagents_core::now_ms(),
+        )
+        .map_err(ApiError::from_store)
+    })
+    .await
+    {
+        Ok(dispatch) => dispatch,
+        Err(err) => return err.into_response(),
+    };
+    if serverless::is_serverless_mode() {
+        for agent_id in &dispatch.fired_agents {
+            if let Err(err) = serverless::dispatch_next_mailbox_message_if_serverless(
+                Arc::clone(&state.store),
+                agent_id,
+            )
+            .await
+            {
+                eprintln!(
+                    "anyagents-serverless: webhook schedule dispatch failed for {agent_id}: {err}"
+                );
+            }
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "topic": topic,
+            "matched": dispatch.matched,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: authenticated channel intake.
@@ -1571,15 +1610,6 @@ async fn telegram_webhook(
 /// and MCP for every credential kind. Until a deployment configures
 /// `public_listen` it is also the public one and keeps the `0.0.0.0:8788`
 /// default; once the public listener exists it defaults to loopback.
-#[cfg(target_os = "linux")]
-pub(crate) fn public_entry_listening(data: &Path) -> bool {
-    match crate::remote::Settings::load(data) {
-        Ok(settings) if settings.public_listen.is_some() => true,
-        Ok(_) => webhook_listen_addr(false, None).is_some(),
-        Err(_) => false,
-    }
-}
-
 fn parse_port_env(name: &str) -> Option<u16> {
     std::env::var(name)
         .ok()
@@ -1668,17 +1698,11 @@ fn binds_loopback(addr: &str) -> bool {
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
-        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
-        .route(
-            "/v1/webhooks/takeover/{key}/{*rest}",
-            any(takeover_page_route),
-        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
-        .route("/v1/webhooks/github", post(github_webhook))
+        .route("/v1/webhooks/events/{*topic}", post(event_webhook))
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route),
@@ -1707,59 +1731,13 @@ async fn public_not_found() -> impl IntoResponse {
     )
 }
 
-pub(crate) async fn takeover_page_route(req: axum::extract::Request) -> Response {
-    #[cfg(target_os = "linux")]
-    {
-        use tower::ServiceExt as _;
-        let prefix = crate::workstation::takeover::MOUNT_PREFIX;
-        let path = req.uri().path().to_string();
-        let tail = path.strip_prefix(prefix).unwrap_or_default();
-        let (key, rest) = tail.split_once('/').unwrap_or((tail, ""));
-        let Some(page) = crate::workstation::takeover::mounted(key) else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let query = req
-            .uri()
-            .query()
-            .map(|q| format!("?{q}"))
-            .unwrap_or_default();
-        if !tail.contains('/') {
-            // The page loads its assets relative to a directory URL.
-            return axum::response::Redirect::permanent(&format!("{path}/{query}")).into_response();
-        }
-        let (mut parts, body) = req.into_parts();
-        let Ok(uri) = format!("/{rest}{query}").parse() else {
-            return StatusCode::BAD_REQUEST.into_response();
-        };
-        parts.uri = uri;
-        match page
-            .oneshot(axum::extract::Request::from_parts(parts, body))
-            .await
-        {
-            Ok(response) => response,
-            Err(never) => match never {},
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = req;
-        StatusCode::NOT_FOUND.into_response()
-    }
-}
-
 fn build_webhook_router(state: AppState) -> Router {
     let base = Router::new()
-        .route("/v1/webhooks/takeover/{key}", any(takeover_page_route))
-        .route("/v1/webhooks/takeover/{key}/", any(takeover_page_route))
-        .route(
-            "/v1/webhooks/takeover/{key}/{*rest}",
-            any(takeover_page_route),
-        )
         .route("/", get(public_healthz))
         .route("/healthz", get(public_healthz))
         .route("/v1/webhooks/healthz", get(public_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
-        .route("/v1/webhooks/github", post(github_webhook))
+        .route("/v1/webhooks/events/{*topic}", post(event_webhook))
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route),
@@ -1818,9 +1796,6 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
             "/v1/agents/{name}/instructions",
             get(get_description_route).post(set_description_route),
         )
-        .route("/v1/browser", post(browser_route))
-        .route("/v1/computer", post(computer_route))
-        .route("/v1/web", post(web_route))
         .route("/v1/media/{file_name}", get(media_file_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
         .route("/v1/profiles/models", get(profile_models_route))
@@ -1830,6 +1805,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         )
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
+        .route("/v1/agents/{name}/memory", get(agent_memory_route))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
         .route(
             "/v1/agents/{name}/conversation/redact",
@@ -1861,9 +1837,6 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         )
         .route("/v1/whoami", get(whoami))
         .route("/v1/usage", get(usage_report))
-        .route("/v1/outcomes", get(outcome_report))
-        .route("/v1/agents/{name}/verdict", post(verdict_route))
-        .route("/v1/skills/reads", post(skill_read_route))
         .route("/v1/outbound", get(outbound_list_route))
         .route("/v1/outbound/{key}/retry", post(outbound_retry_route))
         .route("/v1/outbound/{key}/discard", post(outbound_discard_route))
@@ -1873,7 +1846,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     admin_ui::mount_admin_routes(mount_authenticated_api_routes(Router::new()))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
-        .route("/v1/webhooks/github", post(github_webhook))
+        .route("/v1/webhooks/events/{*topic}", post(event_webhook))
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route),
@@ -1893,12 +1866,6 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(in_flight::track))
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct McpRouteQuery {
-    #[serde(default)]
-    profile: Option<String>,
-}
-
 /// Which listener an MCP call arrived on. Every listener takes remote session
 /// tokens only; the public one also answers anything else with a plain 401,
 /// so a network peer never learns whether a token is a valid local capability.
@@ -1913,30 +1880,6 @@ struct McpCaller {
     agent: Agent,
     /// The remote session the presented token belongs to.
     remote: Option<anyagents_core::RemoteSessionGrant>,
-    /// True when the agent runs inside an isolated remote sandbox (`agent_sandbox_bindings`
-    /// in PostgreSQL, `SandboxConfig` with `remote_spawn`, or Sylphx sandbox lease),
-    /// admitting `?profile=full`.
-    sandbox_backed: bool,
-}
-
-impl McpCaller {
-    /// The tool profile this call gets: `remote`, or `coordination` when it
-    /// asks, or `full` strictly when authenticated as an isolated remote-sandbox
-    /// agent (never cloud harnesses or unisolated local processes).
-    fn profile(&self, requested: Option<&str>) -> Result<crate::mcp::McpProfile, ApiError> {
-        if self.sandbox_backed && self.remote.is_some() && requested == Some("full") {
-            return Ok(crate::mcp::McpProfile::Full);
-        }
-        crate::mcp::McpProfile::resolve_http(requested).map_err(|msg| {
-            let known = requested.and_then(crate::mcp::McpProfile::from_str_opt);
-            let status = if known.is_some() {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            ApiError::new(status, msg)
-        })
-    }
 }
 
 /// Authenticate one MCP call over HTTP. Only a remote session token (bound to
@@ -1992,20 +1935,9 @@ fn authenticate_mcp_request(
         if !crate::remote::runs_off_host_in(store, &agent, &config_dir) {
             return Err(unauthenticated());
         }
-        let has_pg_binding = store.sandbox_binding(&agent.id).ok().flatten().is_some();
-        let sandbox_backed = !crate::vendor::is_effective_cloud_harness(
-            &agent.harness,
-            Some(store.data_dir()),
-            Some(&config_dir),
-        ) && (has_pg_binding
-            || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(&config_dir)
-                .is_some()
-            || crate::sandbox_providers::sandbox_config_from_config_dir(&config_dir)
-                .is_some_and(|sbx| sbx.remote_spawn));
         return Ok(McpCaller {
             agent,
             remote: Some(grant),
-            sandbox_backed,
         });
     }
     // The public listener never tells a network peer whether a token is a
@@ -2036,32 +1968,25 @@ fn authenticate_mcp_request(
 async fn mcp_get_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    mcp_get(McpListener::Local, state, headers, query).await
+    mcp_get(McpListener::Local, state, headers).await
 }
 
 async fn public_mcp_get_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<McpRouteQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    mcp_get(McpListener::Public, state, headers, query).await
+    mcp_get(McpListener::Public, state, headers).await
 }
 
 async fn mcp_get(
     listener: McpListener,
     state: AppState,
     headers: axum::http::HeaderMap,
-    query: McpRouteQuery,
 ) -> Result<axum::response::Response, ApiError> {
     let presented = headers.clone();
-    let (caller, profile) = spawn_store(move || {
-        let caller = authenticate_mcp_request(&state.store, &presented, listener)?;
-        let profile = caller.profile(query.profile.as_deref())?;
-        Ok((caller, profile))
-    })
-    .await?;
+    let caller =
+        spawn_store(move || authenticate_mcp_request(&state.store, &presented, listener)).await?;
     let agent = &caller.agent;
     let remote_session = caller.remote.as_ref().map(|grant| {
         serde_json::json!({
@@ -2080,8 +2005,7 @@ async fn mcp_get(
             "protocolVersion": "2025-03-26",
             "agent": agent.name,
             "harness": agent.harness,
-            "profile": profile.as_str(),
-            "tools": profile.exposed_tools(),
+            "tools": crate::mcp::UNIVERSAL_MCP_TOOLS,
             "remote_session": remote_session,
         });
         return Ok(axum::response::IntoResponse::into_response(Json(body)));
@@ -2091,7 +2015,6 @@ async fn mcp_get(
         "transport": "streamable-http",
         "protocolVersion": "2025-03-26",
         "agent": agent.name,
-        "profile": profile.as_str(),
     });
     let sse_body = format!(": anyagents-mcp\nevent: endpoint\ndata: {event_payload}\n\n");
     Ok(axum::http::Response::builder()
@@ -2135,33 +2058,29 @@ fn decode_mcp_request_payload(
 async fn mcp_post_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<McpRouteQuery>,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
     let payload = decode_mcp_request_payload(&headers, body)?;
-    mcp_post(McpListener::Local, state, headers, query, payload).await
+    mcp_post(McpListener::Local, state, headers, payload).await
 }
 
 async fn public_mcp_post_route(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<McpRouteQuery>,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
     let payload = decode_mcp_request_payload(&headers, body)?;
-    mcp_post(McpListener::Public, state, headers, query, payload).await
+    mcp_post(McpListener::Public, state, headers, payload).await
 }
 
 async fn mcp_post(
     listener: McpListener,
     state: AppState,
     headers: axum::http::HeaderMap,
-    query: McpRouteQuery,
     payload: serde_json::Value,
 ) -> Result<axum::response::Response, ApiError> {
     let mcp = spawn_store(move || {
         let caller = authenticate_mcp_request(&state.store, &headers, listener)?;
-        let profile = caller.profile(query.profile.as_deref())?;
         let McpCaller { agent, .. } = caller;
         let data_dir = state.store.data_dir();
         let config_dir = anyagents_core::agent_config_dir(data_dir, &agent.id);
@@ -2193,7 +2112,6 @@ async fn mcp_post(
             sock,
             config_dir,
             principal,
-            profile,
             router,
         ))
     })
@@ -2309,135 +2227,6 @@ async fn usage_report(
     .await
 }
 
-/// `GET /v1/outcomes`: outcomes, recovery and cost per successful outcome
-/// (ADR 0008), over the same caller boundary and query parameters as
-/// `GET /v1/usage`. `group_by` is `model` (harness and model, the default),
-/// `harness`, `role`, `profile`, `agent` or `skill`. The window bounds when
-/// outcomes were observed; their cost may predate it.
-async fn outcome_report(
-    principal: Principal,
-    State(state): State<AppState>,
-    Query(query): Query<UsageQuery>,
-) -> Result<Json<anyagents_core::OutcomeReport>, ApiError> {
-    spawn_store(move || {
-        let (_, agent_ids) = usage_scope(
-            &state.store,
-            &principal,
-            query.agent.as_deref(),
-            query.include_descendants.or(query.subtree),
-        )?;
-        let group_by =
-            anyagents_core::OutcomeGroupBy::parse(query.group_by.as_deref().unwrap_or(""))
-                .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
-        let now = now_ms();
-        let (since, until) = anyagents_core::UsageFilter {
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
-            days: query.days,
-            group_by: anyagents_core::UsageGroupBy::Agent,
-        }
-        .window(now)
-        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
-        let report = state
-            .store
-            .outcome_report(&agent_ids, since, until.unwrap_or(now), group_by)
-            .map_err(ApiError::from_store)?;
-        Ok(Json(report))
-    })
-    .await
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VerdictRequest {
-    /// `accepted`, `rework`, `rejected` or `abandoned`.
-    verdict: String,
-    #[serde(default, alias = "note")]
-    reason: Option<String>,
-}
-
-/// `POST /v1/agents/{name}/verdict`: record a verdict on an agent's work
-/// (ADR 0008). Only a strict ancestor, a root admin or the operator may judge
-/// it; an agent never records an outcome of its own work.
-async fn verdict_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
-    Json(body): Json<VerdictRequest>,
-) -> Result<Json<anyagents_core::Outcome>, ApiError> {
-    spawn_store(move || {
-        let kind = anyagents_core::OutcomeKind::parse_verdict(&body.verdict).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "verdict must be accepted, rework, rejected or abandoned",
-            )
-        })?;
-        let target = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
-        let _lifecycle = state
-            .store
-            .lock_agent_lifecycle(&target.id)
-            .map_err(ApiError::from_store)?;
-        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &target.id);
-        let actor_id = match &principal {
-            Principal::Operator => None,
-            Principal::Agent { agent_id, .. } => Some(agent_id),
-        };
-        let (outcome, changed) = state
-            .store
-            .apply_verdict(
-                actor_id,
-                &target.id,
-                kind,
-                body.reason,
-                create::bound_profile_name(&config),
-            )
-            .map_err(ApiError::from_store)?;
-        if let Some(agent) = changed {
-            if agent.state == "archived" {
-                finish_agent_archive_locked(&state, &agent, false)?;
-            } else {
-                clear_explicitly_archived(state.store.data_dir(), &agent.id);
-            }
-        }
-        Ok(Json(outcome))
-    })
-    .await
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SkillReadRequest {
-    skill: String,
-    file: String,
-    sha256: String,
-}
-
-/// `POST /v1/skills/reads`: the calling agent read one skill file whose bytes
-/// had `sha256` (ADR 0008). Recorded for the authenticated agent only.
-async fn skill_read_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<SkillReadRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let Principal::Agent { agent_id, .. } = principal else {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "skill reads are recorded for the calling agent",
-        ));
-    };
-    spawn_store(move || {
-        state
-            .store
-            .record_skill_read(&agent_id, &body.skill, &body.file, &body.sha256)
-            .map_err(ApiError::from_store)?;
-        Ok(Json(serde_json::json!({ "recorded": true })))
-    })
-    .await
-}
-
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
 /// speaks for anyone, and gets the id the server resolved from the capability,
 /// never the name a caller wrote.
@@ -2456,9 +2245,6 @@ async fn whoami(
                     "name": name,
                     "workdir": workdir,
                     "harness": harness,
-                    // The `code` limits come from this server's environment
-                    // only, never from a file an agent could write.
-                    "code_limits": crate::mcp::CodeLimits::from_env(),
                 })))
             })
             .await
@@ -3499,6 +3285,8 @@ async fn role_agent_route(
 struct ProfileModelsQuery {
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 async fn profile_models_route(
@@ -3508,9 +3296,10 @@ async fn profile_models_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
         require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
+        let target = query.profile.as_deref().or(query.filter.as_deref());
         Ok(Json(create::probe_profile_models_catalog(
             state.store.data_dir(),
-            query.profile.as_deref(),
+            target,
         )))
     })
     .await
@@ -3908,61 +3697,6 @@ async fn set_description_route(
         })))
     })
     .await
-}
-
-/// Who a desktop call is for: its lease principal (an agent's name, or the
-/// operator) and that caller's own browser profile (the agent's name, or
-/// `default`).
-fn desktop_caller(principal: &Principal) -> crate::workstation::Caller {
-    match principal {
-        Principal::Agent { agent_id, name } => crate::workstation::Caller {
-            agent_id: Some(agent_id.as_str().to_string()),
-            principal: name.clone(),
-            profile: name.clone(),
-        },
-        Principal::Operator => crate::workstation::Caller {
-            agent_id: None,
-            principal: crate::workstation::OPERATOR.to_string(),
-            profile: "default".to_string(),
-        },
-    }
-}
-
-async fn browser_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<crate::workstation::BrowserRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let caller = desktop_caller(&principal);
-    let files = crate::agent_file::FileAuthority::of(&state.store, &principal);
-    crate::workstation::browser::execute(state.store.data_dir(), &caller, body, &files)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_store)
-}
-
-/// Session-desktop `tools.computer` requests (host and cloud requests run in
-/// the caller's process).
-async fn computer_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    #[cfg(target_os = "linux")]
-    {
-        let caller = desktop_caller(&principal);
-        crate::workstation::desktop::execute(state.store.data_dir(), &caller, body)
-            .await
-            .map(Json)
-            .map_err(ApiError::from_store)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (principal, state, body);
-        Err(ApiError::from_store(
-            crate::workstation::unsupported_host().into(),
-        ))
-    }
 }
 
 async fn channels_route(
@@ -5014,7 +4748,7 @@ fn agent_view_preloaded(
         last_error,
         retry_at_ms,
     ) = match health.get(&agent.id) {
-        Some(live) if !crate::vendor::is_spiron_harness(&agent.harness) || live.process_alive => {
+        Some(live) => {
             // The supervisor retries a transient capacity fault by itself and
             // publishes the work as in progress: neither the fault nor the
             // record its adapter persisted for it is an error of the agent's.
@@ -5062,12 +4796,11 @@ fn agent_view_preloaded(
                 retry_at_ms,
             )
         }
-        _ => {
-            let lock_busy = crate::vendor::is_spiron_harness(&agent.harness)
-                && matches!(
-                    store.try_lock_agent(&agent.id),
-                    Err(anyagents_core::Error::AgentBusy)
-                );
+        None => {
+            let lock_busy = matches!(
+                store.try_lock_agent(&agent.id),
+                Err(anyagents_core::Error::AgentBusy)
+            );
             let proc_str = if lock_busy { "alive" } else { "down" };
             let turn_str = if lock_busy { "working" } else { "idle" };
             (
@@ -5978,8 +5711,6 @@ fn reap_subagent_ephemeral_dirs_in(
     }
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Some(agent) = agent {
-        #[cfg(target_os = "linux")]
-        crate::workstation::session::stop_agent_in_background(data_dir, &agent.name);
         complete &= remove_path_with_seat_under(
             data_dir,
             &data_dir.join("browser-profiles").join(&agent.name),
@@ -6527,8 +6258,6 @@ fn remove_agent_identity_files(
     agent_dir: &Path,
     seat_ids: Option<(u32, u32, u32)>,
 ) {
-    #[cfg(target_os = "linux")]
-    crate::workstation::session::stop_agent_blocking(data_dir, &agent.name);
     remove_path_with_seat_under(
         data_dir,
         &data_dir.join("browser-profiles").join(&agent.name),
@@ -7103,6 +6832,180 @@ async fn redact_conversation_route(
             .redact_conversation(actor, &target.id, &request)
             .map(Json)
             .map_err(ApiError::from_store)
+    })
+    .await
+}
+
+/// `GET /v1/agents/{name}/memory`: return the hydrated learned-memory topic list,
+/// index markdown, and sleep-consolidation status for `name` (authorized with the
+/// same visibility boundary as `conversation(scope="memory")`).
+async fn agent_memory_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let (resolved_name, visible_agent_ids) =
+            conversation_visibility(&state.store, &principal, &name)?;
+        let target = if resolved_name.eq_ignore_ascii_case("self")
+            || resolved_name.eq_ignore_ascii_case("all")
+            || resolved_name == "*"
+        {
+            match &principal {
+                Principal::Agent { agent_id, .. } => {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                }
+                Principal::Operator => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "operator memory listing requires an explicit agent name",
+                    ));
+                }
+            }
+        } else {
+            state
+                .store
+                .agent_by_name(
+                    resolved_name
+                        .strip_prefix("agent:")
+                        .unwrap_or(&resolved_name),
+                )
+                .map_err(ApiError::from_store)?
+        };
+        if let Some(visible) = visible_agent_ids.as_ref()
+            && !visible
+                .iter()
+                .any(|v| v == target.id.as_str() || v == &target.name)
+        {
+            return Err(ApiError::forbidden(
+                "cannot read private memory of another agent",
+            ));
+        }
+        let agent_root = state
+            .store
+            .data_dir()
+            .join("agents")
+            .join(target.id.as_str());
+        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &target.id);
+        let mem_dir = agent_root.join("memory");
+        let mem_dir_safe = std::fs::symlink_metadata(&mem_dir)
+            .ok()
+            .is_some_and(|m| m.file_type().is_dir());
+        let read_no_follow = |path: &Path| -> Option<String> {
+            use std::io::Read as _;
+            if !mem_dir_safe
+                || state
+                    .store
+                    .is_host_path_redacted(target.id.as_str(), path)
+                    .unwrap_or(true)
+            {
+                return None;
+            }
+            let mut f = anyagents_core::raw_segment::open_readonly(path).ok()?;
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let mut topics: Vec<anyagents_core::learned_memory::MemoryTopicEntry> = Vec::new();
+        if mem_dir_safe && let Ok(entries) = std::fs::read_dir(&mem_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if fname.starts_with('.')
+                    || fname.eq_ignore_ascii_case("MEMORY.md")
+                    || !fname.ends_with(".md")
+                {
+                    continue;
+                }
+                let Ok(smeta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !smeta.file_type().is_file() {
+                    continue;
+                }
+                let Some(raw) = read_no_follow(&path) else {
+                    continue;
+                };
+                let slug = fname.strip_suffix(".md").unwrap_or(fname).to_string();
+                let (_, description, _, fm_updated_ms, _) =
+                    anyagents_core::learned_memory::parse_topic_frontmatter_full(&slug, &raw);
+                let fs_mtime_ms = smeta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+                    .unwrap_or(0);
+                topics.push(anyagents_core::learned_memory::MemoryTopicEntry {
+                    slug,
+                    filename: fname.to_string(),
+                    description,
+                    updated_at_ms: fm_updated_ms.filter(|&ts| ts > 0).unwrap_or(fs_mtime_ms),
+                    bytes: raw.len(),
+                });
+            }
+            topics.sort_by(|a, b| {
+                b.updated_at_ms
+                    .cmp(&a.updated_at_ms)
+                    .then_with(|| a.slug.cmp(&b.slug))
+            });
+        }
+        let index_path = mem_dir.join("MEMORY.md");
+        let index_is_symlink = std::fs::symlink_metadata(&index_path)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink());
+        let existing_index = if index_is_symlink {
+            None
+        } else {
+            read_no_follow(&index_path)
+        };
+        let needs_index_rebuild = mem_dir_safe
+            && !index_is_symlink
+            && !topics.is_empty()
+            && existing_index
+                .as_deref()
+                .is_none_or(|s| s.contains("No topic files recorded yet."));
+        if needs_index_rebuild
+            && let Ok(index) = anyagents_core::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &target.name,
+                target.role.as_deref(),
+            )
+        {
+            crate::sandbox_exec::persist_agent_memory_file_to_store(
+                &state.store,
+                &target.id,
+                "MEMORY.md",
+                index.as_bytes(),
+            );
+        }
+        let index_text = if index_is_symlink {
+            String::new()
+        } else {
+            read_no_follow(&index_path).unwrap_or_else(|| {
+                format!(
+                    "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
+                    target.name
+                )
+            })
+        };
+        let sleep_path = mem_dir.join(".sleep-state.json");
+        let sleep_state: anyagents_core::learned_memory::SleepState = read_no_follow(&sleep_path)
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let topic_count = topics.len();
+        Ok(Json(serde_json::json!({
+            "agent": target.name,
+            "agent_id": target.id.as_str(),
+            "topics": topics,
+            "topic_count": topic_count,
+            "index": index_text,
+            "index_bytes": index_text.len(),
+            "index_lines": index_text.lines().count(),
+            "last_consolidated_ms": sleep_state.last_consolidated_ms,
+            "consolidated_topics": sleep_state.consolidated_topics,
+        })))
     })
     .await
 }
@@ -10052,19 +9955,6 @@ fn deliver_telegram(
     })
 }
 
-async fn web_route(
-    _principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<crate::web::WebRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    spawn_store(move || {
-        crate::web::execute_web_request(Some(state.store.data_dir()), body)
-            .map(Json)
-            .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
-    })
-    .await
-}
-
 async fn spawn_store<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -10253,9 +10143,9 @@ pub(crate) mod tests {
         let store = Store::open(temp.path().join("state.db")).unwrap();
         for (harness, mode, steer) in [
             ("spiron", "steer", "yes"),
-            ("grok", "steer", "yes"),
             ("opencode", "steer", "yes"),
-            ("dsh", "steer", "yes"),
+            ("claude-code", "steer", "yes"),
+            ("codex", "steer", "yes"),
             ("spiron-cloud", "followup", "no"),
         ] {
             let agent = store
@@ -10892,53 +10782,6 @@ pub(crate) mod tests {
         assert_eq!(view.retry_at_ms, None);
         assert_eq!(view.last_error.as_deref(), Some(fault));
         assert_eq!(parent_notices(), 1);
-    }
-
-    #[test]
-    fn spiron_agent_view_uses_turn_lock_with_missing_or_stale_health() {
-        let dir = crate::test_tempdir();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let mut agent = store
-            .create_agent(anyagents_core::NewAgent::new("lock-owner", "spiron"))
-            .unwrap();
-        for selector in [
-            "spiron",
-            "sylphx",
-            "sylphx-agent",
-            "sylphx_agent",
-            "sylphx/default",
-        ] {
-            // Exercise legacy in-memory records as well as canonical stored rows.
-            agent.harness = selector.into();
-            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
-            let lock = store.try_lock_agent(&agent.id).unwrap();
-            let busy = agent_view(&store, &health, &agent).unwrap();
-            assert_eq!(busy.process, "alive", "{selector}");
-            assert_eq!(busy.turn_state, "working", "{selector}");
-            health.publish(
-                &agent.id,
-                anyagents_supervisor::LiveState {
-                    process_alive: false,
-                    turn_state: anyagents_harness::TurnState::Idle,
-                    delivery: Some(crate::vendor::declared_delivery("spiron")),
-                    quota_reset_at_ms: None,
-                    restart_at_ms: None,
-                    pid: None,
-                    live_harness: Some("spiron".into()),
-                    live_model: None,
-                    process_started_at_ms: None,
-                    last_error: None,
-                    retry_at_ms: None,
-                },
-            );
-            assert_eq!(
-                agent_view(&store, &health, &agent).unwrap().turn_state,
-                "working"
-            );
-            drop(lock);
-            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
-        }
     }
 
     #[test]
@@ -12634,178 +12477,6 @@ pub(crate) mod tests {
                 assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
             }
         });
-    }
-
-    #[test]
-    fn local_scheduler_keeps_ticking_while_external_probe_is_blocked() {
-        use anyagents_core::{NewAgent, NewSchedule};
-        use std::time::{Duration, Instant};
-        if single_test_worker("local_scheduler_keeps_ticking_while_external_probe_is_blocked") {
-            return;
-        }
-        let _env = env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        let external = store
-            .create_agent(NewAgent::new("external", "codex"))
-            .unwrap();
-        let watch = store
-            .create_schedule(NewSchedule {
-                agent_id: external.id.clone(),
-                kind: "watch".into(),
-                spec: "github:pr:example-org/project#1".into(),
-                prompt: "external".into(),
-                interval_ms: None,
-                next_fire_at_ms: None,
-                watch_baseline: Some("pending".into()),
-            })
-            .unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let previous = std::env::var_os("ANYAGENTS_GITHUB_API_BASE");
-        struct RestoreApi(Option<std::ffi::OsString>);
-        impl Drop for RestoreApi {
-            fn drop(&mut self) {
-                // SAFETY: the server fixture and its external worker have stopped.
-                unsafe {
-                    if let Some(value) = &self.0 {
-                        std::env::set_var("ANYAGENTS_GITHUB_API_BASE", value);
-                    } else {
-                        std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
-                    }
-                }
-            }
-        }
-        let _api = RestoreApi(previous);
-        // SAFETY: process-global API overrides are serialized by env_lock.
-        unsafe {
-            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
-        }
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (entered, mut received) = tokio::sync::oneshot::channel();
-        let (release, blocked) = std::sync::mpsc::channel();
-        let peer = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0; 4096];
-            assert!(stream.read(&mut request).unwrap() > 0);
-            entered.send(()).unwrap();
-            // Keep the real external HTTP request in flight across later local ticks.
-            let _ = blocked.recv_timeout(Duration::from_secs(15));
-            stream
-                .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .unwrap();
-        });
-        struct Release(Option<std::sync::mpsc::Sender<()>>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                let _ = self.0.take().unwrap().send(());
-            }
-        }
-        let release = Release(Some(release));
-        runtime.block_on(async {
-            let (stop, stopping) = tokio::sync::watch::channel(false);
-            let (local, network) =
-                crate::schedule::start_loops(Arc::clone(&store), HealthBoard::default(), stopping);
-            let deadline = Instant::now() + Duration::from_secs(8);
-            loop {
-                match received.try_recv() {
-                    Ok(()) => break,
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-                    Err(err) => panic!("external probe did not start: {err}"),
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "external loop did not start on its first tick"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            // These schedules did not exist when the first local pass ran.
-            let target = store
-                .create_agent(NewAgent::new("idle-target", "codex"))
-                .unwrap();
-            let mut child = std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            assert!(child.wait().unwrap().success());
-            let file = dir.path().join("completion");
-            let due = now_ms() + 100;
-            let mut owners = Vec::new();
-            for (name, kind, spec) in [
-                ("at-owner", "at", "due".into()),
-                ("every-owner", "every", "1s".into()),
-                ("file-owner", "watch", format!("file:{}", file.display())),
-                ("pid-owner", "watch", format!("pid:{pid}")),
-                ("idle-owner", "watch", format!("agent:idle:{}", target.name)),
-            ] {
-                let owner = store.create_agent(NewAgent::new(name, "codex")).unwrap();
-                store
-                    .create_schedule(NewSchedule {
-                        agent_id: owner.id.clone(),
-                        kind: kind.into(),
-                        spec,
-                        prompt: name.into(),
-                        interval_ms: (kind == "every").then_some(1000),
-                        next_fire_at_ms: (kind != "watch").then_some(due),
-                        watch_baseline: (name == "file-owner").then(|| "missing".into()),
-                    })
-                    .unwrap();
-                owners.push(owner.id);
-            }
-            std::fs::write(file, "complete").unwrap();
-            let future = store
-                .create_agent(NewAgent::new("future-owner", "codex"))
-                .unwrap();
-            store
-                .create_schedule(NewSchedule {
-                    agent_id: future.id.clone(),
-                    kind: "at".into(),
-                    spec: "future".into(),
-                    prompt: "not due".into(),
-                    interval_ms: None,
-                    next_fire_at_ms: Some(due + 60_000),
-                    watch_baseline: None,
-                })
-                .unwrap();
-            crate::schedule::schedules_changed(store.data_dir());
-            loop {
-                if owners
-                    .iter()
-                    .all(|id| store.inbox(id, None).unwrap().len() == 1)
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "local schedules waited for external probe"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert!(store.inbox(&future.id, None).unwrap().is_empty());
-            assert!(store.inbox(&external.id, None).unwrap().is_empty());
-            let active = store.list_schedules(Some(&external.id), true).unwrap();
-            assert_eq!(active[0].id, watch.id);
-            assert_eq!(active[0].last_observed, watch.last_observed);
-            // All five admissions are proven before releasing the external response.
-            // A stop ends both timers at once, though the external probe is
-            // still waiting for its answer.
-            stop.send(true).unwrap();
-            tokio::time::timeout(Duration::from_secs(1), async {
-                local.await.unwrap();
-                network.await.unwrap();
-            })
-            .await
-            .expect("a stop ends both schedule timers while a probe is in flight");
-        });
-        drop(release);
-        peer.join().unwrap();
-        runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
     struct SingleUidEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -15638,16 +15309,6 @@ exec '{}' "$@"
         let spiron_cap = remote_token(&spiron_agent);
         let local_cap = state.store.issue_capability(&cloud_agent.id).unwrap();
 
-        // Seed a skill inside the agent's config dir so `skills` list/read works deterministically.
-        let skill_dir = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud_agent.id)
-            .join(".agents/skills/test-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: Synthetic test skill for MCP verification\n---\n# Test Skill\nBody content.\n",
-        )
-        .unwrap();
-
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Verify both `build_router` and `build_webhook_router` compile and bind `/mcp`.
             let _main_app = build_router(state.clone());
@@ -15657,7 +15318,6 @@ exec '{}' "$@"
             let unauth_err = mcp_post_route(
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
-                Query(McpRouteQuery::default()),
                 axum::body::Bytes::from(
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc": "2.0",
@@ -15680,7 +15340,6 @@ exec '{}' "$@"
             let bad_err = mcp_post_route(
                 State(state.clone()),
                 bad_headers,
-                Query(McpRouteQuery::default()),
                 axum::body::Bytes::from(
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc": "2.0",
@@ -15714,7 +15373,6 @@ exec '{}' "$@"
                 let refused = mcp_post_route(
                     State(state.clone()),
                     local_headers,
-                    Query(McpRouteQuery::default()),
                     axum::body::Bytes::from(
                         serde_json::to_vec(&serde_json::json!({
                             "jsonrpc": "2.0",
@@ -15735,22 +15393,17 @@ exec '{}' "$@"
                 );
             }
 
-            // Helper to call `mcp_post_route` with a Bearer token and optional profile query.
-            let post_mcp = |token: &str, profile: Option<&str>, body: serde_json::Value| {
+            // Helper to call `mcp_post_route` with a Bearer token.
+            let post_mcp = |token: &str, body: serde_json::Value| {
                 let state = state.clone();
                 let mut headers = axum::http::HeaderMap::new();
                 headers.insert(
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {token}").parse().unwrap(),
                 );
-                let query = McpRouteQuery {
-                    profile: profile.map(str::to_string),
-                };
                 let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
                 async move {
-                    let resp = mcp_post_route(State(state), headers, Query(query), raw)
-                        .await
-                        .unwrap();
+                    let resp = mcp_post_route(State(state), headers, raw).await.unwrap();
                     let status = resp.status();
                     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
                     let json: serde_json::Value = if bytes.is_empty() {
@@ -15768,13 +15421,9 @@ exec '{}' "$@"
                 axum::http::header::AUTHORIZATION,
                 format!("Bearer {cloud_cap}").parse().unwrap(),
             );
-            let sse_resp = mcp_get_route(
-                State(state.clone()),
-                get_headers,
-                Query(McpRouteQuery::default()),
-            )
-            .await
-            .unwrap();
+            let sse_resp = mcp_get_route(State(state.clone()), get_headers)
+                .await
+                .unwrap();
             assert_eq!(sse_resp.status(), StatusCode::OK);
             assert!(
                 sse_resp
@@ -15786,10 +15435,9 @@ exec '{}' "$@"
                     .starts_with("text/event-stream")
             );
 
-            // 3. POST /mcp with valid Bearer capability handles `initialize` and `tools/list` under default `Remote` profile.
+            // 3. POST /mcp with valid Bearer token exposes the exact 7 universal MCP tools.
             let (status, init_json) = post_mcp(
                 &cloud_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -15803,7 +15451,6 @@ exec '{}' "$@"
 
             let (status, list_json) = post_mcp(
                 &cloud_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 2,
@@ -15819,71 +15466,15 @@ exec '{}' "$@"
                 .iter()
                 .map(|t| t["name"].as_str().unwrap().to_string())
                 .collect();
-            let expected_remote: Vec<String> = crate::mcp::REMOTE_MCP_TOOLS
+            let expected_universal: Vec<String> = crate::mcp::UNIVERSAL_MCP_TOOLS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
-            assert_eq!(remote_tools, expected_remote);
-            assert!(remote_tools.contains(&"code".to_string()));
+            assert_eq!(remote_tools, expected_universal);
 
-            // Calling host-free `code` under `Remote` profile succeeds for `coordination.*` + `memory.*`,
-            // while `workspace.*` fails closed with zero coordinator-host filesystem exposure.
-            let (status, code_ok_json) = post_mcp(
-                &cloud_cap,
-                None,
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "code",
-                        "arguments": {
-                            "code": "const [agentsRes, memRes] = await Promise.all([coordination.agents({ action: 'list' }), memory.list()]); return { agentCount: agentsRes.agents.length, memOk: Boolean(memRes) };"
-                        }
-                    }
-                }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-            assert_ne!(
-                code_ok_json["result"]["isError"],
-                serde_json::json!(true),
-                "unexpected remote code error: {code_ok_json}"
-            );
-            assert_eq!(
-                code_ok_json["result"]["structuredContent"]["result"]["memOk"],
-                serde_json::json!(true),
-                "{code_ok_json}"
-            );
-
-            // Direct host-bound `files` tool remains refused under `Remote` profile.
-            let (status, files_err_json) = post_mcp(
-                &cloud_cap,
-                None,
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 30,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "files",
-                        "arguments": { "action": "list" }
-                    }
-                }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(
-                files_err_json["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("disabled by active MCP profile `remote`"),
-                "unexpected error response: {files_err_json}"
-            );
-
-            // Calling `send`, `inbox`, `agents`, `memory`, `skills` succeeds under `Remote` profile.
+            // Calling `send`, `inbox`, `agents`, `memory` succeeds on the universal surface.
             let (_, send_res) = post_mcp(
                 &cloud_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 4,
@@ -15906,7 +15497,6 @@ exec '{}' "$@"
 
             let (_, inbox_res) = post_mcp(
                 &spiron_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 5,
@@ -15930,7 +15520,6 @@ exec '{}' "$@"
 
             let (_, agents_res) = post_mcp(
                 &cloud_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 6,
@@ -15950,7 +15539,6 @@ exec '{}' "$@"
 
             let (_, mem_res) = post_mcp(
                 &cloud_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 7,
@@ -15973,39 +15561,10 @@ exec '{}' "$@"
                 "{mem_res}"
             );
 
-            let (_, skills_res) = post_mcp(
-                &cloud_cap,
-                None,
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 8,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "skills",
-                        "arguments": { "action": "list" }
-                    }
-                }),
-            )
-            .await;
-            assert_ne!(
-                skills_res["result"]["isError"],
-                serde_json::json!(true),
-                "{skills_res}"
-            );
-            assert!(
-                skills_res["result"]["structuredContent"]["skills"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s["name"] == "test-skill"),
-                "{skills_res}"
-            );
-
-            // 4. `spiron` agents are treated uniformly (defaulting to `McpProfile::Remote` over HTTP `/mcp`),
-            // while explicit `?profile=coordination` exposes pure coordination tools only.
+            // 4. `spiron` receives the exact same 7-tool universal MCP surface as every other harness,
+            // and removed/non-core tools are blocked uniformly.
             let (_, spiron_default_json) = post_mcp(
                 &spiron_cap,
-                None,
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 9,
@@ -16020,43 +15579,23 @@ exec '{}' "$@"
                 .iter()
                 .map(|t| t["name"].as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(spiron_default_tools, expected_remote);
+            assert_eq!(spiron_default_tools, expected_universal);
 
-            let (_, spiron_list_json) = post_mcp(
-                &spiron_cap,
-                Some("coordination"),
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 91,
-                    "method": "tools/list",
-                    "params": {}
-                }),
-            )
-            .await;
-            let spiron_tools: Vec<String> = spiron_list_json["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_string())
-                .collect();
-            let expected_coord: Vec<String> = crate::mcp::COORDINATION_MCP_TOOLS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            assert_eq!(spiron_tools, expected_coord);
             for omitted in [
                 "code",
+                "files",
+                "skills",
+                "web",
                 "web_search",
                 "web_fetch",
-                "memory",
-                "skills",
                 "browser",
                 "computer",
+                "device",
+                "media",
             ] {
-                assert!(!spiron_tools.contains(&omitted.to_string()));
+                assert!(!spiron_default_tools.contains(&omitted.to_string()));
                 let (_, err_json) = post_mcp(
                     &spiron_cap,
-                    Some("coordination"),
                     serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": 10,
@@ -16072,18 +15611,18 @@ exec '{}' "$@"
                     err_json["error"]["message"]
                         .as_str()
                         .unwrap()
-                        .contains("disabled by active MCP profile `coordination`"),
-                    "expected `{omitted}` to be blocked in coordination profile, got {err_json}"
+                        .contains("not available on the AnyAgents MCP surface"),
+                    "expected `{omitted}` to be blocked on universal MCP surface, got {err_json}"
                 );
             }
         });
     }
 
-    /// One MCP POST with a bearer token and an optional `?profile=`.
+    /// One MCP POST with a bearer token.
     async fn post_mcp_as(
         state: &AppState,
         token: &str,
-        profile: Option<&str>,
+        _profile: Option<&str>,
         body: serde_json::Value,
     ) -> Result<(StatusCode, serde_json::Value), ApiError> {
         use http_body_util::BodyExt as _;
@@ -16092,11 +15631,8 @@ exec '{}' "$@"
             axum::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        let query = McpRouteQuery {
-            profile: profile.map(str::to_string),
-        };
         let raw = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap());
-        let resp = mcp_post_route(State(state.clone()), headers, Query(query), raw).await?;
+        let resp = mcp_post_route(State(state.clone()), headers, raw).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json = if bytes.is_empty() {
@@ -16266,7 +15802,7 @@ exec '{}' "$@"
     }
 
     #[test]
-    fn remote_session_tokens_get_only_the_remote_profile() {
+    fn remote_session_tokens_get_universal_mcp_surface() {
         use http_body_util::BodyExt as _;
         let _env = env_lock();
         let dir = crate::test_tempdir();
@@ -16291,51 +15827,31 @@ exec '{}' "$@"
         crate::remote::begin_session(&state.store, &cloud).unwrap();
         let cloud_cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &cloud.id);
         let remote = crate::remote::session_token(&cloud_cfg).unwrap();
-        let expected_remote: Vec<String> = crate::mcp::REMOTE_MCP_TOOLS
+        let expected_universal: Vec<String> = crate::mcp::UNIVERSAL_MCP_TOOLS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
         assert_eq!(
-            expected_remote,
+            expected_universal,
             [
+                "agents",
                 "send",
                 "inbox",
-                "agents",
-                "groups",
-                "schedules",
                 "conversation",
-                "code",
                 "memory",
-                "skills"
+                "schedules",
+                "groups",
             ]
         );
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // The default, and an explicit `remote`, list exactly the remote tools.
-            for asked in [None, Some("remote"), Some("cloud")] {
-                let (status, list) = post_mcp_as(&state, &remote, asked, tools_list())
-                    .await
-                    .unwrap();
-                assert_eq!(status, StatusCode::OK);
-                assert_eq!(listed_tools(&list), expected_remote, "{asked:?}");
-            }
-            // `coordination` narrows; `full` is refused, and so is nonsense.
-            let (_, list) = post_mcp_as(&state, &remote, Some("coordination"), tools_list())
+            let (status, list) = post_mcp_as(&state, &remote, None, tools_list())
                 .await
                 .unwrap();
-            assert_eq!(listed_tools(&list), crate::mcp::COORDINATION_MCP_TOOLS);
-            for (asked, expected) in [
-                ("full", StatusCode::FORBIDDEN),
-                ("local", StatusCode::FORBIDDEN),
-                ("everything", StatusCode::BAD_REQUEST),
-            ] {
-                let err = post_mcp_as(&state, &remote, Some(asked), tools_list())
-                    .await
-                    .unwrap_err();
-                assert_eq!(err.status, expected, "{asked}: {}", err.message);
-            }
-            // Nothing that runs directly on or from the host can be called,
-            // even by an alias or the vendor-prefixed name.
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed_tools(&list), expected_universal);
+
+            // Nothing outside the 7 canonical tools can be called, even by vendor prefix.
             for host_tool in [
                 "browser",
                 "computer",
@@ -16345,6 +15861,8 @@ exec '{}' "$@"
                 "web",
                 "web_search",
                 "web_fetch",
+                "code",
+                "skills",
                 "mcp__anyagents__browser",
                 "mcp__anyagents__computer",
             ] {
@@ -16360,34 +15878,11 @@ exec '{}' "$@"
                     refused["error"]["message"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("disabled by active MCP profile `remote`"),
+                        .contains("not available on the AnyAgents MCP surface"),
                     "{host_tool}: {refused}"
                 );
             }
-            // Host-free `code` is exposed on `remote` but forbids coordinator-host
-            // filesystem access when no remote sandbox is bound.
-            let (_, code_fs_refused) = post_mcp_as(
-                &state,
-                &remote,
-                None,
-                tool_call(
-                    "code",
-                    serde_json::json!({ "code": "return await workspace.read('Cargo.toml');" }),
-                ),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                code_fs_refused["result"]["isError"],
-                serde_json::json!(true),
-                "{code_fs_refused}"
-            );
-            assert!(
-                code_fs_refused
-                    .to_string()
-                    .contains("coordinator-host filesystem access is forbidden"),
-                "{code_fs_refused}"
-            );
+
             // Coordination works, as the agent the token names.
             let (_, sent) = post_mcp_as(
                 &state,
@@ -16413,48 +15908,36 @@ exec '{}' "$@"
                 inbox[0].sender
             );
 
-            // The GET route names the session and its expiry, and refuses `full`.
-            let get = |profile: Option<&str>| {
-                let mut headers = axum::http::HeaderMap::new();
-                headers.insert(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {remote}").parse().unwrap(),
-                );
-                headers.insert(
-                    axum::http::header::ACCEPT,
-                    "application/json".parse().unwrap(),
-                );
-                mcp_get_route(
-                    State(state.clone()),
-                    headers,
-                    Query(McpRouteQuery {
-                        profile: profile.map(str::to_string),
-                    }),
-                )
-            };
-            let described = get(None).await.unwrap();
+            // The GET route names the session, its expiry, and the 7 universal tools.
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {remote}").parse().unwrap(),
+            );
+            headers.insert(
+                axum::http::header::ACCEPT,
+                "application/json".parse().unwrap(),
+            );
+            let described = mcp_get_route(State(state.clone()), headers).await.unwrap();
             let bytes = described.into_body().collect().await.unwrap().to_bytes();
             let described: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(described["profile"], "remote");
             assert_eq!(described["agent"], "cloud-remote");
+            assert_eq!(
+                described["tools"],
+                serde_json::json!(crate::mcp::UNIVERSAL_MCP_TOOLS)
+            );
             let grant = state.store.authenticate_remote_session(&remote).unwrap();
             assert_eq!(described["remote_session"]["session_id"], grant.session_id);
             assert_eq!(
                 described["remote_session"]["expires_at_ms"],
                 grant.expires_at_ms
             );
-            assert_eq!(
-                get(Some("full")).await.unwrap_err().status,
-                StatusCode::FORBIDDEN
-            );
 
             // Over HTTP a local capability is refused outright.
-            for asked in [None, Some("full")] {
-                let refused = post_mcp_as(&state, &peer_cap, asked, tools_list())
-                    .await
-                    .unwrap_err();
-                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked:?}");
-            }
+            let refused = post_mcp_as(&state, &peer_cap, None, tools_list())
+                .await
+                .unwrap_err();
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
         });
     }
 
@@ -16559,35 +16042,73 @@ exec '{}' "$@"
     }
 
     #[test]
-    fn github_webhook_routes_authenticate_original_bytes() {
+    fn event_webhook_routes_authenticate_original_bytes() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
+        let watcher = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("deploy-bot", "codex"))
+            .unwrap();
+        state.store.set_agent_running(&watcher.id, "/work").unwrap();
+        crate::schedule::create_agent_schedule(
+            &state.store,
+            &state.health,
+            &watcher,
+            None,
+            None,
+            Some("webhook:deploy/prod"),
+            "verify deployment",
+        )
+        .unwrap();
         let config = state.store.data_dir().join("anyagents.toml");
-        std::fs::write(&config, "[server]\ngithub_webhook_secret = 'secret'\n").unwrap();
+        std::fs::write(&config, "[server]\nwebhook_secret = 'secret'\n").unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             use hyper::service::Service as _;
-            for router in [build_router(state.clone()), build_public_router(state.clone()), build_webhook_router(state.clone())] {
+            for router in [
+                build_router(state.clone()),
+                build_public_router(state.clone()),
+                build_webhook_router(state.clone()),
+            ] {
                 let service = hyper_util::service::TowerToHyperService::new(router);
-                for (body, signed, event, expected) in [
-                    (" {\n\"repository\":{\"full_name\":\"nobody/unused\"},\"check_run\":{\"head_sha\":\"sha\",\"id\":1,\"name\":\"build\",\"status\":\"completed\"}}", true, "check_run", StatusCode::ACCEPTED),
-                    ("{", false, "check_run", StatusCode::UNAUTHORIZED),
-                    ("{", true, "check_run", StatusCode::BAD_REQUEST),
-                    ("{", true, "ping", StatusCode::ACCEPTED),
+                for (body, signed, expected) in [
+                    (r#"{"release":"v2"}"#, true, StatusCode::ACCEPTED),
+                    ("{", false, StatusCode::UNAUTHORIZED),
+                    ("{", true, StatusCode::BAD_REQUEST),
                 ] {
-                    let signature = if signed { format!("sha256={}", crate::github_webhook::hmac_sha256_hex(b"secret", body.as_bytes())) } else { "sha256=invalid".into() };
-                    let request = hyper::Request::builder().method("POST").uri("/v1/webhooks/github")
-                        .header("x-hub-signature-256", signature).header("x-github-event", event)
-                        .header("x-github-delivery", format!("route-{event}-{}", body.len()))
-                        .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(body.as_bytes()))).unwrap();
+                    let signature = if signed {
+                        format!(
+                            "sha256={}",
+                            anyagents_core::hmac_sha256_hex(b"secret", body.as_bytes())
+                        )
+                    } else {
+                        "sha256=invalid".into()
+                    };
+                    let request = hyper::Request::builder()
+                        .method("POST")
+                        .uri("/v1/webhooks/events/deploy/prod")
+                        .header("x-anyagents-signature-256", signature)
+                        .header("x-anyagents-delivery", format!("route-{}", body.len()))
+                        .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
+                            body.as_bytes(),
+                        )))
+                        .unwrap();
                     assert_eq!(service.call(request).await.unwrap().status(), expected);
                 }
             }
-            std::fs::write(&config, "[server]\ngithub_webhook_secret = ''\n").unwrap();
-            let service = hyper_util::service::TowerToHyperService::new(build_webhook_router(state));
-            let request = hyper::Request::builder().method("POST").uri("/v1/webhooks/github")
-                .body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
-            assert_eq!(service.call(request).await.unwrap().status(), StatusCode::NOT_FOUND);
+            assert_eq!(state.store.inbox(&watcher.id, None).unwrap().len(), 1);
+            std::fs::write(&config, "[server]\nwebhook_secret = ''\n").unwrap();
+            let service =
+                hyper_util::service::TowerToHyperService::new(build_webhook_router(state));
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri("/v1/webhooks/events/deploy/prod")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            assert_eq!(
+                service.call(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
         });
     }
 
@@ -16885,7 +16406,7 @@ exec '{}' "$@"
             .await
             .unwrap();
             assert_eq!(status, 200, "{body}");
-            assert_eq!(listed_tools(&body), crate::mcp::REMOTE_MCP_TOOLS);
+            assert_eq!(listed_tools(&body), crate::mcp::UNIVERSAL_MCP_TOOLS);
 
             // Telegram's webhook is verified by the channel's secret token here
             // too: a missing or wrong secret is refused before any delivery.
@@ -17051,7 +16572,7 @@ exec '{}' "$@"
     }
 
     #[test]
-    fn http_mcp_never_serves_more_than_the_remote_profile_to_any_credential() {
+    fn http_mcp_serves_only_universal_seven_tools_and_blocks_host_tools() {
         let _env = env_lock();
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
@@ -17068,8 +16589,6 @@ exec '{}' "$@"
         let cap =
             crate::remote::session_token(&anyagents_core::agent_config_dir(dir.path(), &local.id))
                 .unwrap();
-        // Neither a sandbox binding nor disabled built-in tools upgrades HTTP
-        // any more: over HTTP the tools would run as the server.
         let cfg = anyagents_core::agent_config_dir(dir.path(), &local.id);
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("cloud.json"), r#"{"disable_builtin_tools":true}"#).unwrap();
@@ -17085,49 +16604,10 @@ exec '{}' "$@"
         let marker = dir.path().join("exec-ran");
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for asked in [None, Some("remote"), Some("http")] {
-                let (status, list) = post_mcp_as(&state, &cap, asked, tools_list())
-                    .await
-                    .unwrap();
-                assert_eq!(status, StatusCode::OK);
-                assert_eq!(
-                    listed_tools(&list),
-                    crate::mcp::REMOTE_MCP_TOOLS,
-                    "{asked:?}"
-                );
-            }
-            let (_, list) = post_mcp_as(&state, &cap, Some("coordination"), tools_list())
-                .await
-                .unwrap();
-            assert_eq!(listed_tools(&list), crate::mcp::COORDINATION_MCP_TOOLS);
-            for asked in ["full", "FULL", "local", "stdio"] {
-                let refused = post_mcp_as(&state, &cap, Some(asked), tools_list())
-                    .await
-                    .unwrap_err();
-                assert_eq!(refused.status, StatusCode::FORBIDDEN, "{asked}");
-                assert!(
-                    refused.message.contains("not served over HTTP"),
-                    "{}",
-                    refused.message
-                );
-            }
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                axum::http::header::AUTHORIZATION,
-                format!("Bearer {cap}").parse().unwrap(),
-            );
-            let refused = mcp_get_route(
-                State(state.clone()),
-                headers,
-                Query(McpRouteQuery {
-                    profile: Some("full".into()),
-                }),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+            let (status, list) = post_mcp_as(&state, &cap, None, tools_list()).await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed_tools(&list), crate::mcp::UNIVERSAL_MCP_TOOLS);
 
-            // Direct host-bound tools remain disabled under `Remote` profile.
             let exec = serde_json::json!({
                 "action": "exec",
                 "command": format!("touch {}", marker.display()),
@@ -17145,6 +16625,8 @@ exec '{}' "$@"
                     "web_fetch",
                     serde_json::json!({ "url": "https://example.com" }),
                 ),
+                ("code", serde_json::json!({ "code": "return 1;" })),
+                ("skills", serde_json::json!({ "action": "list" })),
             ] {
                 let (_, refused) = post_mcp_as(&state, &cap, None, tool_call(tool, args))
                     .await
@@ -17153,29 +16635,10 @@ exec '{}' "$@"
                     refused["error"]["message"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("disabled by active MCP profile"),
+                        .contains("not available on the AnyAgents MCP surface"),
                     "{tool}: {refused}"
                 );
             }
-            // Host-free `code` under `Remote` profile cannot execute commands or read on the coordinator host.
-            let (_, code_refused) = post_mcp_as(
-                &state,
-                &cap,
-                None,
-                tool_call(
-                    "code",
-                    serde_json::json!({
-                        "code": format!("return await workspace.exec('touch {}');", marker.display())
-                    }),
-                ),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                code_refused["result"]["isError"],
-                serde_json::json!(true),
-                "{code_refused}"
-            );
             assert!(!marker.exists(), "an HTTP call ran a host command");
         });
     }
@@ -17978,142 +17441,6 @@ exec '{}' "$@"
     }
 
     #[tokio::test]
-    async fn verdicts_need_an_ancestor_and_outcomes_follow_the_usage_boundary() {
-        let (_dir, state, root, child, _grandchild, sibling, other_root) = usage_fixture();
-        let as_agent = |agent: &Agent| Principal::Agent {
-            agent_id: agent.id.clone(),
-            name: agent.name.clone(),
-        };
-        let judge = |principal: Principal, target: &str, verdict: &str| {
-            verdict_route(
-                principal,
-                State(state.clone()),
-                AxumPath(target.to_string()),
-                Json(VerdictRequest {
-                    verdict: verdict.to_string(),
-                    reason: Some("checked against the brief".to_string()),
-                }),
-            )
-        };
-        // An agent never judges its own work; peers and other roots cannot.
-        for (principal, target) in [
-            (as_agent(&child), "usage-child"),
-            (as_agent(&sibling), "usage-child"),
-            (as_agent(&other_root), "usage-child"),
-        ] {
-            let err = judge(principal, target, "accepted").await.unwrap_err();
-            assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
-        }
-        let err = judge(Principal::Operator, "usage-child", "pr_merged")
-            .await
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        // Any strict ancestor may judge; the operator may judge anyone.
-        let Json(rework) = judge(as_agent(&root), "usage-grandchild", "rework")
-            .await
-            .unwrap();
-        assert_eq!(rework.kind, anyagents_core::OutcomeKind::Rework);
-        assert_eq!(rework.actor, "agent:usage-root");
-        assert_eq!(rework.note.as_deref(), Some("checked against the brief"));
-        let Json(accepted) = judge(as_agent(&child), "usage-grandchild", "Accepted")
-            .await
-            .unwrap();
-        assert_eq!(accepted.kind, anyagents_core::OutcomeKind::Accepted);
-        let Json(rejected) = judge(Principal::Operator, "usage-sibling", "rejected")
-            .await
-            .unwrap();
-        assert_eq!(rejected.actor, "operator");
-
-        let report = |principal: Principal, query: UsageQuery| {
-            outcome_report(principal, State(state.clone()), Query(query))
-        };
-        let by_agent = || UsageQuery {
-            group_by: Some("agent".to_string()),
-            ..UsageQuery::default()
-        };
-        let Json(all) = report(Principal::Operator, by_agent()).await.unwrap();
-        let rows: Vec<(&str, u64, u64, u64)> = all
-            .groups
-            .iter()
-            .map(|group| {
-                (
-                    group.agent_name.as_deref().unwrap(),
-                    group.succeeded,
-                    group.failed,
-                    group.recovered,
-                )
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            vec![("usage-grandchild", 1, 0, 1), ("usage-sibling", 0, 1, 0)]
-        );
-        // Each judged agent's own usage is its cost; the rest is unattributed.
-        assert_eq!(
-            all.groups
-                .iter()
-                .map(|group| group.cost.reported_cost_micros)
-                .sum::<i64>(),
-            400 + 800
-        );
-        assert_eq!(all.unattributed.reported_cost_micros, 100 + 200 + 1600);
-        // A child sees only its subtree, and cannot widen it.
-        let Json(mine) = report(as_agent(&child), by_agent()).await.unwrap();
-        assert_eq!(mine.groups.len(), 1);
-        assert_eq!(
-            mine.groups[0].agent_name.as_deref(),
-            Some("usage-grandchild")
-        );
-        assert_eq!(mine.unattributed.reported_cost_micros, 200);
-        let err = report(
-            as_agent(&child),
-            UsageQuery {
-                agent: Some("usage-sibling".to_string()),
-                ..UsageQuery::default()
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        let err = report(
-            Principal::Operator,
-            UsageQuery {
-                group_by: Some("day".to_string()),
-                ..UsageQuery::default()
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn skill_reads_are_recorded_only_for_the_calling_agent() {
-        let (_dir, state, root, ..) = usage_fixture();
-        let read = |principal: Principal, file: &str| {
-            skill_read_route(
-                principal,
-                State(state.clone()),
-                Json(SkillReadRequest {
-                    skill: "prove-it".to_string(),
-                    file: file.to_string(),
-                    sha256: "d".repeat(64),
-                }),
-            )
-        };
-        let as_root = || Principal::Agent {
-            agent_id: root.id.clone(),
-            name: root.name.clone(),
-        };
-        let Json(recorded) = read(as_root(), "SKILL.md").await.unwrap();
-        assert_eq!(recorded["recorded"], true);
-        let err = read(as_root(), "../escape").await.unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        let err = read(Principal::Operator, "SKILL.md").await.unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
     async fn usage_rpc_enforces_causal_authorization_boundary() {
         let (_dir, state, root, child, grandchild, sibling, _other) = usage_fixture();
         let op = Principal::Operator;
@@ -18358,50 +17685,6 @@ exec '{}' "$@"
         .unwrap();
         assert_eq!(r.totals.input_tokens, 600);
         assert_eq!(r.buckets.len(), 2);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn takeover_pages_are_served_under_their_key_on_the_public_listener() {
-        use axum::body::to_bytes;
-        let page = Router::new()
-            .route(
-                "/",
-                get(|uri: axum::http::Uri| async move { uri.to_string() }),
-            )
-            .route("/ws", get(|| async { "ws" }));
-        crate::workstation::takeover::mount_router("k1", page);
-        let call = |uri: &str| {
-            takeover_page_route(
-                axum::extract::Request::get(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-        };
-        let redirect = call("/v1/webhooks/takeover/k1?token=t").await;
-        assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            redirect.headers()["location"],
-            "/v1/webhooks/takeover/k1/?token=t",
-            "relative assets need a directory URL"
-        );
-        let body = |r: Response| async move {
-            String::from_utf8(to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap()
-        };
-        assert_eq!(
-            body(call("/v1/webhooks/takeover/k1/?token=t").await).await,
-            "/?token=t"
-        );
-        assert_eq!(body(call("/v1/webhooks/takeover/k1/ws").await).await, "ws");
-        assert_eq!(
-            call("/v1/webhooks/takeover/zz/").await.status(),
-            StatusCode::NOT_FOUND
-        );
-        crate::workstation::takeover::unmount("k1");
-        assert_eq!(
-            call("/v1/webhooks/takeover/k1/").await.status(),
-            StatusCode::NOT_FOUND
-        );
     }
 
     #[tokio::test]
@@ -19418,10 +18701,15 @@ exec '{}' "$@"
             });
             let list = tools_list().to_string();
 
-            // 1) Remote-sandboxed agent admits `?profile=full` on `/mcp` and `/v1/webhooks/mcp`.
-            for path in ["/mcp?profile=full", "/v1/webhooks/mcp?profile=full"] {
+            // 1) Both sandboxed and cloud agents receive the identical 7-tool universal MCP surface
+            // on `/mcp`, `/v1/webhooks/mcp`, and legacy `?profile=...` URLs.
+            for (tok, path) in [
+                (sbx_remote.clone(), "/mcp"),
+                (sbx_remote.clone(), "/v1/webhooks/mcp"),
+                (sbx_remote.clone(), "/mcp?profile=full"),
+                (cloud_remote.clone(), "/mcp?profile=full"),
+            ] {
                 let list_body = list.clone();
-                let tok = sbx_remote.clone();
                 let (status, body) = tokio::task::spawn_blocking(move || {
                     let hdrs = [("authorization", format!("Bearer {tok}"))];
                     let refs: Vec<(&str, &str)> =
@@ -19431,22 +18719,12 @@ exec '{}' "$@"
                 .await
                 .unwrap();
                 assert_eq!(status, 200, "{path}: {body}");
-                let tools_str = body.to_string();
-                assert!(tools_str.contains("\"code\""), "{path}: {tools_str}");
-                assert!(tools_str.contains("\"web_search\""), "{path}: {tools_str}");
-                assert!(tools_str.contains("\"browser\""), "{path}: {tools_str}");
+                assert_eq!(
+                    listed_tools(&body),
+                    crate::mcp::UNIVERSAL_MCP_TOOLS,
+                    "{path}"
+                );
             }
-
-            // 2) Cloud-only harness MUST NOT receive `?profile=full`.
-            let list_body = list.clone();
-            let (status, _) = tokio::task::spawn_blocking(move || {
-                let hdrs = [("authorization", format!("Bearer {cloud_remote}"))];
-                let refs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                raw_http(addr, "POST", "/mcp?profile=full", &refs, &list_body)
-            })
-            .await
-            .unwrap();
-            assert_eq!(status, 403);
 
             // 3) Both `/v1/responses` and `/gateway/v1/responses` work on the webhook router.
             for path in ["/gateway/v1/responses", "/v1/responses"] {
@@ -19651,6 +18929,19 @@ exec '{}' "$@"
             !body.contains("ANYAGENTS_DATA_DIR"),
             "Dockerfile must not reference dead ANYAGENTS_DATA_DIR env var"
         );
+        for heavy in [
+            "chromium",
+            "sway",
+            "wayvnc",
+            "fonts-noto-core",
+            "nodejs",
+            "oven/bun",
+        ] {
+            assert!(
+                !body.contains(heavy),
+                "slim coordinator Dockerfile must not install `{heavy}`"
+            );
+        }
     }
 
     #[test]
@@ -19755,7 +19046,7 @@ exec '{}' "$@"
         let cfg_b = anyagents_core::agent_config_dir(dir_b.path(), &agent.id);
         assert!(!cfg_b.exists());
 
-        // 3. Replica B serves HTTP MCP (`?profile=full`) using PG `agent_sandbox_bindings`
+        // 3. Replica B serves HTTP MCP using PG `agent_sandbox_bindings`
         //    and direct `Principal::Agent` injection WITHOUT calling `operator::ensure()`.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -19767,9 +19058,6 @@ exec '{}' "$@"
             let resp = mcp_post_route(
                 State(state_b.clone()),
                 headers.clone(),
-                Query(McpRouteQuery {
-                    profile: Some("full".to_string()),
-                }),
                 axum::body::Bytes::from(
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc": "2.0",
@@ -19789,20 +19077,18 @@ exec '{}' "$@"
             });
             assert_eq!(resp.status(), StatusCode::OK);
             let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-            let text = String::from_utf8_lossy(&bytes);
-            assert!(
-                text.contains("\"code\""),
-                "replica B must grant ?profile=full from PG agent_sandbox_bindings: {text}"
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                listed_tools(&parsed),
+                crate::mcp::UNIVERSAL_MCP_TOOLS,
+                "replica B must expose the universal 7-tool MCP surface"
             );
 
-            // Also call an MCP tool (`whoami` / `inbox`) to verify the in-process router accepts
+            // Also call an MCP tool (`inbox`) to verify the in-process router accepts
             // `InjectedPrincipal` cleanly with zero local capability file on replica B!
             let call_resp = mcp_post_route(
                 State(state_b.clone()),
                 headers,
-                Query(McpRouteQuery {
-                    profile: Some("full".to_string()),
-                }),
                 axum::body::Bytes::from(
                     serde_json::to_vec(&serde_json::json!({
                         "jsonrpc": "2.0",

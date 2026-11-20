@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 #[derive(Args, Clone, Debug)]
 pub struct McpProxyArgs {
-    /// Target coordinator MCP URL (typically `https://<host>/mcp?profile=full`).
+    /// Target coordinator MCP URL (typically `https://<host>/mcp`).
     #[arg(long)]
     pub url: Option<String>,
     /// Path to file containing the current bearer capability token (hot-reloaded per call).

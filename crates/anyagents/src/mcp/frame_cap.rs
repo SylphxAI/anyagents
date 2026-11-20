@@ -47,7 +47,7 @@ pub(super) fn artifact_info(path: &Path, bytes: &[u8]) -> serde_json::Value {
     serde_json::json!({
         "path": path, "bytes": bytes.len(), "sha256": sha256_hex(bytes),
         "format": "json", "mode": "0600",
-        "read": "In code, const p=await workspace.read({path,byte_offset,max_bytes:4096}); return {content:p.content,byte_offset:p.byte_offset,bytes_read:p.bytes_read,total_bytes:p.total_bytes,sha256:p.sha256,truncated:p.truncated}; concatenate content, advance byte_offset by bytes_read until truncated=false; verify total_bytes and sha256 before JSON.parse"
+        "read": "Read the JSON file at `path` directly and verify `bytes` and `sha256` before parsing."
     })
 }
 
@@ -257,7 +257,7 @@ mod stdio_frame_cap_tests {
 
     #[test]
     fn tools_list_frame_stays_below_48_kib() {
-        let tools = tool_definitions(McpProfile::Full);
+        let tools = tool_definitions();
         assert!(!tools.is_empty());
         let frame = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -395,7 +395,8 @@ mod stdio_frame_cap_tests {
             .unwrap();
         let png = png.into_inner();
         assert!(png.len() > 2_200_000);
-        let media = serde_json::json!({"type":"image","mimeType":"image/png","data":crate::computer::base64_encode(&png)});
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+        let media = serde_json::json!({"type":"image","mimeType":"image/png","data":encoded});
         let nested = serde_json::json!({"result":{"visionImage": media.clone()}});
         for content in [
             serde_json::json!([media.clone()]),

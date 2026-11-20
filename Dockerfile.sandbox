@@ -3,15 +3,17 @@
 # Open-source, vendor-neutral multi-stage sandbox image for AnyAgents.
 #
 # Targets:
-#   - guest-builder : compiles the release `anyagents-guest`, `agent-code-mode`
-#                     (`agent-tools`), and `agent-workstation` binaries from `Cargo.lock`
+#   - guest-builder : compiles the release `anyagents-guest`, `anyagents-mcp-browser`,
+#                     `anyagents-mcp-web`, and `agent-code-mode` (`agent-tools`)
+#                     binaries from `Cargo.lock`
 #   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
-#                     `agent-code-mode`, `agent-workstation`, persistent
+#                     `agent-code-mode`, persistent
 #                     `/home/user/agent-data/{state,workspace}` layout, and standard CLI
 #                     utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
-#   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup)
-#                     and `bun` for building and testing Rust + JS/TS repositories
-#   - sandbox-full  : extends `sandbox-dev` with optional CLI harnesses selected via
+#   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup),
+#                     `bun`, and the standalone `anyagents-mcp-web` MCP server
+#   - sandbox-full  : extends `sandbox-dev` with the standalone `anyagents-mcp-browser`
+#                     MCP server and optional CLI harnesses selected via
 #                     `--build-arg INSTALL_HARNESSES="..."` (including opt-in `spiron` via
 #                     `SPIRON_INSTALL_URL` or `SPIRON_NPM_PKG`)
 #
@@ -36,8 +38,9 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 
 # ------------------------------------------------------------------------------
-# Stage 1: Build standalone release `anyagents-guest`, `agent-code-mode`, and
-#          `agent-workstation` binaries from locked workspace dependencies
+# Stage 1: Build standalone release `anyagents-guest`, `anyagents-mcp-browser`,
+#          `anyagents-mcp-web`, and `agent-code-mode` binaries from locked
+#          workspace dependencies
 # ------------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS guest-builder
 
@@ -51,17 +54,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-RUN cargo build --release --locked -p anyagents-guest --bin anyagents-guest \
+RUN cargo build --release --locked \
+        -p anyagents-guest --bin anyagents-guest \
+        -p anyagents-mcp-browser --bin anyagents-mcp-browser \
+        -p anyagents-mcp-web --bin anyagents-mcp-web \
     && AGENT_TOOLS_MANIFEST="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "agent-tools") | .manifest_path' | head -n 1)" \
-    && AGENT_WS_MANIFEST="$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "agent-workstation") | .manifest_path' | head -n 1)" \
     && test -n "$AGENT_TOOLS_MANIFEST" \
-    && test -n "$AGENT_WS_MANIFEST" \
     && cargo build --release --manifest-path "$AGENT_TOOLS_MANIFEST" --target-dir /src/target --bin agent-code-mode \
-    && cargo build --release --manifest-path "$AGENT_WS_MANIFEST" --target-dir /src/target --bin agent-workstation \
     && (strip \
         /src/target/release/anyagents-guest \
-        /src/target/release/agent-code-mode \
-        /src/target/release/agent-workstation || true)
+        /src/target/release/anyagents-mcp-browser \
+        /src/target/release/anyagents-mcp-web \
+        /src/target/release/agent-code-mode || true)
 
 # ------------------------------------------------------------------------------
 # Stage 2: Minimal vendor-neutral developer sandbox (`sandbox-base`)
@@ -85,6 +89,7 @@ RUN apt-get update \
         chromium \
         curl \
         fd-find \
+        fonts-noto-cjk \
         fonts-noto-core \
         git \
         gnupg \
@@ -136,15 +141,13 @@ RUN apt-get update \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install `anyagents-guest` runtime supervisor + MCP proxy alongside unified
-# `agent-code-mode` (`agent-tools`) and `agent-workstation` binaries.
+# Install `anyagents-guest` runtime supervisor + MCP proxy alongside
+# `agent-code-mode` (`agent-tools`).
 COPY --from=guest-builder /src/target/release/anyagents-guest /usr/local/bin/anyagents-guest
 COPY --from=guest-builder /src/target/release/agent-code-mode /usr/local/bin/agent-code-mode
-COPY --from=guest-builder /src/target/release/agent-workstation /usr/local/bin/agent-workstation
 RUN chmod 0755 \
     /usr/local/bin/anyagents-guest \
-    /usr/local/bin/agent-code-mode \
-    /usr/local/bin/agent-workstation
+    /usr/local/bin/agent-code-mode
 
 # Create non-root `user` and unified persistent volume layout under `/home/user/agent-data`.
 # Mounting a single persistent volume at `/home/user/agent-data` preserves BOTH agent runtime
@@ -163,8 +166,7 @@ ENV HOME=/home/user \
     ANYAGENTS_GUEST_STATE_DIR=/home/user/agent-data/state \
     ANYAGENTS_GUEST_WORKDIR=/home/user/agent-data/workspace \
     ANYAGENTS_SANDBOX_GUEST_PATH=/usr/local/bin/anyagents-guest \
-    ANYAGENTS_CODE_MODE_BIN=/usr/local/bin/agent-code-mode \
-    ANYAGENTS_WORKSTATION_BIN=/usr/local/bin/agent-workstation
+    ANYAGENTS_CODE_MODE_BIN=/usr/local/bin/agent-code-mode
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
@@ -216,14 +218,18 @@ RUN apt-get update \
     && cargo --version
 
 COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=guest-builder /src/target/release/anyagents-mcp-web /usr/local/bin/anyagents-mcp-web
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
+    && chmod 0755 /usr/local/bin/anyagents-mcp-web \
+    && chown -R "${USER_UID}:${USER_GID}" /home/user \
     && bun --version
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
 
 # ------------------------------------------------------------------------------
-# Stage 4: Full sandbox with dev toolchains + opt-in CLI harnesses (`sandbox-full`)
+# Stage 4: Full sandbox with dev toolchains, standalone browser/web MCP servers,
+#          and opt-in CLI harnesses (`sandbox-full`)
 # ------------------------------------------------------------------------------
 FROM sandbox-dev AS sandbox-full
 
@@ -238,10 +244,13 @@ ARG SPIRON_INSTALL_URL=""
 ARG SPIRON_NPM_PKG=""
 
 LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
-      org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable CLI harnesses" \
+      org.opencontainers.image.description="Open-source AnyAgents sandbox image with configurable CLI harnesses and standalone browser/web MCP servers" \
       org.opencontainers.image.licenses="MIT"
 
 USER root
+
+COPY --from=guest-builder /src/target/release/anyagents-mcp-browser /usr/local/bin/anyagents-mcp-browser
+RUN chmod 0755 /usr/local/bin/anyagents-mcp-browser
 
 RUN set -eu; \
     raw="$(printf '%s' "${INSTALL_HARNESSES}" | tr ',' ' ')"; \
@@ -283,7 +292,9 @@ RUN set -eu; \
     if [ -n "$npm_pkgs" ]; then \
         npm install -g --no-audit --no-fund $npm_pkgs; \
         npm cache clean --force; \
-    fi
+    fi; \
+    mkdir -p /home/user/.config /home/user/.cache /home/user/.local/bin; \
+    chown -R "${USER_UID}:${USER_GID}" /home/user
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
