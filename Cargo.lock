@@ -262,6 +262,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "ureq",
+ "url",
  "uuid",
 ]
 
@@ -447,12 +449,15 @@ dependencies = [
  "agent-workstation",
  "base64 0.22.1",
  "clap",
+ "flate2",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
+ "ureq",
  "url",
 ]
 

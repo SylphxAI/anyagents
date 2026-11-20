@@ -6,6 +6,7 @@
 
 mod address;
 pub mod boundary;
+pub mod browser_profiles_store;
 pub mod db;
 mod error;
 mod host_cursor;
@@ -23,7 +24,10 @@ mod migrate;
 pub mod quote;
 pub mod raw_segment;
 pub mod redaction;
+pub mod s3_media;
+pub mod s3_store;
 mod secret;
+pub mod secrets_store;
 pub mod stateless;
 pub mod storage;
 mod store;
@@ -32,10 +36,23 @@ pub use address::{Address, AddressError};
 pub use anyagents_harness::{
     atomic_write_file, atomic_write_in_existing_dir, atomic_write_nonempty_file, atomic_write_with,
 };
+pub use browser_profiles_store::{
+    BrowserProfileActor, BrowserProfileGrant, MAX_BROWSER_PROFILE_NAME_LEN,
+    validate_browser_profile_name,
+};
 pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
+pub use s3_store::{
+    DEFAULT_MAX_S3_OBJECT_BYTES, ObjectMeta, S3_ACCESS_KEY_ID_ENV, S3_BUCKET_ENV, S3_ENDPOINT_ENV,
+    S3_FORCE_PATH_STYLE_ENV, S3_PREFIX_ENV, S3_REGION_ENV, S3_SECRET_ACCESS_KEY_ENV, S3Config,
+    S3Store,
+};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
+pub use secrets_store::{
+    DeploymentSecretMetadata, is_reserved_secret_env_key, require_deployment_master_key,
+    validate_secret_env_key, validate_secret_name,
+};
 pub use stateless::{
     AGENT_FILE_NAMESPACES, BlobEntry, BlobMeta, CAPABILITY_KEY_ENV, CoordinatorLease,
     CoordinatorLeaseGuard, CoordinatorLockBackend, DEFAULT_LEASE_TTL,

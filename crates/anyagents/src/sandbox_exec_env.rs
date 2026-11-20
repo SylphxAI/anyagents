@@ -41,6 +41,7 @@ pub(crate) fn is_blocked_sandbox_env_key(key: &str) -> bool {
             | "ANYAGENTS_GATEWAY_TOKEN"
     ) || upper.starts_with("ANYAGENTS_OPERATOR_")
         || upper.starts_with("ANYAGENTS_TICK_")
+        || upper.starts_with("ANYAGENTS_S3_")
         || upper.starts_with(SANDBOX_ENV_PREFIX)
 }
 
@@ -218,6 +219,10 @@ mod tests {
             (
                 "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_GATEWAY_TOKEN".into(),
                 "gw-secret".into(),
+            ),
+            (
+                "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_S3_SECRET_KEY".into(),
+                "s3-secret".into(),
             ),
             (
                 "ANYAGENTS_SANDBOX_ENV_ANYAGENTS_SANDBOX_ENV_NESTED".into(),

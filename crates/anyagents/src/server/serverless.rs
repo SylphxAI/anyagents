@@ -616,24 +616,7 @@ async fn dispatch_sandbox_turn(
     let (ensured, effective_prompt) = match ensured {
         Ok(pair) => pair,
         Err(err) => {
-            let store_fail = Arc::clone(&store);
-            let tid_fail = turn_id.clone();
-            let err_fail = err.clone();
-            let _ = run_store_blocking(move || {
-                let _ = store_fail.remote_turn_store().settle_turn(
-                    &tid_fail,
-                    &SettleRemoteTurn {
-                        status: "failed".to_string(),
-                        result_text: None,
-                        error_text: Some(err_fail),
-                        usage_json: None,
-                        cursor: None,
-                        settled_at_ms: now_ms(),
-                    },
-                );
-                Ok(())
-            })
-            .await;
+            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
             return Err(err);
         }
     };
@@ -687,33 +670,26 @@ async fn dispatch_sandbox_turn(
         .with_cwd(ensured.handle.workdir.clone())
         .with_stdin(effective_prompt.into_bytes())
         .with_timeout_ms(DETACHED_EXEC_TIMEOUT_MS);
-    exec_req
-        .env
-        .extend(crate::sandbox_exec::filter_sandbox_launch_env(
-            &input.agent.launch_env,
-        ));
+    let store_env = Arc::clone(&store);
+    let agent_env = input.agent.clone();
+    let resolved_env = run_store_blocking(move || {
+        let mut env = BTreeMap::new();
+        super::secrets::merge_sandbox_exec_env(&store_env, &agent_env, &mut env)?;
+        Ok(env)
+    })
+    .await;
+    match resolved_env {
+        Ok(env) => exec_req.env.extend(env),
+        Err(err) => {
+            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
+            return Err(err);
+        }
+    }
 
     let out = match provider.exec(&ensured.handle, &exec_req).await {
         Ok(o) => o,
         Err(err) => {
-            let store_fail = Arc::clone(&store);
-            let tid_fail = turn_id.clone();
-            let err_fail = err.clone();
-            let _ = run_store_blocking(move || {
-                let _ = store_fail.remote_turn_store().settle_turn(
-                    &tid_fail,
-                    &SettleRemoteTurn {
-                        status: "failed".to_string(),
-                        result_text: None,
-                        error_text: Some(err_fail),
-                        usage_json: None,
-                        cursor: None,
-                        settled_at_ms: now_ms(),
-                    },
-                );
-                Ok(())
-            })
-            .await;
+            fail_remote_turn(&store, &input.agent.id, &turn_id, err.clone()).await;
             return Err(err);
         }
     };
@@ -724,25 +700,8 @@ async fn dispatch_sandbox_turn(
             out.exit_code,
             out.stderr.trim()
         );
-        let store_fail = Arc::clone(&store);
-        let tid_fail = turn_id.clone();
-        let diag_fail = diag.clone();
-        let _ = run_store_blocking(move || {
-            let _ = store_fail.remote_turn_store().settle_turn(
-                &tid_fail,
-                &SettleRemoteTurn {
-                    status: "failed".to_string(),
-                    result_text: None,
-                    error_text: Some(diag_fail),
-                    usage_json: None,
-                    cursor: None,
-                    settled_at_ms: now_ms(),
-                },
-            );
-            Ok(())
-        })
-        .await;
-        return Err(diag);
+        let masked = fail_remote_turn(&store, &input.agent.id, &turn_id, diag).await;
+        return Err(masked);
     }
 
     let remote_run_id = serde_json::from_str::<Value>(out.stdout.trim())
@@ -801,67 +760,7 @@ fn hydrate_prompt_media_for_sandbox(
     state_dir: &str,
     prompt: &str,
 ) -> String {
-    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
-    let mut prefixes = Vec::new();
-    let dir_str = media_dir
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
-    if !dir_str.is_empty() {
-        prefixes.push(format!("{dir_str}/"));
-    }
-    if dir_str != "/var/lib/anyagents/media" {
-        prefixes.push("/var/lib/anyagents/media/".to_string());
-    }
-    let remote_media_prefix = format!("{}/media", state_dir.trim_end_matches('/'));
-    let mut rewritten = prompt.to_string();
-    let mut hydrated_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for prefix in &prefixes {
-        let mut search_from = 0usize;
-        while let Some(rel_idx) = rewritten[search_from..].find(prefix.as_str()) {
-            let start = search_from + rel_idx + prefix.len();
-            let rest = &rewritten[start..];
-            let end_offset = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '>' | ',' | ';')
-                })
-                .unwrap_or(rest.len());
-            let fname = rest[..end_offset].trim();
-            if !fname.is_empty()
-                && !fname.contains('/')
-                && !fname.contains('\\')
-                && !fname.contains("..")
-            {
-                hydrated_names.insert(fname.to_string());
-            }
-            search_from = start + end_offset;
-        }
-    }
-    if hydrated_names.is_empty() {
-        return rewritten;
-    }
-    let stage_dir = cfg_dir.join("media");
-    let _ = std::fs::create_dir_all(&stage_dir);
-    for fname in hydrated_names {
-        let bytes_opt = store
-            .blob_store()
-            .get_deployment_blob("media", &fname)
-            .ok()
-            .flatten()
-            .map(|b| b.content)
-            .or_else(|| std::fs::read(media_dir.join(&fname)).ok());
-        if let Some(bytes) = bytes_opt
-            && !bytes.is_empty()
-            && std::fs::write(stage_dir.join(&fname), &bytes).is_ok()
-        {
-            for prefix in &prefixes {
-                let from = format!("{prefix}{fname}");
-                let to = format!("{remote_media_prefix}/{fname}");
-                rewritten = rewritten.replace(&from, &to);
-            }
-        }
-    }
-    rewritten
+    super::s3_media_profiles::hydrate_prompt_media_for_sandbox(store, cfg_dir, state_dir, prompt)
 }
 
 /// When `ANYAGENTS_SERVERLESS=true`, synchronously dispatch all pending undelivered
@@ -999,16 +898,48 @@ pub(crate) struct SettleAndDeliverResult {
     pub notified_agent_id: Option<AgentId>,
 }
 
+async fn fail_remote_turn(
+    store: &Arc<Store>,
+    agent_id: &AgentId,
+    turn_id: &str,
+    err: String,
+) -> String {
+    let store_fail = Arc::clone(store);
+    let aid = agent_id.clone();
+    let tid = turn_id.to_string();
+    let err_in = err.clone();
+    run_store_blocking(move || {
+        let masked = super::secrets::mask_text_for_agent(&store_fail, &aid, &err_in);
+        let _ = store_fail.remote_turn_store().settle_turn(
+            &tid,
+            &SettleRemoteTurn {
+                status: "failed".to_string(),
+                result_text: None,
+                error_text: Some(masked.clone()),
+                usage_json: None,
+                cursor: None,
+                settled_at_ms: now_ms(),
+            },
+        );
+        Ok(masked)
+    })
+    .await
+    .unwrap_or_else(|_| anyagents_core::masking::mask_known_secrets(&err).into_owned())
+}
+
 /// Idempotently settle `turn_id` in `pending_remote_turns`, persist transcript + usage
 /// records in PostgreSQL, update runtime & sandbox idle state, and trigger outbound
 /// delivery (Telegram or parent/peer agent mailbox) strictly once.
 pub(crate) fn settle_remote_turn_and_deliver(
     store: &Store,
     turn_id: &str,
-    settlement: SettleRemoteTurn,
+    mut settlement: SettleRemoteTurn,
     session_id: Option<&str>,
     inflight_children: i32,
 ) -> Result<Option<SettleAndDeliverResult>, String> {
+    if let Ok(Some(existing)) = store.remote_turn_store().get_turn(turn_id) {
+        super::secrets::mask_settlement_for_agent(store, &existing.agent_id, &mut settlement);
+    }
     let Some(outcome) = store
         .remote_turn_store()
         .settle_turn(turn_id, &settlement)

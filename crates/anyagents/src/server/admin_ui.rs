@@ -23,6 +23,7 @@ use super::{ApiError, AppState, admin_auth, require_operator, serverless, spawn_
 
 const INDEX_HTML: &str = include_str!("../../assets/admin/index.html");
 const APP_JS: &str = include_str!("../../assets/admin/app.js");
+const SECRETS_JS: &str = include_str!("../../assets/admin/secrets.js");
 const STYLES_CSS: &str = include_str!("../../assets/admin/styles.css");
 
 const ADMIN_CSP: &str =
@@ -59,6 +60,10 @@ pub(crate) async fn index_route() -> Response {
 
 pub(crate) async fn app_js_route() -> Response {
     static_asset_response("application/javascript; charset=utf-8", APP_JS)
+}
+
+pub(crate) async fn secrets_js_route() -> Response {
+    static_asset_response("application/javascript; charset=utf-8", SECRETS_JS)
 }
 
 pub(crate) async fn styles_css_route() -> Response {
@@ -172,6 +177,7 @@ pub(crate) fn mount_admin_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/admin", get(index_route))
         .route("/admin/", get(index_route))
         .route("/admin/assets/app.js", get(app_js_route))
+        .route("/admin/assets/secrets.js", get(secrets_js_route))
         .route("/admin/assets/styles.css", get(styles_css_route))
         .route("/admin/auth/login", get(admin_auth::login_route))
         .route("/admin/auth/callback", get(admin_auth::callback_route))

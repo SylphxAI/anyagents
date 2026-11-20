@@ -113,6 +113,7 @@ RUN apt-get update \
         unzip \
         wayvnc \
         xz-utils \
+        zstd \
     && fc-cache -f \
     && mkdir -p /etc/apt/keyrings /etc/anyagents /var/lib/anyagents \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \

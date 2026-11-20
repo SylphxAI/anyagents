@@ -315,6 +315,9 @@ pub(super) struct AgentsArgs {
     /// Optional raw Telegram bot HTTP API token when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
     #[serde(default, alias = "bot_token")]
     pub(super) token: Option<String>,
+    /// Optional persistent browser profile names to grant when `action` is `"spawn"`, `"create"`, `"update"`, `"describe"`, or `"browser_profiles"` (enforces exact `child ⊆ parent` delegation; non-admin self-mutation is denied).
+    #[serde(default)]
+    pub(super) browser_profiles: Option<Vec<String>>,
     /// Zero-based position in the deterministically sorted list. Continue with
     /// `next_cursor` and the same query, parent and state; this is not a snapshot.
     #[serde(default, alias = "offset")]
@@ -338,6 +341,11 @@ pub(super) struct AgentsArgs {
     /// `outcomes`: `model`, `harness`, `role`, `profile`, `agent` or `skill`.
     #[serde(default)]
     pub(super) group_by: Option<String>,
+    /// Optional list of named deployment secret bundles to grant when `action` is
+    /// `"spawn"`, `"create"`, `"update"`, or `"secrets"`. Defaults to `[]` on
+    /// create/spawn. Non-admin parents may only grant secrets they themselves hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -404,6 +412,13 @@ pub(super) struct SpawnArgs {
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
     pub(super) prompt: Option<String>,
+    /// Optional persistent browser profile names to grant to the spawned child (`child ⊆ parent`).
+    #[serde(default)]
+    pub(super) browser_profiles: Option<Vec<String>>,
+    /// Optional list of named deployment secret bundles to grant to the spawned agent.
+    /// Defaults to `[]` when omitted. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -439,6 +454,9 @@ pub(super) struct DescribeArgs {
     /// Set `true` to clear the agent's custom description/instructions.
     #[serde(default)]
     pub(super) clear: Option<bool>,
+    /// Optional persistent browser profile names to grant to the target agent (`child ⊆ parent`).
+    #[serde(default)]
+    pub(super) browser_profiles: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -535,6 +553,9 @@ pub(super) struct SubagentsArgs {
     /// Optional raw Telegram bot HTTP API token when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
     #[serde(default, alias = "bot_token")]
     pub(super) token: Option<String>,
+    /// Optional persistent browser profile names to grant when `action` is `"spawn"`, `"create"`, `"update"`, `"describe"`, or `"browser_profiles"` (enforces exact `child ⊆ parent` delegation; non-admin self-mutation is denied).
+    #[serde(default)]
+    pub(super) browser_profiles: Option<Vec<String>>,
     /// Zero-based position in the deterministically sorted list. Continue with
     /// `next_cursor` and the same query, parent and state; this is not a snapshot.
     #[serde(default, alias = "offset")]
@@ -542,6 +563,10 @@ pub(super) struct SubagentsArgs {
     /// Page size for list (default 100, clamped to 1..=100), or recent turns for inspect (default 10).
     #[serde(default)]
     pub(super) limit: Option<usize>,
+    /// Optional list of named deployment secret bundles when `action` is `"spawn"`,
+    /// `"update"`, or `"secrets"`. Non-admin parents may only grant secrets they hold.
+    #[serde(default)]
+    pub(super) secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

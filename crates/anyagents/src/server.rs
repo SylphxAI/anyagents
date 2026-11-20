@@ -48,7 +48,9 @@ mod profiles;
 mod quota_rotation;
 mod reap_queue;
 mod roles;
+pub(crate) mod s3_media_profiles;
 mod schedules;
+pub(crate) mod secrets;
 pub(crate) mod serverless;
 mod serverless_failure;
 mod types;
@@ -155,11 +157,13 @@ fn build_webhook_router(state: AppState) -> Router {
 fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .merge(agents::router())
+        .merge(secrets::router())
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(channels_groups::router())
         .merge(roles::router())
         .merge(ops::router())
+        .merge(s3_media_profiles::router())
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {

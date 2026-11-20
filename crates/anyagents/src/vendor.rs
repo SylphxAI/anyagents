@@ -1137,6 +1137,31 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
     None
 }
 
+fn is_untrusted_launch_env(k: &str) -> bool {
+    k.starts_with("ANYAGENTS_S3_")
+        || matches!(
+            k,
+            anyagents_harness::SEAT_LAUNCH_ENV
+                | anyagents_harness::SEAT_PEERS_ENV
+                | "ANYAGENTS_DATA"
+                | anyagents_core::STATE_DIR_ENV
+                | anyagents_core::WORKSPACES_DIR_ENV
+                | anyagents_core::SCRATCH_DIR_ENV
+                | anyagents_core::GIT_POOL_DIR_ENV
+                | "ANYAGENTS_AGENT_CONFIG"
+                | "ANYAGENTS_AGENT_UID"
+                | "ANYAGENTS_OPERATOR_TOKEN"
+                | "ANYAGENTS_OPERATOR_TOKEN_FILE"
+                | "ANYAGENTS_CAPABILITY_KEY"
+                | "ANYAGENTS_MASTER_KEY"
+                | "ANYAGENTS_TICK_TOKEN"
+                | "ANYAGENTS_DATABASE_URL"
+                | "ANYAGENTS_DIRECT_DATABASE_URL"
+                | "LD_PRELOAD"
+                | "LD_LIBRARY_PATH"
+        )
+}
+
 fn vendor_launch_inner(
     mut request: LaunchRequest,
     authority: Option<&anyagents_core::Store>,
@@ -1146,29 +1171,7 @@ fn vendor_launch_inner(
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = std::mem::take(&mut request.extra_env)
         .into_iter()
-        .filter(|(k, _)| {
-            !matches!(
-                k.as_str(),
-                anyagents_harness::SEAT_LAUNCH_ENV
-                    | anyagents_harness::SEAT_PEERS_ENV
-                    | "ANYAGENTS_DATA"
-                    | anyagents_core::STATE_DIR_ENV
-                    | anyagents_core::WORKSPACES_DIR_ENV
-                    | anyagents_core::SCRATCH_DIR_ENV
-                    | anyagents_core::GIT_POOL_DIR_ENV
-                    | "ANYAGENTS_AGENT_CONFIG"
-                    | "ANYAGENTS_AGENT_UID"
-                    | "ANYAGENTS_OPERATOR_TOKEN"
-                    | "ANYAGENTS_OPERATOR_TOKEN_FILE"
-                    | "ANYAGENTS_CAPABILITY_KEY"
-                    | "ANYAGENTS_MASTER_KEY"
-                    | "ANYAGENTS_TICK_TOKEN"
-                    | "ANYAGENTS_DATABASE_URL"
-                    | "ANYAGENTS_DIRECT_DATABASE_URL"
-                    | "LD_PRELOAD"
-                    | "LD_LIBRARY_PATH"
-            )
-        })
+        .filter(|(k, _)| !is_untrusted_launch_env(k))
         .collect();
     // The data directory the deployment serves, so an agent's tools find the
     // one socket and one config directory that hold its capability. Never a
@@ -1242,29 +1245,7 @@ fn vendor_launch_inner(
         .agent
         .launch_env
         .iter()
-        .filter(|(k, _)| {
-            !matches!(
-                k.as_str(),
-                anyagents_harness::SEAT_LAUNCH_ENV
-                    | anyagents_harness::SEAT_PEERS_ENV
-                    | "ANYAGENTS_DATA"
-                    | anyagents_core::STATE_DIR_ENV
-                    | anyagents_core::WORKSPACES_DIR_ENV
-                    | anyagents_core::SCRATCH_DIR_ENV
-                    | anyagents_core::GIT_POOL_DIR_ENV
-                    | "ANYAGENTS_AGENT_CONFIG"
-                    | "ANYAGENTS_AGENT_UID"
-                    | "ANYAGENTS_OPERATOR_TOKEN"
-                    | "ANYAGENTS_OPERATOR_TOKEN_FILE"
-                    | "ANYAGENTS_CAPABILITY_KEY"
-                    | "ANYAGENTS_MASTER_KEY"
-                    | "ANYAGENTS_TICK_TOKEN"
-                    | "ANYAGENTS_DATABASE_URL"
-                    | "ANYAGENTS_DIRECT_DATABASE_URL"
-                    | "LD_PRELOAD"
-                    | "LD_LIBRARY_PATH"
-            )
-        })
+        .filter(|(k, _)| !is_untrusted_launch_env(k))
         .cloned()
         .collect();
     env.append(&mut launch_env);

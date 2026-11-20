@@ -1,5 +1,7 @@
 //! JSON shapes shared by the unix-socket server and the MCP tools.
 
+use std::collections::BTreeMap;
+
 use anyagents_core::Quote;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -191,6 +193,9 @@ pub struct AgentView {
     /// is resent automatically; `anyagents outbound` retries or discards one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsettled_outbound: Vec<UnsettledOutboundView>,
+    /// Named deployment secret bundles granted to this agent (names ONLY, never values).
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 impl AgentView {
@@ -366,6 +371,95 @@ pub struct CreateAgentRequest {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Optional persistent browser profile grants to delegate to the new agent
+    /// (enforcing exact `child ⊆ parent` capability attenuation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profiles: Option<Vec<String>>,
+    /// Optional named deployment secret bundles to grant to this agent upon creation.
+    /// Defaults to `[]` when omitted. Non-admin parents may only grant secrets they hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
+}
+
+/// Body of `PATCH /v1/agents/{name}`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PatchAgentRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "instruction",
+        alias = "system_prompt"
+    )]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "allow_external"
+    )]
+    pub public: Option<bool>,
+    /// Replace this agent's granted deployment secret bundle names.
+    /// Enforces exact parent-delegated capability attenuation (`child ⊆ parent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
+    /// Replace this agent's granted persistent browser profile names.
+    /// Enforces exact parent-delegated capability attenuation (`child ⊆ parent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profiles: Option<Vec<String>>,
+}
+
+/// Body of `PUT /v1/secrets/{name}` (write-only upsert; values are never returned).
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpsertSecretRequest {
+    pub env: BTreeMap<String, String>,
+}
+
+/// Write-only metadata view of one named deployment secret bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretMetadataView {
+    pub name: String,
+    pub env_keys: Vec<String>,
+    pub updated_at_ms: i64,
+    pub granted_agent_ids: Vec<String>,
+    #[serde(default)]
+    pub granted_agents: Vec<String>,
+}
+
+/// Response body of `GET /v1/secrets`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretsListResponse {
+    pub secrets: Vec<SecretMetadataView>,
+}
+
+/// Response body of `DELETE /v1/secrets/{name}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeleteSecretResponse {
+    pub deleted: bool,
+    pub name: String,
+}
+
+/// Response body of `GET /v1/agents/{name}/secrets` and `PUT /v1/agents/{name}/secrets`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentSecretsResponse {
+    pub agent: String,
+    pub agent_id: String,
+    pub secrets: Vec<String>,
+}
+
+/// Body of `PUT /v1/agents/{name}/secrets`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetAgentSecretsRequest {
+    pub secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
