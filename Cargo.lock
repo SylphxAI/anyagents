@@ -377,8 +377,11 @@ version = "0.1.9"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]
