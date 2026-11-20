@@ -1,11 +1,13 @@
-import { useCallback, useMemo, useState } from 'react';
-import { Activity, Archive, ArrowDownUp, ArrowLeft, Bot, ChevronRight, CircleAlert, GitFork, KeyRound, Layers, Moon, Pause, Play, Plus, Search, Workflow } from 'lucide-react';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Activity, Archive, ArrowDownUp, ArrowLeft, Bot, ChevronRight, CircleAlert, GitFork, KeyRound, Layers, MessageSquare, Moon, Pause, Play, Plus, Search, Workflow } from 'lucide-react';
 import { agentPath, api, useResource } from '../api';
 import { status, states } from '../types';
 import type { Agent, Overview } from '../types';
 import { Badge, CopyButton, Dot, Empty, Heading, Panel, Problem, Status } from '../ui';
 import { Conversation } from './Conversation';
 import type { FleetAction } from './AgentAction';
+import { buildForest, projectForest } from './tree';
+import './fleet.css';
 
 const labels = { all: 'Total fleet', working: 'Working', idle: 'Idle', paused: 'Paused', errored: 'Errors', archived: 'Archived' };
 const icons = { all: Layers, working: Activity, idle: Moon, paused: Pause, errored: CircleAlert, archived: Archive };
@@ -17,30 +19,33 @@ export function Fleet({ agents, overview, selected, select, open, grants, refres
   const [filter, setFilter] = useState<typeof states[number]>('all');
   const [search, setSearch] = useState('');
   const [folded, setFolded] = useState(new Set<string>());
-  const rows = useMemo(() => {
-    const lookup = new Map(agents.flatMap(agent => [[agent.id, agent], [agent.name, agent]] as const));
-    const children = new Map<string | undefined, Agent[]>();
-    for (const a of [...agents].sort((a, b) => a.name.localeCompare(b.name))) {
-      const parent = a.parent ? lookup.get(a.parent)?.id : undefined;
-      children.set(parent, [...(children.get(parent) ?? []), a]);
+  const [filteredFolded, setFilteredFolded] = useState(new Set<string>());
+  const filtering = filter !== 'all' || Boolean(search.trim());
+  const activeFolds = filtering ? filteredFolded : folded;
+  const forest = useMemo(() => buildForest(agents), [agents]);
+  const { rows, matchCount } = useMemo(() => projectForest(forest, filter, search, activeFolds), [forest, filter, search, activeFolds]);
+  const roster = useRef<HTMLElement>(null);
+  const inspectorBack = useRef<HTMLButtonElement>(null);
+  const wasSelected = useRef(selected?.id);
+  useLayoutEffect(() => {
+    const previous = wasSelected.current;
+    wasSelected.current = selected?.id;
+    if (previous === selected?.id || !matchMedia('(max-width: 760px)').matches) return;
+    if (selected) inspectorBack.current?.focus();
+    else if (previous) {
+      const row = roster.current?.querySelector<HTMLButtonElement>(        '.tree-select[data-agent-id="' + CSS.escape(previous) + '"]');
+      (row ?? roster.current)?.focus();
     }
-    const flat: { agent: Agent; depth: number; branch: boolean }[] = [];
-    const seen = new Set<string>();
-    const query = search.trim().toLowerCase();
-    function visit(agent: Agent, depth: number, hidden = false) {
-      if (seen.has(agent.id)) return;
-      seen.add(agent.id);
-      const sub = children.get(agent.id) ?? [];
-      if (!hidden && (filter === 'all' || status(agent) === filter) &&
-        [agent.name, agent.role, agent.harness, agent.runtime, agent.model].some(field => field?.toLowerCase().includes(query))) {
-        flat.push({ agent, depth, branch: sub.length > 0 });
-      }
-      for (const child of sub) visit(child, depth + 1, hidden || (!query && filter === 'all' && folded.has(agent.id)));
-    }
-    for (const a of children.get(undefined) ?? []) visit(a, 0);
-    for (const a of agents) visit(a, 0);
-    return flat;
-  }, [agents, filter, folded, search]);
+  }, [selected?.id]);
+
+  function toggle(id: string) {
+    (filtering ? setFilteredFolded : setFolded)(before => {
+      const next = new Set(before);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }
+
   return <div className={selected ? 'fleet-workspace has-agent' : 'fleet-workspace'}>
     <Heading eyebrow="CONTROL PLANE / FLEET" title="Agent fleet" blurb="Monitor your agents, their execution state, and live conversations.">
       <button className="button primary" onClick={() => open({ kind: 'spawn' })}><Plus size={16} /> Spawn agent</button>
@@ -48,31 +53,55 @@ export function Fleet({ agents, overview, selected, select, open, grants, refres
     <section className="pulse" aria-label="Fleet pulse">{states.map(state => {
       const Icon = icons[state];
       const count = state === 'all' ? agents.length : agents.filter(agent => status(agent) === state).length;
-      return <button key={state} className={'pulse-card ' + state} aria-pressed={state === filter} onClick={() => setFilter(state === filter ? 'all' : state)}>
+      return <button key={state} className={'pulse-card ' + state} aria-pressed={state === filter} onClick={() => {
+        setFilter(state === filter ? 'all' : state); setFilteredFolded(new Set());
+      }}>
         <span className="pulse-label"><Icon size={15} />{labels[state]}</span><strong>{count.toString().padStart(2, '0')}</strong>
       </button>;
     })}</section>
     <div className={'fleet-grid' + (selected ? ' has-selection' : '')}>
-      <aside className="fleet-roster panel" aria-label="Fleet tree">
-        <div className="panel-head"><h2><GitFork size={16} /> Hierarchy</h2><Badge>{rows.length} agents</Badge></div>
-        <label className="tree-search"><Search size={16} /><input aria-label="Search agents" placeholder="Filter by name, role, model…" value={search} onChange={event => setSearch(event.target.value)} /></label>
-        <div className="tree-rows">{rows.length === 0 && <Empty>No agents match this filter.</Empty>}{rows.map(({ agent, depth, branch }) => <div key={agent.id} className={'tree-row' + (selected?.id === agent.id ? ' current' : '')} style={{ '--depth': Math.min(depth, 5) } as React.CSSProperties}>
-          {branch ? <button className="tree-expand" aria-label={(folded.has(agent.id) ? 'Expand ' : 'Collapse ') + agent.name} aria-expanded={!folded.has(agent.id)} onClick={() => setFolded(before => {
-            const next = new Set(before); if (next.has(agent.id)) next.delete(agent.id); else next.add(agent.id); return next;
-          })}><ChevronRight size={14} /></button> : <span className="tree-stem" />}
-          <button className="tree-select" aria-current={selected?.id === agent.id ? 'true' : undefined} onClick={() => select(agent.id)}>
-            <span className="tree-name"><Dot tone={status(agent)} />{agent.name}{Boolean(overview?.agents_meta?.[agent.id]?.unread_count) && <Badge>{overview?.agents_meta?.[agent.id]?.unread_count} unread</Badge>}</span>
-            <span className="tree-specs">{[agent.role, agent.harness, agent.runtime, agent.model].filter(Boolean).map((chip, index) => <Badge key={index}>{chip}</Badge>)}</span>
-          </button>
-        </div>)}</div>
+      <aside className="fleet-roster panel" aria-label="Fleet tree" ref={roster} tabIndex={-1}>
+        <div className="panel-head"><h2><GitFork size={16} /> Hierarchy</h2><Badge>{matchCount} {filtering ? (matchCount === 1 ? 'match' : 'matches') : (matchCount === 1 ? 'agent' : 'agents')}</Badge></div>
+        <label className="tree-search"><Search size={16} /><input aria-label="Search agents" placeholder="Filter by name, role, model…" value={search} onChange={event => {
+          setSearch(event.target.value); setFilteredFolded(new Set());
+        }} /></label>
+        {rows.length === 0 ? <Empty>{filtering ? 'No agents match this filter.' : 'No agents in the fleet yet.'}</Empty> :
+          <ul className="tree-rows" aria-label="Agent hierarchy" role="list">{rows.map(({ node, depth, rails, last, context, branch, expanded, stem, showParent }) => {
+            const { agent, state, activeDescendants, parent } = node;
+            const unread = overview?.agents_meta?.[agent.id]?.unread_count;
+            const specs = [['Harness', agent.harness], ['Model', agent.model], ['Profile', agent.profile]];
+            return <li key={agent.id} className={'tree-row' + (selected?.id === agent.id ? ' current' : '')}>
+              <span className="fleet-guides" aria-hidden="true">
+                {rails.map((continues, level) => <span key={level} className={continues ? 'fleet-rail continues' : 'fleet-rail'} />)}
+                {depth > 0 && !showParent && <span className={last ? 'fleet-elbow last' : 'fleet-elbow'} />}
+              </span>
+              <span className={'fleet-node-control' + (stem ? ' continues' : '')}>
+                {branch && <button type="button" className="tree-expand" aria-label={(expanded ? 'Collapse ' : 'Expand ') + agent.name} aria-expanded={expanded} onClick={() => toggle(agent.id)}><ChevronRight size={16} /></button>}
+              </span>
+              <button type="button" className="tree-select" data-agent-id={agent.id} aria-current={selected?.id === agent.id ? 'true' : undefined} onClick={() => select(agent.id)}>
+                <span className="tree-name">
+                  <span className="fleet-agent-label" title={state}><Dot tone={state} /><span>{agent.name}<span className="sr-only">, {state}</span></span></span>
+                  {node.children.length > 0 && <span className={'badge fleet-active' + (activeDescendants > 0 ? ' has-active' : '')} title="Non-archived descendants">{activeDescendants} active<span className="sr-only"> {activeDescendants === 1 ? 'descendant' : 'descendants'}</span></span>}
+                  {Boolean(unread) && <Badge>{unread} unread</Badge>}
+                  {context && <span className="fleet-ancestor">Ancestor</span>}
+                </span>
+                {parent && <span className={showParent ? 'fleet-parent' : 'sr-only'}>Parent: {parent.agent.name}</span>}
+                <span className="tree-specs">{specs.map(([label, value]) => value && <span className="badge" key={label} title={label + ': ' + value}>
+                  <span className="sr-only">{label}: </span><span>{value}</span>
+                </span>)}</span>
+                <span className="sr-only">Open conversation</span>
+                <MessageSquare className="fleet-conversation-icon" size={14} aria-hidden="true" />
+              </button>
+            </li>;
+          })}</ul>}
       </aside>
-      {selected ? <Inspector key={selected.id} agent={selected} overview={overview} back={() => select()} open={open} grants={grants} revision={refreshVersion} /> : <section className="inspector-placeholder panel"><Bot size={30} /><h2>Select an agent</h2><p>Choose an agent in the hierarchy to see its settings and conversation.</p></section>}
+      {selected ? <Inspector key={selected.id} agent={selected} overview={overview} back={() => select()} backRef={inspectorBack} open={open} grants={grants} revision={refreshVersion} /> : <section className="inspector-placeholder panel"><Bot size={30} /><h2>Select an agent</h2><p>Choose an agent in the hierarchy to see its settings and conversation.</p></section>}
     </div>
   </div>;
 }
 
-function Inspector({ agent: summary, overview, back, open, grants, revision }: {
-  agent: Agent; overview?: Overview; back: () => void; open: (action: FleetAction) => void; grants: (agent: Agent) => void; revision: number;
+function Inspector({ agent: summary, overview, back, backRef, open, grants, revision }: {
+  agent: Agent; overview?: Overview; back: () => void; backRef: React.Ref<HTMLButtonElement>; open: (action: FleetAction) => void; grants: (agent: Agent) => void; revision: number;
 }) {
   const load = useCallback((signal: AbortSignal) => api<Agent>(agentPath(summary.name), { signal }), [summary.name, revision]);
   const detail = useResource(load, 6000);
@@ -87,7 +116,7 @@ function Inspector({ agent: summary, overview, back, open, grants, revision }: {
     ['Budget cap', agent.remote_budget_micros != null ? '$' + (agent.remote_budget_micros / 1e6).toFixed(2) : undefined],
     ['Automations', agent.automations?.total]];
   return <section className="inspector min-w-0" aria-label="Agent inspector">
-    <header className="inspector-head panel"><button className="button quiet mobile-back" onClick={back}><ArrowLeft size={15} /> Fleet tree</button>
+    <header className="inspector-head panel"><button type="button" className="button quiet mobile-back" ref={backRef} onClick={back}><ArrowLeft size={15} /> Fleet tree</button>
       <div className="identity"><span className="agent-symbol"><Bot size={23} /></span><div><div className="identity-name"><h2>{agent.name}</h2><Status value={state} /></div>
         <div className="identity-id"><code>{agent.id}</code><CopyButton value={agent.id} label="Copy agent ID" /></div></div></div>
       {agent.description && <p className="agent-description">{agent.description}</p>}

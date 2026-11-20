@@ -2,12 +2,202 @@
 //! query where they would otherwise decode every agent row or ask once per
 //! listed agent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::{AgentId, Error, Store, telegram_chat_links};
-use crate::db::{DbExecExt as _, db_params};
+use super::{AgentId, AgentSummary, Error, Store, telegram_chat_links};
+use crate::db::{DbBackend, DbExec as _, DbExecExt as _, db_params};
+use crate::stateless::{PendingRemoteTurn, SandboxBinding};
+
+#[derive(Default)]
+pub struct AgentOverviewMetadata {
+    pub unread_count: i64,
+    pub sandbox_lease: Option<OverviewSandboxLease>,
+    pub active_remote_turns: Vec<OverviewRemoteTurn>,
+}
+
+#[derive(serde::Serialize)]
+pub struct OverviewSandboxLease {
+    provider: String,
+    lease_state: String,
+    lease_id: Option<String>,
+    volume_id: String,
+    lease_expires_at_ms: Option<i64>,
+    idle_since_ms: Option<i64>,
+    last_heartbeat_ms: Option<i64>,
+}
+
+impl From<SandboxBinding> for OverviewSandboxLease {
+    fn from(binding: SandboxBinding) -> Self {
+        Self {
+            provider: binding.provider,
+            lease_state: binding.lease_state,
+            lease_id: binding.lease_id,
+            volume_id: binding.volume_id,
+            lease_expires_at_ms: binding.lease_expires_at_ms,
+            idle_since_ms: binding.idle_since_ms,
+            last_heartbeat_ms: binding.last_heartbeat_ms,
+        }
+    }
+}
+
+pub struct OverviewRemoteTurn {
+    pub turn_id: String,
+    pub harness_kind: String,
+    pub provider_kind: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub last_event_at_ms: i64,
+    pub next_poll_at_ms: Option<i64>,
+}
+
+impl From<PendingRemoteTurn> for OverviewRemoteTurn {
+    fn from(turn: PendingRemoteTurn) -> Self {
+        Self {
+            turn_id: turn.turn_id,
+            harness_kind: turn.harness_kind,
+            provider_kind: turn.provider_kind,
+            status: turn.status,
+            created_at_ms: turn.created_at_ms,
+            last_event_at_ms: turn.last_event_at_ms,
+            next_poll_at_ms: turn.next_poll_at_ms,
+        }
+    }
+}
+
+// Count only the prefix the old mailbox listing returned. The range on
+// (agent_id, seq) stops after 100 rows and never fetches message payloads.
+// A missing cursor, like a failed cursor lookup, contributes zero.
+macro_rules! overview_unread_count {
+    () => {
+        "CASE WHEN a.state = 'archived' OR c.agent_id IS NULL THEN 0 ELSE (
+             SELECT COUNT(*) FROM (
+                 SELECT 1 FROM messages m
+                 WHERE m.agent_id = a.id AND m.seq > c.delivered_seq
+                 ORDER BY m.seq LIMIT 100
+             ) AS pending
+         ) END"
+    };
+}
 
 impl Store {
+    /// One batched read for the overview's mailbox counts and PostgreSQL
+    /// metadata. On SQLite, the leases and turns live on disk, not in SQL.
+    pub fn agent_overview_metadata(
+        &self,
+        agents: &[AgentSummary],
+    ) -> (HashMap<AgentId, AgentOverviewMetadata>, usize) {
+        let conn = self.read_conn();
+        if conn.backend() == DbBackend::Postgres {
+            let rows = conn
+                .db_query_vec(
+                    concat!(
+                        "SELECT a.id, ",
+                        overview_unread_count!(),
+                        ", b.provider, b.lease_state, b.lease_id, b.volume_id,
+                           b.lease_expires_at_ms, b.idle_since_ms, b.last_heartbeat_ms,
+                           t.turn_id, t.harness_kind, t.provider_kind, t.status,
+                           t.created_at_ms, t.last_event_at_ms, t.next_poll_at_ms
+                         FROM public.agents a
+                         LEFT JOIN public.mailbox_cursors c ON c.agent_id = a.id
+                         LEFT JOIN public.agent_sandbox_bindings b ON b.agent_id = a.id
+                         LEFT JOIN public.pending_remote_turns t ON t.agent_id = a.id
+                            AND a.state <> 'archived'
+                            AND t.status IN ('dispatched', 'running')"
+                    ),
+                    &[],
+                    |r| {
+                        let sandbox_lease = if let Some(provider) = r.get::<Option<String>>(2)? {
+                            Some(OverviewSandboxLease {
+                                provider,
+                                lease_state: r.get(3)?,
+                                lease_id: r.get(4)?,
+                                volume_id: r.get(5)?,
+                                lease_expires_at_ms: r.get(6)?,
+                                idle_since_ms: r.get(7)?,
+                                last_heartbeat_ms: r.get(8)?,
+                            })
+                        } else {
+                            None
+                        };
+                        // The partial unique index allows at most one active turn per agent.
+                        let active_remote_turns =
+                            if let Some(turn_id) = r.get::<Option<String>>(9)? {
+                                vec![OverviewRemoteTurn {
+                                    turn_id,
+                                    harness_kind: r.get(10)?,
+                                    provider_kind: r.get(11)?,
+                                    status: r.get(12)?,
+                                    created_at_ms: r.get(13)?,
+                                    last_event_at_ms: r.get(14)?,
+                                    next_poll_at_ms: r.get(15)?,
+                                }]
+                            } else {
+                                Vec::new()
+                            };
+                        Ok((
+                            r.get(0)?,
+                            AgentOverviewMetadata {
+                                unread_count: r.get(1)?,
+                                sandbox_lease,
+                                active_remote_turns,
+                            },
+                        ))
+                    },
+                )
+                .unwrap_or_default();
+            let active_sandboxes_count = rows
+                .iter()
+                .filter_map(|(_, meta)| meta.sandbox_lease.as_ref())
+                .filter(|lease| lease.lease_state == "ready" && lease.lease_id.is_some())
+                .count();
+            return (rows.into_iter().collect(), active_sandboxes_count);
+        }
+
+        let mut unread_counts: HashMap<AgentId, i64> = conn
+            .db_query_vec(
+                concat!(
+                    "SELECT a.id, ",
+                    overview_unread_count!(),
+                    " FROM agents a LEFT JOIN mailbox_cursors c ON c.agent_id = a.id"
+                ),
+                &[],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        drop(conn);
+
+        let bindings = self.sandbox_binding_store();
+        let turns = self.remote_turn_store();
+        let metadata = agents
+            .iter()
+            .map(|agent| {
+                let sandbox_lease = bindings.get(&agent.id).ok().flatten().map(Into::into);
+                let active_remote_turns = if agent.state == "archived" {
+                    Vec::new()
+                } else {
+                    turns
+                        .list_active_for_agent(&agent.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()
+                };
+                (
+                    agent.id.clone(),
+                    AgentOverviewMetadata {
+                        unread_count: unread_counts.remove(&agent.id).unwrap_or_default(),
+                        sandbox_lease,
+                        active_remote_turns,
+                    },
+                )
+            })
+            .collect();
+        let active_sandboxes_count = bindings.list_active_ready().map(|v| v.len()).unwrap_or(0);
+        (metadata, active_sandboxes_count)
+    }
+
     /// Every agent that shares an internal group or a Telegram chat with
     /// `agent`: exactly the `other` for which
     /// [`Store::share_any_group_or_chat`]`(agent, other)` holds, read with one

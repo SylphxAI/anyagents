@@ -43,6 +43,7 @@ mod memory_backlog;
 mod messaging;
 mod messaging_conversation;
 mod messaging_delivery;
+mod native_signin;
 pub(crate) mod oidc_bearer;
 mod ops;
 pub(crate) mod outbound_history;
@@ -104,7 +105,7 @@ use messaging::{Actor, held_send};
 use messaging_conversation::conversation_route;
 #[cfg(test)]
 use types::ProcessRunner;
-use types::{SignInLine, require_operator, spawn_store};
+use types::{require_operator, spawn_store};
 
 /// The public listener (`[server] public_listen`): the only surface a network
 /// peer reaches once it is configured. It serves readiness, Telegram webhooks

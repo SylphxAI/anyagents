@@ -87,46 +87,27 @@ pub(crate) async fn overview_route(
     require_operator(&principal)?;
     let store = Arc::clone(&state.store);
     spawn_store(move || {
-        let agents = store.list_agents().map_err(ApiError::from_store)?;
-        let rts = store.remote_turn_store();
+        let agents = store.agent_summaries(true).map_err(ApiError::from_store)?;
+        let (mut metadata, active_sandboxes_count) = store.agent_overview_metadata(&agents);
         let mut agents_meta = Map::new();
         let mut active_remote_turns = Vec::new();
 
-        for agent in &agents {
-            let unread_count = if agent.state == "archived" {
-                0
-            } else {
-                store
-                    .list_undelivered(&agent.id, 100)
-                    .map(|msgs| msgs.len())
-                    .unwrap_or(0)
-            };
-            let sandbox_lease = store.sandbox_binding(&agent.id).ok().flatten().map(|b| {
-                json!({
-                    "provider": b.provider,
-                    "lease_state": b.lease_state,
-                    "lease_id": b.lease_id,
-                    "volume_id": b.volume_id,
-                    "lease_expires_at_ms": b.lease_expires_at_ms,
-                    "idle_since_ms": b.idle_since_ms,
-                    "last_heartbeat_ms": b.last_heartbeat_ms,
-                })
-            });
+        for agent in agents {
+            let meta = metadata.remove(&agent.id).unwrap_or_default();
+            let archived = agent.state == "archived";
             agents_meta.insert(
                 agent.id.as_str().to_string(),
                 json!({
-                    "unread_count": unread_count,
-                    "sandbox_lease": sandbox_lease,
+                    "unread_count": if archived { 0 } else { meta.unread_count },
+                    "sandbox_lease": meta.sandbox_lease,
                 }),
             );
 
-            if agent.state != "archived"
-                && let Ok(turns) = rts.list_active_for_agent(&agent.id)
-            {
-                for turn in turns {
+            if !archived {
+                for turn in meta.active_remote_turns {
                     active_remote_turns.push(json!({
                         "turn_id": turn.turn_id,
-                        "agent_id": turn.agent_id.as_str(),
+                        "agent_id": agent.id.as_str(),
                         "agent_name": agent.name,
                         "harness_kind": turn.harness_kind,
                         "provider_kind": turn.provider_kind,
@@ -139,11 +120,6 @@ pub(crate) async fn overview_route(
             }
         }
 
-        let active_sandboxes_count = store
-            .sandbox_binding_store()
-            .list_active_ready()
-            .map(|v| v.len())
-            .unwrap_or(0);
         let sandbox_provider = std::env::var("ANYAGENTS_SANDBOX_PROVIDER")
             .ok()
             .map(|s| s.trim().to_string())

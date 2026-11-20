@@ -4,6 +4,7 @@ import { api, errorMessage, useResource } from './api';
 import { AgentAction } from './fleet/AgentAction';
 import type { FleetAction } from './fleet/AgentAction';
 import { Fleet } from './fleet/Fleet';
+import { agentLookup } from './fleet/tree';
 import type { Agent, Overview, Session } from './types';
 import { Dialog, Dot, Empty, Mark, Problem, ThemeButton, useTheme } from './ui';
 import { AutomationsView } from './views/AutomationsView';
@@ -46,7 +47,8 @@ export function App() {
   const [expired, setExpired] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const agents = roster.data?.agents ?? noAgents;
-  const selected = agents.find(agent => agent.id === location.id || agent.name === location.id);
+  const resolveAgent = useMemo(() => agentLookup(agents), [agents]);
+  const selected = resolveAgent(location.id);
   useEffect(() => {
     const onHash = () => setLocation(route());
     const onExpired = () => setExpired(true);

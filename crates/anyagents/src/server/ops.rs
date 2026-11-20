@@ -25,7 +25,7 @@ use super::{ServedProfile, in_flight, quota_rotation, serverless};
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
-        .route("/v1/profiles/native-signin", post(native_signin_route))
+        .merge(super::native_signin::router())
         .route("/v1/profiles/models", get(profile_models_route))
         .route(
             "/v1/subagent-defaults",
@@ -539,56 +539,20 @@ struct SignInQuery {
     profile: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeSignInRequest {
-    /// Target harness or provider (`claude-code`, `codex`, `agy`, `anthropic`, `openai`, `google-antigravity`, ...).
-    #[serde(alias = "provider")]
-    harness: String,
-    /// Target profile name (defaults to `"default"`).
-    #[serde(default)]
-    profile: Option<String>,
-}
-
-fn canonical_signin_harness(raw: &str) -> String {
-    match anyagents_harness::normalize_harness_name(raw) {
-        "anthropic" => "claude-code".to_string(),
-        "openai" => "codex".to_string(),
-        "google-antigravity" => "agy".to_string(),
-        "deepseek" => "dsh".to_string(),
-        "xai" => "grok".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// `POST /v1/profiles/native-signin`: canonical Control-Plane REST route to
-/// stream a native provider/harness sign-in flow into a profile.
-async fn native_signin_route(
-    principal: Principal,
-    State(state): State<AppState>,
-    Json(body): Json<NativeSignInRequest>,
-) -> Result<Response, ApiError> {
-    let harness = canonical_signin_harness(&body.harness);
-    if harness.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "harness (or provider) is required",
-        ));
-    }
-    start_native_signin_stream(principal, state, harness, body.profile).await
-}
-
-/// `POST /v1/harnesses/{id}/sign-in`: delegates to the canonical native sign-in stream.
+/// Legacy local harness sign-in. The profiles endpoint always resolves the authenticated account.
 async fn sign_in_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<SignInQuery>,
 ) -> Result<Response, ApiError> {
+    if serverless::is_serverless_mode() {
+        return super::native_signin::start(principal, state, &id).await;
+    }
     start_native_signin_stream(
         principal,
         state,
-        canonical_signin_harness(&id),
+        super::native_signin::canonical_harness(&id).to_string(),
         query.profile,
     )
     .await
@@ -622,54 +586,45 @@ async fn start_native_signin_stream(
     // The response streams while the sign-in runs, so the call's future ends
     // before its work: the work holds the call open for a stop (`in_flight`).
     let call = in_flight::carry();
-    if serverless::is_serverless_mode() {
-        let store = Arc::clone(&state.store);
-        let profiles = Arc::clone(&state.profiles);
-        tokio::spawn(async move {
-            let _call = call;
-            serverless::run_serverless_sandbox_sign_in(store, profiles, id, profile, tx).await;
-        });
-    } else {
-        let runner = Arc::clone(&state.sign_in);
-        let root = state.store.data_dir().to_path_buf();
-        let mark = capability_mark(Arc::clone(&state.store));
-        let spawned = tokio::task::spawn_blocking(move || {
-            let _call = call;
-            let mut sink = ChannelSink { tx };
-            let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
-            let result = sign_in(
-                &builtin_catalog(),
-                &root,
-                &id,
-                &profile,
-                &mut *guard,
-                &mut sink,
-            );
-            let line = match &result {
-                Ok(outcome) => {
-                    // A new sign-in is a new instance: the harness restarts with a
-                    // capability this sign-in minted, and the last one is retired.
-                    if let Err(err) = mark() {
-                        eprintln!("capability after sign-in: {err}");
-                    }
-                    SignInLine {
-                        kind: "done",
-                        text: outcome.account.clone().unwrap_or_default(),
-                    }
+    let runner = Arc::clone(&state.sign_in);
+    let root = state.store.data_dir().to_path_buf();
+    let mark = capability_mark(Arc::clone(&state.store));
+    let spawned = tokio::task::spawn_blocking(move || {
+        let _call = call;
+        let mut sink = ChannelSink { tx };
+        let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
+        let result = sign_in(
+            &builtin_catalog(),
+            &root,
+            &id,
+            &profile,
+            &mut *guard,
+            &mut sink,
+        );
+        let line = match &result {
+            Ok(outcome) => {
+                // A new sign-in is a new instance: the harness restarts with a
+                // capability this sign-in minted, and the last one is retired.
+                if let Err(err) = mark() {
+                    eprintln!("capability after sign-in: {err}");
                 }
-                Err(err) => SignInLine {
-                    kind: "error",
-                    text: err.to_string(),
-                },
-            };
-            sink.send(&line);
-            result
-        });
-        // The task sends the final line before it returns, so the stream ends only
-        // after the command has finished. Dropping the handle detaches it; the
-        // channel keeps the lines ordered.
-        drop(spawned);
-    }
+                SignInLine {
+                    kind: "done",
+                    text: outcome.account.clone().unwrap_or_default(),
+                }
+            }
+            Err(err) => SignInLine {
+                kind: "error",
+                text: err.to_string(),
+            },
+        };
+        sink.send(&line);
+        result
+    });
+    // The task sends the final line before it returns, so the stream ends only
+    // after the command has finished. Dropping the handle detaches it; the
+    // channel keeps the lines ordered.
+    drop(spawned);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream.map(|line| Ok::<_, std::io::Error>(format!("{line}\n"))));
     Ok(Response::builder()
@@ -899,60 +854,6 @@ mod tests {
             assert_eq!(item["quota_weekly"]["remaining_pct"], json!(84), "{item}");
         }
         assert_eq!(*seen_fresh_flags.lock().unwrap(), vec![false, true]);
-    }
-
-    #[tokio::test]
-    async fn profiles_native_signin_route_requires_operator_and_streams_ndjson() {
-        let dir = crate::test_tempdir();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        store
-            .hold_capability_key("ops-signin-cap-key-0123456789abcdef")
-            .unwrap();
-        let ag = store
-            .create_agent(NewAgent::new("regular", "codex"))
-            .unwrap();
-        let cap = store.issue_capability(&ag.id).unwrap();
-        let app = make_app(store, Arc::new(ProfileSnapshots::default()));
-
-        // Agent caller is forbidden (403).
-        let denied = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/profiles/native-signin")
-                    .header("content-type", "application/json")
-                    .header(operator::AGENT_HEADER, &cap)
-                    .body(Body::from(r#"{"harness":"codex","profile":"acct-1"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-
-        // Operator caller succeeds and receives NDJSON stream with link/code + terminal line.
-        let ok = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/profiles/native-signin")
-                    .header("content-type", "application/json")
-                    .header(operator::HEADER, OP_TOKEN)
-                    .body(Body::from(r#"{"harness":"openai","profile":"acct-1"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(ok.status(), StatusCode::OK);
-        assert_eq!(
-            ok.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/x-ndjson")
-        );
-        let bytes = ok.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(body.contains("\"kind\""), "expected NDJSON stream: {body}");
     }
 
     #[tokio::test]

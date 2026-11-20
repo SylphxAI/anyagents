@@ -1,0 +1,71 @@
+.fleet-roster {
+  --fleet-indent: 15px;
+  --fleet-control: 28px;
+  --fleet-axis: 20px;
+  --fleet-guide: color-mix(in srgb, var(--line-strong) 78%, var(--dim));
+}
+
+.fleet-roster .tree-rows { margin: 0; padding: 2px 9px 9px; list-style: none; }
+.fleet-roster .tree-row { padding: 0 3px 0 0; }
+.fleet-roster .tree-row + .tree-row { margin-top: 0; }
+.fleet-guides { display: flex; align-self: stretch; flex: none; }
+.fleet-rail, .fleet-elbow { position: relative; flex: 0 0 var(--fleet-indent); width: var(--fleet-indent); }
+.fleet-rail.continues::before, .fleet-elbow:not(.last)::before, .fleet-node-control.continues::before {
+  content: '';
+  position: absolute;
+  inset: -1px auto -1px calc(var(--fleet-control) / 2);
+  border-left: 1px solid var(--fleet-guide);
+}
+.fleet-elbow::after {
+  content: '';
+  position: absolute;
+  inset: -1px calc(2px - var(--fleet-control) / 2) auto calc(var(--fleet-control) / 2);
+  height: calc(var(--fleet-axis) + 1px);
+  border-bottom: 1px solid var(--fleet-guide);
+}
+.fleet-elbow.last::after { border-left: 1px solid var(--fleet-guide); border-bottom-left-radius: 4px; }
+.fleet-node-control { position: relative; align-self: stretch; flex: 0 0 var(--fleet-control); }
+.fleet-node-control.continues::before { top: var(--fleet-axis); }
+.fleet-roster .tree-expand {
+  position: relative;
+  width: var(--fleet-control);
+  height: calc(var(--fleet-axis) * 2);
+  z-index: 1;
+  border-radius: 5px;
+  color: var(--accent);
+}
+.fleet-roster .tree-expand svg { background: var(--surface); border-radius: 3px; }
+.fleet-roster .tree-expand:hover svg, .fleet-roster .tree-expand:focus-visible svg { background: var(--selection); }
+.fleet-roster .tree-select { position: relative; align-self: stretch; border-radius: 5px; padding: 7px 22px 8px 4px; }
+.fleet-roster .tree-name { flex-wrap: wrap; gap: 3px 6px; }
+.fleet-agent-label { display: inline-flex; align-items: baseline; gap: 7px; min-width: 0; max-width: 100%; }
+.fleet-agent-label .dot { align-self: start; margin-top: .5em; }
+.fleet-active { color: var(--sub); }
+.fleet-active.has-active { color: var(--green); }
+.fleet-ancestor, .fleet-parent { color: var(--sub); font-size: 10px; font-weight: 550; }
+.fleet-parent { display: block; margin-top: 3px; overflow-wrap: anywhere; }
+.fleet-roster .tree-specs .badge { max-width: 100%; }
+.fleet-conversation-icon {
+  position: absolute;
+  top: calc(var(--fleet-axis) - 7px);
+  right: 3px;
+  color: var(--dim);
+}
+.tree-select:hover .fleet-conversation-icon, .tree-row.current .fleet-conversation-icon { color: var(--accent); }
+
+/* Keep long metadata and message headings from sizing the inspector's grid track. */
+.fleet-workspace .inspector { grid-template-columns: minmax(0, 1fr); }
+.fleet-workspace .message-heading, .fleet-workspace .code-label { overflow-wrap: anywhere; }
+
+@media (max-width: 760px) {
+  .fleet-roster { --fleet-indent: 12px; --fleet-control: 32px; }
+  .fleet-roster, .fleet-workspace .mobile-back, .fleet-roster .tree-select { scroll-margin-top: 112px; }
+  .fleet-roster .tree-select { min-height: 44px; }
+}
+
+@media (max-width: 440px) {
+  .fleet-workspace .pulse { margin-bottom: 12px; }
+  .fleet-workspace .pulse-card { gap: 4px; padding-block: 6px; }
+  .fleet-workspace .pulse-card strong { font-size: 20px; }
+  .fleet-roster .tree-search { margin-block: 7px; }
+}

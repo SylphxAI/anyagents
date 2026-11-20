@@ -229,3 +229,21 @@ input[type="checkbox"] { accent-color: var(--brand); }
   .workspace { padding-top: 11px; }
   .identity-name h2 { font-size: 19px; }
 }
+
+/* Provider capacity and account connection */
+.profile-pulse { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 14px 0 24px; }
+.profile-metric.healthy strong, .native-success { color: var(--green); }
+.profile-metric.expired strong, .profile-card.expired .panel-heading h2 { color: var(--red); }
+.profile-metric.low strong, .quota.low strong { color: var(--amber); }
+.profile-group { display: grid; gap: 10px; margin-bottom: 24px; }
+.profile-group > header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.profile-group > header h2 { font-size: 15px; font-weight: 675; overflow-wrap: anywhere; }
+.profile-card { min-width: 0; overflow-wrap: anywhere; }
+.profile-card > .panel { height: 100%; }
+.profile-card.expired > .panel { border-color: color-mix(in srgb, var(--red) 50%, var(--line)); }
+.profile-context p { font-weight: 580; }
+.profile-card-action { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; border-top: 1px solid var(--line); padding-top: 9px; }
+.quota.low progress { accent-color: var(--amber); }
+.native-code code { font-size: 16px; font-weight: 675; letter-spacing: .045em; }
+.native-success { border-left: 3px solid var(--green); padding: 8px 10px; background: var(--inset); }
+@media (max-width: 560px) { .profile-pulse { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
