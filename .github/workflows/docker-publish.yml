@@ -48,6 +48,16 @@ on:
         required: false
         default: claude-code codex opencode
         type: string
+      spiron_install_url:
+        description: Optional binary or tarball URL when installing spiron in sandbox-full
+        required: false
+        default: ''
+        type: string
+      spiron_npm_pkg:
+        description: Optional npm package spec when installing spiron in sandbox-full
+        required: false
+        default: ''
+        type: string
       push:
         description: Push built images to registry (set false for build-only verification)
         required: false
@@ -73,6 +83,8 @@ jobs:
       sandbox_image: ${{ steps.vars.outputs.sandbox_image }}
       platforms: ${{ steps.vars.outputs.platforms }}
       install_harnesses: ${{ steps.vars.outputs.install_harnesses }}
+      spiron_install_url: ${{ steps.vars.outputs.spiron_install_url }}
+      spiron_npm_pkg: ${{ steps.vars.outputs.spiron_npm_pkg }}
       extra_tag: ${{ steps.vars.outputs.extra_tag }}
       push: ${{ steps.vars.outputs.push }}
     steps:
@@ -83,6 +95,8 @@ jobs:
           INPUT_NAMESPACE: ${{ inputs.image_namespace }}
           INPUT_PLATFORMS: ${{ inputs.platforms }}
           INPUT_HARNESSES: ${{ inputs.install_harnesses }}
+          INPUT_SPIRON_INSTALL_URL: ${{ inputs.spiron_install_url }}
+          INPUT_SPIRON_NPM_PKG: ${{ inputs.spiron_npm_pkg }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PUSH: ${{ inputs.push }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -95,6 +109,14 @@ jobs:
           namespace="$(printf '%s' "$raw_ns" | tr '[:upper:]' '[:lower:]')"
           platforms="${INPUT_PLATFORMS:-linux/amd64,linux/arm64}"
           harnesses="${INPUT_HARNESSES:-claude-code codex opencode}"
+          spiron_install_url="${INPUT_SPIRON_INSTALL_URL:-}"
+          spiron_npm_pkg="${INPUT_SPIRON_NPM_PKG:-}"
+          case "$spiron_install_url" in
+            *$'\n'*|*$'\r'*) echo "spiron_install_url must be single-line" >&2; exit 1 ;;
+          esac
+          case "$spiron_npm_pkg" in
+            *$'\n'*|*$'\r'*) echo "spiron_npm_pkg must be single-line" >&2; exit 1 ;;
+          esac
           push_flag="true"
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_PUSH" = "false" ]; then
             push_flag="false"
@@ -106,6 +128,8 @@ jobs:
             echo "sandbox_image=${registry}/${namespace}/anyagents-sandbox"
             echo "platforms=${platforms}"
             echo "install_harnesses=${harnesses}"
+            echo "spiron_install_url=${spiron_install_url}"
+            echo "spiron_npm_pkg=${spiron_npm_pkg}"
             echo "extra_tag=${INPUT_TAG:-}"
             echo "push=${push_flag}"
           } >> "$GITHUB_OUTPUT"
@@ -257,6 +281,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             INSTALL_HARNESSES=${{ needs.resolve.outputs.install_harnesses }}
+            SPIRON_INSTALL_URL=${{ needs.resolve.outputs.spiron_install_url }}
+            SPIRON_NPM_PKG=${{ needs.resolve.outputs.spiron_npm_pkg }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
