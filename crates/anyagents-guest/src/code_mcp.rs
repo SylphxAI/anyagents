@@ -20,9 +20,9 @@ pub struct CodeMcpArgs {
 
 pub fn run_code_mcp(mut args: CodeMcpArgs) -> Result<(), String> {
     if args.bin.is_none() {
-        args.bin = std::env::var_os("ANYAGENTS_CODE_MODE_BIN")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
+        args.bin = anyagents_toolchain::tool("agent-code-mode", "anyagents-guest.code_mcp")
+            .ok()
+            .map(|r| r.path)
             .or_else(|| Some(PathBuf::from(DEFAULT_CODE_MODE_BIN)));
     }
     if args.workdir.is_none() {

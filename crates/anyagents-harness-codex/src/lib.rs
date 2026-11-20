@@ -603,6 +603,11 @@ impl State {
                     for id in &members {
                         self.failures.insert(id.clone(), message.clone());
                     }
+                    for (id, custody) in &self.inflight {
+                        if custody.turn.as_deref() == Some(turn.as_str()) || members.is_empty() {
+                            self.failures.insert(id.clone(), message.clone());
+                        }
+                    }
                     persist_codex_fault_error(self.config_dir.as_deref(), Some(&message));
                     if is_unrecoverable_thread_error(params) {
                         self.invalidate_thread();
@@ -2085,6 +2090,13 @@ mod tests {
             thread_id: Some("th-1".into()),
             ..State::default()
         };
+        s.inflight.insert(
+            "m1".into(),
+            Custody {
+                stage: Stage::Pending,
+                turn: Some("t1".into()),
+            },
+        );
         s.on_notification("turn/started", &json!({"turn": {"id": "t1"}}));
         s.consume("m1", Some("t1"));
         s.on_notification(
@@ -2100,6 +2112,13 @@ mod tests {
             Some("hello world")
         );
 
+        s.inflight.insert(
+            "m2".into(),
+            Custody {
+                stage: Stage::Pending,
+                turn: Some("t2".into()),
+            },
+        );
         s.on_notification("turn/started", &json!({"turn": {"id": "t2"}}));
         s.consume("m2", Some("t2"));
         s.on_notification(

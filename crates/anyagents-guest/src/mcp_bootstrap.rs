@@ -43,15 +43,18 @@ fn find_bin(name: &str, dir_override: Option<&Path>) -> Option<PathBuf> {
         let p = d.join(name);
         return p.is_file().then_some(p);
     }
+    if let Ok(resolved) = anyagents_toolchain::tool(name, "anyagents-guest.mcp_bootstrap")
+        && resolved.path.is_file()
+    {
+        return Some(resolved.path);
+    }
     for d in ["/usr/local/bin", "/usr/bin", "/home/user/.local/bin"] {
         let p = Path::new(d).join(name);
         if p.is_file() {
             return Some(p);
         }
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
+    None
 }
 
 pub fn discover_local_mcp_servers(
