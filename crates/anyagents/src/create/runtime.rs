@@ -147,7 +147,7 @@ pub(crate) fn reset_agent_session_locked(
     let session = anyagents_core::host_session::reset_session_with_source(
         &root,
         &agent.harness,
-        harness_session_filename(&agent.harness),
+        agent_session_filename(agent),
         crate::vendor::memory_source(agent),
     )?;
     Ok(serde_json::json!({
@@ -155,6 +155,14 @@ pub(crate) fn reset_agent_session_locked(
         "generation": session.generation, "harness": session.harness,
         "memory_sha256": session.memory.sha256,
     }))
+}
+
+pub(crate) fn agent_session_filename(agent: &Agent) -> Option<&'static str> {
+    if crate::remote::is_agent_cloud(agent, None, None) {
+        harness_session_filename(&crate::remote::agent_cloud_selector(agent))
+    } else {
+        harness_session_filename(&agent.harness)
+    }
 }
 
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
@@ -258,7 +266,12 @@ pub(crate) fn compute_live_session_continuity(
         let _ = std::fs::remove_file(&recovery_cache_path);
     }
 
-    let active_sess_file = harness_session_filename(&agent.harness).map(|f| config.join(f));
+    let active_selector = if crate::remote::is_agent_cloud(agent, None, None) {
+        crate::remote::agent_cloud_selector(agent)
+    } else {
+        normalize_harness_name(&agent.harness).to_string()
+    };
+    let active_sess_file = harness_session_filename(&active_selector).map(|f| config.join(f));
     let active_sess_mtime = active_sess_file.as_ref().and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
         if text.trim().is_empty() {
@@ -283,7 +296,7 @@ pub(crate) fn compute_live_session_continuity(
         "openai-cloud",
         "cursor-cloud",
     ] {
-        if candidate == normalize_harness_name(&agent.harness) {
+        if candidate == active_selector {
             continue;
         }
         if let Some(fname) = harness_session_filename(candidate) {

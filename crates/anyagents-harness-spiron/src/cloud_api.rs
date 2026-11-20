@@ -711,6 +711,43 @@ fn parse_retry_after_ms(
     reset_at_ms(text, now_ms).unwrap_or_else(|| now_ms.saturating_add(DEFAULT_RETRY_AFTER_MS))
 }
 
+fn safe_problem_summary(body: Option<&Value>) -> Option<String> {
+    let val = body?;
+    let raw_code = ptr_str(val, &["/error/code", "/code", "/error/type"]).or_else(|| {
+        val.pointer("/type")
+            .and_then(Value::as_str)
+            .and_then(|u| u.rsplit('/').next())
+    });
+    let code = ascii_code(raw_code);
+    let detail = ptr_str(val, &["/detail", "/title"]).and_then(|raw| {
+        let cleaned: String = raw
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(160)
+            .collect();
+        let lower = cleaned.to_ascii_lowercase();
+        let sensitive = [
+            "spiron_sk_",
+            "sylphx_sk_",
+            "aars_",
+            "bearer ",
+            "authorization",
+        ]
+        .iter()
+        .any(|p| lower.contains(p));
+        (!cleaned.is_empty() && !sensitive).then_some(cleaned)
+    });
+    match (code, detail) {
+        (Some(c), Some(d)) => Some(format!("({c}): {d}")),
+        (Some(c), None) => Some(format!("({c})")),
+        (None, Some(d)) => Some(format!(": {d}")),
+        (None, None) => None,
+    }
+}
+
 pub(crate) fn classify_http_error(err: &HttpError) -> RemoteSessionError {
     match err.status {
         401 => RemoteSessionError::Auth("Spiron API authentication failed (HTTP 401)".into()),
@@ -731,7 +768,13 @@ pub(crate) fn classify_http_error(err: &HttpError) -> RemoteSessionError {
             }
         }
         s if (500..=599).contains(&s) => transport(format!("Spiron API returned HTTP {s}")),
-        s => proto(format!("Spiron API returned HTTP {s}")),
+        s => match safe_problem_summary(err.body_json.as_ref()) {
+            Some(summary) if summary.starts_with(':') => {
+                proto(format!("Spiron API returned HTTP {s}{summary}"))
+            }
+            Some(summary) => proto(format!("Spiron API returned HTTP {s} {summary}")),
+            None => proto(format!("Spiron API returned HTTP {s}")),
+        },
     }
 }
 
@@ -773,9 +816,15 @@ pub(crate) fn spend_cap_bounds(val: Option<&Value>, fallback: Option<RemoteBudge
         "/error/spent_usd",
     ];
     let cap_m = [
+        "/effective_cap_micros",
+        "/spend_cap_micros",
+        "/plan_cap_micros",
         "/cap_micros",
         "/limit_micros",
         "/monthly_limit_micros",
+        "/error/effective_cap_micros",
+        "/error/spend_cap_micros",
+        "/error/plan_cap_micros",
         "/error/cap_micros",
         "/error/limit_micros",
     ];

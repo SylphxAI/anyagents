@@ -8,9 +8,9 @@ use crate::mcp_config;
 
 use super::spawn::create_private_config_dir;
 use super::{
-    DEFAULT_AGENT_ROLE, backfill_historical_agent_roles, compute_live_session_continuity,
-    discover_available_archetype_slugs, effective_agent_instructions, harness_session_filename,
-    mark_instructions_rotated_if_changed,
+    DEFAULT_AGENT_ROLE, agent_session_filename, backfill_historical_agent_roles,
+    compute_live_session_continuity, discover_available_archetype_slugs,
+    effective_agent_instructions, mark_instructions_rotated_if_changed,
 };
 
 pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) -> Result<(), Error> {
@@ -173,7 +173,7 @@ pub(crate) fn write_agent_instructions_with_continuity_and_store(
         match anyagents_core::host_session::prepare_harness_with_source(
             root,
             &agent.harness,
-            harness_session_filename(&agent.harness),
+            agent_session_filename(agent),
             crate::vendor::memory_source(agent),
         ) {
             Ok(Some(session)) => {

@@ -1077,7 +1077,7 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     let prepared = anyagents_core::host_session::prepare_harness_with_source(
         root,
         &request.agent.harness,
-        crate::create::harness_session_filename(&request.agent.harness),
+        crate::create::agent_session_filename(&request.agent),
         source,
     )
     .map_err(|e| format!("host session pin failed: {e}"))?;
@@ -1089,7 +1089,7 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
         )
         .map_err(|e| format!("host session pin failed: {e}"))?;
     }
-    if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
+    if let Some(file) = crate::create::agent_session_filename(&request.agent)
         && let Some(id) = session_from_file(&request.config_dir, file)?
     {
         anyagents_core::host_session::bind_vendor(root, &request.agent.harness, &id)
@@ -1782,7 +1782,7 @@ fn plan_adapter(
                 env,
             },
             Some(&session_file),
-            &cloud_selector,
+            &request.agent.harness,
         ))
     } else if is_spiron_harness(&request.agent.harness) {
         let session = session_from_file(&request.config_dir, "spiron-session-id")?;
@@ -4003,7 +4003,7 @@ for raw in reader:
         };
         let spiron_planned = plan_adapter(&spiron_req, dir.path(), Vec::new(), false).unwrap();
         assert!(spiron_planned.launch.runs_off_host());
-        assert_eq!(spiron_planned.selector, "spiron-cloud");
+        assert_eq!(spiron_planned.selector, "spiron");
         assert_eq!(
             spiron_planned.pointer,
             Some(spiron_cfg.join("spiron-cloud-session-id"))
@@ -4037,7 +4037,7 @@ for raw in reader:
         };
         let claude_planned = plan_adapter(&claude_req, dir.path(), Vec::new(), false).unwrap();
         assert!(claude_planned.launch.runs_off_host());
-        assert_eq!(claude_planned.selector, "claude-cloud");
+        assert_eq!(claude_planned.selector, "claude-code");
         assert_eq!(
             claude_planned.pointer,
             Some(claude_cfg.join("claude-cloud-session-id"))
@@ -4062,6 +4062,78 @@ for raw in reader:
         assert_eq!(
             anyagents_harness_claude::CLOUD_DELIVERY.level,
             anyagents_harness::DeliveryLevel::TurnEnd
+        );
+    }
+
+    #[test]
+    fn spiron_cloud_host_session_binding_and_restart_resume_use_canonical_harness() {
+        use anyagents_core::{ExecutionRuntime, NewAgent, Store};
+        const REMOTE_AGENT_ID: &str = "00000000-0000-4000-8000-000000000077";
+
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(
+                NewAgent::new("spiron-cloud-bind", "spiron")
+                    .with_runtime(ExecutionRuntime::Cloud)
+                    .with_budget_micros(500_000),
+            )
+            .unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        let root = cfg.parent().unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        let req = LaunchRequest {
+            agent: agent.clone(),
+            data_dir: dir.path().to_owned(),
+            config_dir: cfg.clone(),
+            work_dir: dir.path().join("work-spiron-bind"),
+            extra_env: vec![],
+            lock: None,
+        };
+
+        // First launch: prepare_host_session pins `spiron`, plan_adapter returns selector `spiron`,
+        // and SessionPointer's bind_vendor call succeeds without selector mismatch.
+        prepare_host_session(&req).expect("prepare_host_session for spiron@cloud");
+        let planned = plan_adapter(&req, dir.path(), Vec::new(), false).unwrap();
+        assert_eq!(planned.selector, "spiron");
+        let pointer = planned.pointer.as_ref().expect("spiron-cloud pointer");
+        assert_eq!(pointer, &cfg.join("spiron-cloud-session-id"));
+        anyagents_core::host_session::bind_vendor(root, &planned.selector, REMOTE_AGENT_ID)
+            .expect("bind_vendor must accept spiron@cloud selector");
+        std::fs::write(pointer, format!("{REMOTE_AGENT_ID}\n")).unwrap();
+
+        // Restart: prepare_host_session binds persisted `spiron-cloud-session-id`, and
+        // plan_adapter passes it as `session: Some(REMOTE_AGENT_ID)` into RemoteSession.
+        prepare_host_session(&req).expect("restart prepare_host_session for spiron@cloud");
+        let resumed = plan_adapter(&req, dir.path(), Vec::new(), false).unwrap();
+        assert!(
+            matches!(
+                resumed.launch,
+                AdapterLaunch::RemoteSession {
+                    ref harness,
+                    ref session,
+                    ..
+                } if harness == "spiron" && session.as_deref() == Some(REMOTE_AGENT_ID)
+            ),
+            "expected resumed RemoteSession with remote agent id, got {:?}",
+            resumed.launch
+        );
+
+        // Continuity check must treat spiron-cloud-session-id as the active session, not another harness.
+        store
+            .record_outbound(&agent.id, "operator", None, "reply 1")
+            .unwrap();
+        assert_eq!(
+            crate::create::compute_live_session_continuity(&store, &agent, &cfg),
+            None,
+            "active spiron-cloud-session-id must not trigger cross-harness continuity"
+        );
+
+        // Explicit session reset retires spiron-cloud-session-id for (spiron, Cloud).
+        crate::create::reset_agent_session_locked(&store, &agent).expect("reset spiron@cloud");
+        assert!(
+            !pointer.exists(),
+            "reset must retire spiron-cloud-session-id for spiron@cloud"
         );
     }
 
