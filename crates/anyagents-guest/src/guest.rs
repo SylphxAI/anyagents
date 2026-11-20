@@ -477,7 +477,7 @@ impl GuestHarness for OmpAdapter {
     }
 }
 
-struct SpironAdapter(SpironHarness);
+struct SpironAdapter(SpironHarness, Option<PathBuf>);
 impl Harness for SpironAdapter {
     fn deliver(&mut self, msg: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         self.0.deliver(msg)
@@ -487,6 +487,9 @@ impl Harness for SpironAdapter {
     }
     fn stop(&mut self) {
         self.0.stop();
+        if let Some(sock) = self.1.take() {
+            let _ = std::fs::remove_file(sock);
+        }
     }
     fn background(&mut self) -> Result<(), HarnessError> {
         self.0.background()
@@ -1265,8 +1268,8 @@ pub(crate) fn launch_guest_harness(
             let launch = crate::auth_bootstrap::build_spiron_launch(
                 program, model, session, extra_args, state_dir, work_dir, env, file_cfg,
             );
-            let h = SpironHarness::launch(launch)?;
-            Ok(Box::new(SpironAdapter(h)))
+            let (h, sock) = crate::auth_bootstrap::launch_guest_spiron(launch, state_dir)?;
+            Ok(Box::new(SpironAdapter(h, sock)))
         }
         "gemini" => {
             let h =
@@ -1351,6 +1354,9 @@ pub(crate) fn build_guest_env(
 
     for (k, v) in [
         ("HOME", state_str.as_str()),
+        ("ANYAGENTS_AGENT_CONFIG", state_str.as_str()),
+        ("AGY_CONFIG_DIR", state_str.as_str()),
+        ("MUSE_CONFIG_HOME", state_str.as_str()),
         ("CLAUDE_CONFIG_DIR", state_str.as_str()),
         ("CODEX_HOME", state_str.as_str()),
         ("XDG_CONFIG_HOME", &config_home.display().to_string()),
@@ -1365,6 +1371,14 @@ pub(crate) fn build_guest_env(
     ] {
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v.to_string()));
+    }
+    for k in ["ANYAGENTS_AGY_HTTP_PORT", "ANYAGENTS_AGY_CSRF_TOKEN"] {
+        if !env.iter().any(|(ek, _)| ek == k)
+            && let Ok(val) = std::env::var(k)
+            && !val.trim().is_empty()
+        {
+            env.push((k.to_string(), val));
+        }
     }
     crate::media::enrich_guest_env(state_dir, file_cfg, &mut env);
     repo::ensure_gh_auth_setup_git_for_env(state_dir, &env);
