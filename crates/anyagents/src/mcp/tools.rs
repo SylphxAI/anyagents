@@ -1719,6 +1719,25 @@ impl AgentMcp {
                     }
                 }
 
+                if topics_val.is_empty() || !is_self_target {
+                    let route_target = target_arg.as_deref().unwrap_or(self.agent.name.as_str());
+                    let mem_path =
+                        format!("/v1/agents/{}/memory", urlencoding_simple(route_target));
+                    if let Ok(mem_doc) = self.client.get::<serde_json::Value>(&mem_path, None).await
+                    {
+                        if let Some(arr) = mem_doc.get("topics").and_then(|v| v.as_array()) {
+                            topics_val = match args.limit {
+                                Some(lim) => arr.iter().take(lim.max(1)).cloned().collect(),
+                                None => arr.clone(),
+                            };
+                        }
+                        if let Some(idx) = mem_doc.get("index").and_then(|v| v.as_str())
+                            && !idx.is_empty()
+                        {
+                            index_text = idx.to_string();
+                        }
+                    }
+                }
                 if (index_text.is_empty() || !is_self_target)
                     && let Ok(resp) = self
                         .conversation(Parameters(ConversationArgs {
@@ -2072,7 +2091,18 @@ impl AgentMcp {
                         "consolidated_topics": sleep_state.consolidated_topics,
                     }));
                 }
-                Err("local memory root is not available for `memory.status`".to_string())
+                let route_target = target_arg.as_deref().unwrap_or(self.agent.name.as_str());
+                let mem_path = format!("/v1/agents/{}/memory", urlencoding_simple(route_target));
+                let mem_doc: serde_json::Value = self.client.get(&mem_path, None).await?;
+                Ok(serde_json::json!({
+                    "action": "status",
+                    "agent": mem_doc.get("agent").and_then(|v| v.as_str()).unwrap_or(route_target),
+                    "topic_count": mem_doc.get("topic_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "index_bytes": mem_doc.get("index_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "index_lines": mem_doc.get("index_lines").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "last_consolidated_ms": mem_doc.get("last_consolidated_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "consolidated_topics": mem_doc.get("consolidated_topics").cloned().unwrap_or_else(|| serde_json::json!([])),
+                }))
             }
             "recall" | "history" => {
                 let q = raw_query

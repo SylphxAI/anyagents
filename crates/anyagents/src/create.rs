@@ -9851,6 +9851,49 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
         }
     }
 
+    // In thin/serverless coordinators without a host `agy` binary, synthesize
+    // `agy_cli_models` from the live backend model catalog fetched via synced
+    // OAuth tokens so `agents(action="models")` never returns empty `[]`.
+    if agy_cli_models.is_empty() {
+        let mut seen = std::collections::BTreeMap::<String, String>::new();
+        for p in &profiles_out {
+            if let Some(bms) = p.get("backend_models").and_then(|v| v.as_array()) {
+                for bm in bms {
+                    if let Some(id) = bm.get("id").and_then(|v| v.as_str()) {
+                        let label = bm
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(id)
+                            .to_string();
+                        seen.entry(id.to_string()).or_insert(label);
+                    }
+                }
+            }
+        }
+        for (id, label) in seen {
+            agy_cli_models.push(serde_json::json!({
+                "id": id,
+                "label": label,
+                "default": false,
+            }));
+        }
+        if !agy_cli_models.is_empty() {
+            for p in &mut profiles_out {
+                if let Some(obj) = p.as_object_mut()
+                    && obj
+                        .get("cli_models")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(Vec::is_empty)
+                {
+                    obj.insert(
+                        "cli_models".to_string(),
+                        serde_json::Value::Array(agy_cli_models.clone()),
+                    );
+                }
+            }
+        }
+    }
+
     serde_json::json!({
         "agy_cli_models": agy_cli_models,
         "profiles": profiles_out,

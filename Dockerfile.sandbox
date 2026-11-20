@@ -89,6 +89,7 @@ RUN apt-get update \
         chromium \
         curl \
         fd-find \
+        fonts-noto-cjk \
         fonts-noto-core \
         git \
         gnupg \
@@ -220,6 +221,7 @@ COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=guest-builder /src/target/release/anyagents-mcp-web /usr/local/bin/anyagents-mcp-web
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
     && chmod 0755 /usr/local/bin/anyagents-mcp-web \
+    && chown -R "${USER_UID}:${USER_GID}" /home/user \
     && bun --version
 
 WORKDIR /home/user/agent-data/workspace
@@ -290,7 +292,9 @@ RUN set -eu; \
     if [ -n "$npm_pkgs" ]; then \
         npm install -g --no-audit --no-fund $npm_pkgs; \
         npm cache clean --force; \
-    fi
+    fi; \
+    mkdir -p /home/user/.config /home/user/.cache /home/user/.local/bin; \
+    chown -R "${USER_UID}:${USER_GID}" /home/user
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}

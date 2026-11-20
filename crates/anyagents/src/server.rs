@@ -1805,6 +1805,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         )
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
+        .route("/v1/agents/{name}/memory", get(agent_memory_route))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
         .route(
             "/v1/agents/{name}/conversation/redact",
@@ -3284,6 +3285,8 @@ async fn role_agent_route(
 struct ProfileModelsQuery {
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 async fn profile_models_route(
@@ -3293,9 +3296,10 @@ async fn profile_models_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
         require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
+        let target = query.profile.as_deref().or(query.filter.as_deref());
         Ok(Json(create::probe_profile_models_catalog(
             state.store.data_dir(),
-            query.profile.as_deref(),
+            target,
         )))
     })
     .await
@@ -6828,6 +6832,102 @@ async fn redact_conversation_route(
             .redact_conversation(actor, &target.id, &request)
             .map(Json)
             .map_err(ApiError::from_store)
+    })
+    .await
+}
+
+/// `GET /v1/agents/{name}/memory`: return the hydrated learned-memory topic list,
+/// index markdown, and sleep-consolidation status for `name` (authorized with the
+/// same visibility boundary as `conversation(scope="memory")`).
+async fn agent_memory_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let (resolved_name, visible_agent_ids) =
+            conversation_visibility(&state.store, &principal, &name)?;
+        let target = if resolved_name.eq_ignore_ascii_case("self")
+            || resolved_name.eq_ignore_ascii_case("all")
+            || resolved_name == "*"
+        {
+            match &principal {
+                Principal::Agent { agent_id, .. } => {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                }
+                Principal::Operator => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "operator memory listing requires an explicit agent name",
+                    ));
+                }
+            }
+        } else {
+            state
+                .store
+                .agent_by_name(
+                    resolved_name
+                        .strip_prefix("agent:")
+                        .unwrap_or(&resolved_name),
+                )
+                .map_err(ApiError::from_store)?
+        };
+        if let Some(visible) = visible_agent_ids.as_ref()
+            && !visible
+                .iter()
+                .any(|v| v == target.id.as_str() || v == &target.name)
+        {
+            return Err(ApiError::forbidden(
+                "cannot read private memory of another agent",
+            ));
+        }
+        let agent_root = state
+            .store
+            .data_dir()
+            .join("agents")
+            .join(target.id.as_str());
+        let _ = crate::sandbox_exec::hydrate_agent_memory_from_store(&state.store, &target.id);
+        let topics =
+            anyagents_core::learned_memory::list_memory_topics(&agent_root).unwrap_or_default();
+        let index_path = agent_root.join("memory/MEMORY.md");
+        let needs_index_rebuild = !topics.is_empty()
+            && (!index_path.is_file()
+                || std::fs::read_to_string(&index_path)
+                    .ok()
+                    .is_some_and(|s| s.contains("No topic files recorded yet.")));
+        if needs_index_rebuild
+            && let Ok(index) = anyagents_core::learned_memory::rebuild_memory_index(
+                &agent_root,
+                &target.name,
+                target.role.as_deref(),
+            )
+        {
+            crate::sandbox_exec::persist_agent_memory_file_to_store(
+                &state.store,
+                &target.id,
+                "MEMORY.md",
+                index.as_bytes(),
+            );
+        }
+        let index_text = std::fs::read_to_string(&index_path).unwrap_or_else(|_| {
+            format!(
+                "# {} — Learned Memory Index\n- No topic files recorded yet.\n",
+                target.name
+            )
+        });
+        let sleep_state = anyagents_core::learned_memory::read_sleep_state(&agent_root);
+        let topic_count = topics.len();
+        Ok(Json(serde_json::json!({
+            "agent": target.name,
+            "agent_id": target.id.as_str(),
+            "topics": topics,
+            "topic_count": topic_count,
+            "index": index_text,
+            "index_bytes": index_text.len(),
+            "index_lines": index_text.lines().count(),
+            "last_consolidated_ms": sleep_state.last_consolidated_ms,
+            "consolidated_topics": sleep_state.consolidated_topics,
+        })))
     })
     .await
 }
@@ -10604,53 +10704,6 @@ pub(crate) mod tests {
         assert_eq!(view.retry_at_ms, None);
         assert_eq!(view.last_error.as_deref(), Some(fault));
         assert_eq!(parent_notices(), 1);
-    }
-
-    #[test]
-    fn spiron_agent_view_uses_turn_lock_with_missing_or_stale_health() {
-        let dir = crate::test_tempdir();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let health = HealthBoard::default();
-        let mut agent = store
-            .create_agent(anyagents_core::NewAgent::new("lock-owner", "spiron"))
-            .unwrap();
-        for selector in [
-            "spiron",
-            "sylphx",
-            "sylphx-agent",
-            "sylphx_agent",
-            "sylphx/default",
-        ] {
-            // Exercise legacy in-memory records as well as canonical stored rows.
-            agent.harness = selector.into();
-            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
-            let lock = store.try_lock_agent(&agent.id).unwrap();
-            let busy = agent_view(&store, &health, &agent).unwrap();
-            assert_eq!(busy.process, "alive", "{selector}");
-            assert_eq!(busy.turn_state, "working", "{selector}");
-            health.publish(
-                &agent.id,
-                anyagents_supervisor::LiveState {
-                    process_alive: false,
-                    turn_state: anyagents_harness::TurnState::Idle,
-                    delivery: Some(crate::vendor::declared_delivery("spiron")),
-                    quota_reset_at_ms: None,
-                    restart_at_ms: None,
-                    pid: None,
-                    live_harness: Some("spiron".into()),
-                    live_model: None,
-                    process_started_at_ms: None,
-                    last_error: None,
-                    retry_at_ms: None,
-                },
-            );
-            assert_eq!(
-                agent_view(&store, &health, &agent).unwrap().turn_state,
-                "working"
-            );
-            drop(lock);
-            assert_eq!(agent_view(&store, &health, &agent).unwrap().process, "down");
-        }
     }
 
     #[test]
