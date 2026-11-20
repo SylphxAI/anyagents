@@ -347,7 +347,7 @@ mod spawn_args_tests {
         assert!(args.instructions.is_none());
     }
 
-    fn dummy_agent_view(
+    pub(super) fn dummy_agent_view(
         id: &str,
         name: &str,
         state: &str,
@@ -1301,8 +1301,21 @@ mod tool_server_runtime_tests {
         });
     }
 
+    fn agent_view_with_parent(
+        id: &str,
+        name: &str,
+        state: &str,
+        turn_state: &str,
+        parent: Option<&str>,
+    ) -> AgentView {
+        let mut view = super::spawn_args_tests::dummy_agent_view(id, name, state, turn_state, None);
+        view.parent = parent.map(str::to_string);
+        view
+    }
+
     #[tokio::test]
     async fn agents_list_include_descendants_traverses_three_generations_and_respects_limit() {
+        use serde_json::json;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("server.sock");
@@ -1312,33 +1325,33 @@ mod tool_server_runtime_tests {
         let grandchild_id = AgentId::generate();
 
         let mut population = vec![
-            dummy_agent_view(root_id.as_str(), "root", "running", "idle", None),
-            dummy_agent_view(
+            agent_view_with_parent(root_id.as_str(), "root", "running", "idle", None),
+            agent_view_with_parent(
                 child_id.as_str(),
                 "child-lead",
                 "running",
                 "idle",
                 Some(root_id.as_str()),
             ),
-            dummy_agent_view(
+            agent_view_with_parent(
                 grandchild_id.as_str(),
                 "grandchild-worker",
                 "running",
                 "working",
                 Some(child_id.as_str()),
             ),
-            dummy_agent_view(
+            agent_view_with_parent(
                 "agt_great_grandchild",
                 "great-grandchild",
                 "idle",
                 "idle",
                 Some(grandchild_id.as_str()),
             ),
-            dummy_agent_view("agt_unrelated", "other-root", "running", "idle", None),
+            agent_view_with_parent("agt_unrelated", "other-root", "running", "idle", None),
         ];
         // Add 35 more direct children so total descendants = 38 (> old 18-row budget cap).
         for idx in 0..35 {
-            population.push(dummy_agent_view(
+            population.push(agent_view_with_parent(
                 &format!("agt_sub_{idx:02}"),
                 &format!("sub-{idx:02}"),
                 "running",
@@ -1421,12 +1434,13 @@ mod tool_server_runtime_tests {
 
     #[tokio::test]
     async fn inspect_falls_back_to_single_agent_route_for_archived_agents() {
+        use serde_json::json;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("server.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let parent_id = AgentId::generate();
-        let mut archived_child = dummy_agent_view(
+        let mut archived_child = agent_view_with_parent(
             "agt_archived_1",
             "archived-worker",
             "archived",
