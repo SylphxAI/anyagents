@@ -1208,6 +1208,7 @@ pub(crate) fn configure_agent_runtime_with_options(
             crate::install::record,
         )?;
     }
+    let _ = crate::sandbox_exec::hydrate_agent_files_from_store(store, &existing.id, &config);
     let current_bound = bound_profile_name(&config);
 
     let (provider, profile_name) =
@@ -1319,6 +1320,7 @@ pub(crate) fn configure_agent_runtime_with_options(
         .map(PathBuf::from)
         .unwrap_or_else(|| agent_work_dir(data, &updated.id));
     reconcile_agent_runtime_config(store, data, &updated, &config, &work_dir)?;
+    super::persist_spawned_agent_config_to_store(store, &updated.id, &config);
     poke_agent_wake_socket(data, &updated.id);
 
     let process = if lock_busy { "alive" } else { "down" };

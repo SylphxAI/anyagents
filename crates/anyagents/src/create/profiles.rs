@@ -1004,10 +1004,7 @@ pub(super) fn sync_and_list_provider_profiles_inner(
         let is_root = agent.parent_id.is_none();
         let cfg = agent_config_dir(data, &agent.id);
         let expected_provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let bound = bound_profile_name(&cfg).or_else(|| {
-            if !store.is_postgres() {
-                return None;
-            }
+        let bound = if store.is_postgres() {
             store
                 .blob_store()
                 .get_agent_file(&agent.id, "markers", ".anyagents-profile")
@@ -1016,7 +1013,10 @@ pub(super) fn sync_and_list_provider_profiles_inner(
                 .and_then(|e| String::from_utf8(e.content).ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-        });
+                .or_else(|| bound_profile_name(&cfg))
+        } else {
+            bound_profile_name(&cfg)
+        };
         let (bound_prov, bound_prof) = match bound.as_deref() {
             Some(s) if s.contains('/') => {
                 let (p, n) = s.split_once('/').unwrap_or((&expected_provider, "default"));

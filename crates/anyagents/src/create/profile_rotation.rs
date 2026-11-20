@@ -588,6 +588,7 @@ pub(super) fn try_rotate_exhausted_profile_in(
         if agent.harness == "agy" {
             clear_stale_agy_quota_error_steps(&cfg);
         }
+        super::persist_spawned_agent_config_to_store(store, &agent.id, &cfg);
         poke_agent_wake_socket(data, &agent.id);
         return Some(format!("{current_provider}/{current_prof}"));
     }
