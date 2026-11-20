@@ -16,7 +16,9 @@ CREATE TABLE knowledge_docs (
 );
 
 CREATE TABLE knowledge_revisions (
-    id TEXT PRIMARY KEY NOT NULL,
+    -- A stable cursor for replay into the separate SQLite search file.
+    projection_seq INTEGER PRIMARY KEY,
+    id TEXT UNIQUE NOT NULL,
     doc_id TEXT NOT NULL REFERENCES knowledge_docs(id),
     namespace TEXT NOT NULL,
     topic TEXT NOT NULL,
@@ -62,13 +64,3 @@ CREATE TRIGGER knowledge_revisions_no_update BEFORE UPDATE ON knowledge_revision
 BEGIN SELECT RAISE(ABORT, 'knowledge revisions are append-only'); END;
 CREATE TRIGGER knowledge_revisions_no_delete BEFORE DELETE ON knowledge_revisions
 BEGIN SELECT RAISE(ABORT, 'knowledge revisions are append-only'); END;
-
--- A separate RAG partition: old mailbox readers must not see protected chunks
--- during rolling upgrades. State and its index commit together.
-CREATE TABLE knowledge_rag_chunks (
-    chunk_id TEXT PRIMARY KEY NOT NULL REFERENCES knowledge_docs(id),
-    content_hash TEXT NOT NULL
-);
-CREATE VIRTUAL TABLE knowledge_rag_chunks_fts USING fts5(
-    chunk_id UNINDEXED, search_tokens, tokenize='unicode61'
-);

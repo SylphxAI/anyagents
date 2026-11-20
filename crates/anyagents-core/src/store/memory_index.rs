@@ -250,7 +250,7 @@ impl MemoryIndex {
         }
     }
 
-    fn run_write_tx<T>(
+    pub(super) fn run_write_tx<T>(
         &self,
         wait: bool,
         f: impl FnOnce(&DbTx<'_>) -> Result<T, Error>,
@@ -893,6 +893,7 @@ fn open_checked(path: &Path) -> Result<Connection, Error> {
     if layout != Some(LAYOUT) {
         reset(&conn, None, false)?;
     }
+    super::knowledge::sqlite_index::initialize(&conn)?;
     // A damaged file fails here and is recreated by the caller.
     conn.query_row(
         "SELECT count(*) FROM rag_chunks_fts WHERE rowid = 0",
@@ -985,7 +986,8 @@ pub(super) fn reset(
             .prepare(
                 "SELECT type, name FROM sqlite_master
                  WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
-                   AND name NOT LIKE 'rag_chunks_fts_%'",
+                   AND name NOT LIKE 'rag_chunks_fts_%'
+                   AND name NOT LIKE 'knowledge_rag_chunks_fts_%'",
             )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
@@ -997,6 +999,7 @@ pub(super) fn reset(
             ))?;
         }
         conn.execute_batch(SCHEMA_SQL)?;
+        super::knowledge::sqlite_index::create(conn)?;
         conn.execute(
             "INSERT INTO rag_chunks_fts(rag_chunks_fts, rank) VALUES('secure-delete', 1)",
             [],

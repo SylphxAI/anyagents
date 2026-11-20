@@ -203,3 +203,70 @@ fn check_contract(store: &Store) {
             .is_empty()
     );
 }
+
+#[test]
+fn sqlite_knowledge_replays_committed_revisions_after_index_contention_and_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.db");
+    let store = Store::open(&state).unwrap();
+    let owner = Actor::Owner("fixture-owner".into());
+    let scope = Scope::Namespace(INSTRUCTIONS.into());
+    let index = store.memory_index_path().to_path_buf();
+    let write = |store: &Store, topic: &str, version, body: &str, delete| {
+        store
+            .knowledge_write(
+                &owner,
+                INSTRUCTIONS,
+                topic,
+                Some(version),
+                &Edit {
+                    body: Some(body.into()),
+                    reason: "fixture".into(),
+                    ..Edit::default()
+                },
+                delete,
+            )
+            .unwrap()
+    };
+    let search =
+        |store: &Store, phrase| store.knowledge_search(&owner, &scope, phrase, 10).unwrap();
+    write(&store, "replace", 0, "oldsentinel", false);
+    write(&store, "retire", 0, "deletedsentinel", false);
+    assert_eq!(search(&store, "oldsentinel")[0].version, 1);
+    assert_eq!(search(&store, "deletedsentinel")[0].version, 1);
+
+    let blocker = rusqlite::Connection::open(&index).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Use a deadline and always release the external lock before joining, so
+    // the test reports the regression rather than deadlocking when it fails.
+    std::thread::scope(|thread| {
+        let (done, result) = std::sync::mpsc::channel();
+        let store = &store;
+        let writer = thread.spawn(move || {
+            write(store, "replace", 1, "newsentinel", false);
+            write(store, "retire", 1, "deletedsentinel", true);
+            done.send(()).unwrap();
+        });
+        let while_locked = result.recv_timeout(std::time::Duration::from_secs(3));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        writer.join().unwrap();
+        while_locked.expect("knowledge mutations must not wait for the index lock");
+    });
+    drop(blocker);
+    assert!(search(&store, "oldsentinel").is_empty());
+    assert!(search(&store, "deletedsentinel").is_empty());
+    assert_eq!(search(&store, "newsentinel")[0].version, 2);
+
+    // Rebuild across more than one batch, including repeated changes to one
+    // topic and a tombstone that must not become a searchable document.
+    for version in 2..132 {
+        write(&store, "replace", version, "newsentinel", false);
+    }
+    assert_eq!(search(&store, "newsentinel")[0].version, 132);
+    drop(store);
+    std::fs::remove_file(&index).unwrap();
+    let reopened = Store::open(&state).unwrap();
+    assert_eq!(search(&reopened, "newsentinel")[0].version, 132);
+    assert!(search(&reopened, "oldsentinel").is_empty());
+    assert!(search(&reopened, "deletedsentinel").is_empty());
+}

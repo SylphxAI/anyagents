@@ -33,7 +33,8 @@ fn knowledge_survives_copy_and_resume_with_optional_search() {
 
 fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
     let dir = tempfile::tempdir().unwrap();
-    let source = Store::open(dir.path().join("state.db")).unwrap();
+    let state_path = dir.path().join("state.db");
+    let source = Store::open(&state_path).unwrap();
     let owner = Actor::Owner("fixture-owner".into());
     let agent = source
         .create_agent(NewAgent::new("knowledge-reader", "test"))
@@ -43,6 +44,8 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
     let topic = "readiness";
     let phrase = "部署守則";
     let edit = Edit {
+        title: Some("Release checklist".into()),
+        description: Some("Verify the production rollout".into()),
         body: Some(phrase.into()),
         reason: "fixture".into(),
         sim_expected: Some("expected result".into()),
@@ -61,17 +64,54 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
         .knowledge_propose(&reader, ns, topic, 1, &edit)
         .unwrap();
 
-    source
+    let live = source
         .knowledge_write(&owner, ns, topic, Some(1), &edit, false)
         .unwrap();
+    source
+        .knowledge_write(&owner, ns, "retired", Some(0), &edit, false)
+        .unwrap();
+    source
+        .knowledge_write(&owner, ns, "retired", Some(1), &edit, true)
+        .unwrap();
+
+    // Never search on SQLite. Even if the memory cache was opened, migrate
+    // without it or any legacy projection in state.db.
+    drop(source);
+    for file in [
+        "memory-index.db",
+        "memory-index.db-wal",
+        "memory-index.db-shm",
+    ] {
+        let path = dir.path().join(file);
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let state = rusqlite::Connection::open_with_flags(
+        &state_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let projections: i64 = state
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name GLOB 'knowledge_rag_chunks*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        projections, 0,
+        "state.db must not contain a knowledge projection"
+    );
+    drop(state);
 
     let mut opts = MigrateToPostgresOptions::new(dir.path(), url);
     opts.master_key = None;
     opts.skip_index = true;
     let first = migrate_sqlite_dir_to_postgres(&opts).unwrap();
     for (table, count) in [
-        ("knowledge_docs", 1),
-        ("knowledge_revisions", 2),
+        ("knowledge_docs", 2),
+        ("knowledge_revisions", 4),
         ("knowledge_grants", 2),
         ("knowledge_proposals", 1),
     ] {
@@ -116,7 +156,17 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
         .unwrap();
     assert_eq!(
         (stat.sqlite_rows, stat.pg_rows_before, stat.pg_rows_after),
-        (2, 2, 2)
+        (4, 4, 4)
+    );
+    let stat = resumed
+        .tables
+        .iter()
+        .find(|s| s.pg_table == "knowledge_index.rag_chunks")
+        .unwrap();
+    assert_eq!(
+        (stat.sqlite_rows, stat.pg_rows_before, stat.pg_rows_after),
+        (1, 0, 1),
+        "only live documents should contribute to the projection"
     );
     let history = target
         .knowledge_revisions(&reader, ns, topic, None, 5)
@@ -149,11 +199,36 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
             .is_empty()
     );
 
+    let rerun = migrate_sqlite_dir_to_postgres(&opts).unwrap();
+    let stat = rerun
+        .tables
+        .iter()
+        .find(|s| s.pg_table == "knowledge_index.rag_chunks")
+        .unwrap();
+    assert_eq!(
+        (stat.sqlite_rows, stat.pg_rows_before, stat.pg_rows_after),
+        (1, 1, 1)
+    );
+
     opts.resume = false;
     migrate_sqlite_dir_to_postgres(&opts).unwrap();
+    let native = target
+        .knowledge_write(&owner, "org:parity", topic, Some(0), &edit, false)
+        .unwrap();
     rt.block_on(async {
         let config: PgConnectOptions = url.parse().unwrap();
         let mut conn = config.connect().await.unwrap();
+        let same_projection: bool = sqlx::query_scalar(
+            "SELECT migrated.content_hash = native.content_hash AND migrated.search_tsv = native.search_tsv
+             FROM knowledge_index.rag_chunks migrated, knowledge_index.rag_chunks native
+             WHERE migrated.chunk_id = $1 AND native.chunk_id = $2",
+        )
+        .bind(&live.id)
+        .bind(&native.id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(same_projection, "migrated and native hashes and tokens must agree");
         let err = sqlx::query("UPDATE public.knowledge_revisions SET reason = reason")
             .execute(&mut conn)
             .await

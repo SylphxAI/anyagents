@@ -18,16 +18,23 @@ pub struct SearchHit {
     pub description: String,
 }
 
-fn indexed_text(doc: &Doc) -> String {
-    format!(
-        "{}\n{}\n{}\n{}",
-        doc.topic, doc.title, doc.description, doc.body
-    )
+pub(super) fn indexed_text(topic: &str, title: &str, description: &str, body: &str) -> String {
+    format!("{topic}\n{title}\n{description}\n{body}")
+}
+
+pub(crate) fn projection_fields(
+    topic: &str,
+    title: &str,
+    description: &str,
+    body: &str,
+) -> (String, String) {
+    let text = indexed_text(topic, title, description, body);
+    (rag_content_hash(&text), search_tokens(&text))
 }
 
 // Store CJK phrase bigrams in uninterrupted order. Unigrams and ASCII terms
 // are separate so a single-character query does not break phrase matching.
-fn search_tokens(text: &str) -> String {
+pub(super) fn search_tokens(text: &str) -> String {
     let mut tokens = tokenize_hybrid_search_tokens(text);
     for run in cjk_runs(text) {
         tokens.push("zzragboundaryzz".into());
@@ -36,30 +43,18 @@ fn search_tokens(text: &str) -> String {
     tokens.join(" ")
 }
 
-pub(super) fn project(tx: &DbTx<'_>, doc: &Doc) -> Result<(), Error> {
-    let sqlite = tx.backend() == DbBackend::Sqlite;
-    let table = if sqlite {
-        "knowledge_rag_chunks"
-    } else {
-        "knowledge_index.rag_chunks"
-    };
+pub(super) fn project_postgres(tx: &DbTx<'_>, doc: &Doc) -> Result<(), Error> {
     if doc.deleted_at_ms.is_some() {
-        let changed = tx.db_execute(
-            &format!("DELETE FROM {table} WHERE chunk_id = ?1"),
+        tx.db_execute(
+            "DELETE FROM knowledge_index.rag_chunks WHERE chunk_id = ?1",
             &db_params![doc.id],
         )?;
-        if sqlite && changed != 0 {
-            tx.db_execute(
-                "DELETE FROM knowledge_rag_chunks_fts WHERE chunk_id = ?1",
-                &db_params![doc.id],
-            )?;
-        }
         return Ok(());
     }
-    let text = indexed_text(doc);
+    let text = indexed_text(&doc.topic, &doc.title, &doc.description, &doc.body);
     let hash = rag_content_hash(&text);
     let prior: Option<String> = tx.db_query_opt(
-        &format!("SELECT content_hash FROM {table} WHERE chunk_id = ?1"),
+        "SELECT content_hash FROM knowledge_index.rag_chunks WHERE chunk_id = ?1",
         &db_params![doc.id],
         |r| r.get(0),
     )?;
@@ -67,30 +62,12 @@ pub(super) fn project(tx: &DbTx<'_>, doc: &Doc) -> Result<(), Error> {
         return Ok(());
     }
     let tokens = search_tokens(&text);
-    if sqlite {
-        tx.db_execute(
-            "INSERT INTO knowledge_rag_chunks(chunk_id, content_hash) VALUES (?1, ?2)
-            ON CONFLICT(chunk_id) DO UPDATE SET content_hash = excluded.content_hash",
-            &db_params![doc.id, hash],
-        )?;
-        if prior.is_some() {
-            tx.db_execute(
-                "DELETE FROM knowledge_rag_chunks_fts WHERE chunk_id = ?1",
-                &db_params![doc.id],
-            )?;
-        }
-        tx.db_execute(
-            "INSERT INTO knowledge_rag_chunks_fts(chunk_id, search_tokens) VALUES (?1, ?2)",
-            &db_params![doc.id, tokens],
-        )?;
-    } else {
-        tx.db_execute(
-            "INSERT INTO knowledge_index.rag_chunks(chunk_id, content_hash, search_tsv)
-            VALUES (?1, ?2, to_tsvector('simple', ?3)) ON CONFLICT(chunk_id) DO UPDATE
-            SET content_hash = excluded.content_hash, search_tsv = excluded.search_tsv",
-            &db_params![doc.id, hash, tokens],
-        )?;
-    }
+    tx.db_execute(
+        "INSERT INTO knowledge_index.rag_chunks(chunk_id, content_hash, search_tsv)
+        VALUES (?1, ?2, to_tsvector('simple', ?3)) ON CONFLICT(chunk_id) DO UPDATE
+        SET content_hash = excluded.content_hash, search_tsv = excluded.search_tsv",
+        &db_params![doc.id, hash, tokens],
+    )?;
     Ok(())
 }
 
@@ -105,7 +82,7 @@ impl Store {
         if query.trim().is_empty() || query.len() > 256 || query.contains('\0') {
             return Err(invalid("search requires 1–256 bytes"));
         }
-        let conn = self.read_conn();
+        let conn = self.knowledge_search_reader()?;
         require_scope(&conn, actor, scope)?;
         let mut groups: Vec<Vec<String>> = cjk_runs(query).map(cjk_phrase_tokens).collect();
         groups.extend(
@@ -122,6 +99,7 @@ impl Store {
         }
         let sqlite = conn.backend() == DbBackend::Sqlite;
         let query = if sqlite {
+            self.sync_knowledge_sqlite(&conn)?;
             groups
                 .iter()
                 .map(|g| format!("\"{}\"", g.join(" ")))
@@ -136,15 +114,18 @@ impl Store {
         };
         let mut params = db_params![query, limit.clamp(1, 50) as i64];
         let visible = visibility(actor, scope, &mut params);
-        let (join, matches, rank) = if sqlite {
+        let (join, document, matches, rank) = if sqlite {
             (
-                "knowledge_rag_chunks_fts c",
+                "memory_index.knowledge_rag_chunks_fts f
+                 JOIN memory_index.knowledge_rag_chunks c ON c.rowid = f.rowid",
+                "d.id = c.chunk_id AND d.version = c.version",
                 "knowledge_rag_chunks_fts MATCH ?1",
                 "bm25(knowledge_rag_chunks_fts)",
             )
         } else {
             (
                 "knowledge_index.rag_chunks c",
+                "d.id = c.chunk_id",
                 "c.search_tsv @@ to_tsquery('simple', ?1)",
                 "-ts_rank_cd(c.search_tsv, to_tsquery('simple', ?1))",
             )
@@ -152,7 +133,7 @@ impl Store {
         conn.db_query_vec(
             &format!(
                 "SELECT d.namespace, d.topic, d.version, d.title, d.description
-            FROM {join} JOIN knowledge_docs d ON d.id = c.chunk_id
+            FROM {join} JOIN knowledge_docs d ON {document}
             WHERE d.deleted_at_ms IS NULL AND ({visible}) AND ({matches})
             ORDER BY {rank}, d.pinned DESC, d.namespace, d.topic LIMIT ?2"
             ),

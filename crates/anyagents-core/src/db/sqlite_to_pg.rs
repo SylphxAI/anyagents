@@ -144,6 +144,12 @@ struct TableSpec {
     cols: &'static [ColSpec],
     extra_pg_cols: Option<&'static str>,
     pg_select: Option<&'static str>,
+    sqlite_projection: Option<SqliteProjection>,
+}
+
+struct SqliteProjection {
+    select: &'static str,
+    push: fn(&rusqlite::Row<'_>, &mut [ColBuf]) -> Result<(), Error>,
 }
 
 impl TableSpec {
@@ -159,6 +165,7 @@ impl TableSpec {
             cols,
             extra_pg_cols: None,
             pg_select: None,
+            sqlite_projection: None,
         }
     }
 }
@@ -366,15 +373,15 @@ fn copy_table(
     resume: bool,
 ) -> Result<TableMigrationStat, Error> {
     let pg_before = block_on_pg(pg_count(pool, spec.pg_table))?;
-    if !sqlite_table_exists(sqlite, spec.sqlite_table)? {
-        return Ok(TableMigrationStat {
-            pg_table: spec.pg_table.to_owned(),
-            sqlite_rows: 0,
-            pg_rows_before: pg_before,
-            pg_rows_after: pg_before,
-        });
-    }
-    let expected = sqlite_count(sqlite, spec.sqlite_table)?;
+    let expected = match &spec.sqlite_projection {
+        Some(_) if sqlite_table_exists(sqlite, spec.sqlite_table)? => sqlite.query_row(
+            &format!("SELECT COUNT(*) FROM {}", spec.sqlite_from),
+            [],
+            |r| r.get(0),
+        )?,
+        Some(_) => 0,
+        None => sqlite_count(sqlite, spec.sqlite_table)?,
+    };
     if expected == 0 {
         return Ok(TableMigrationStat {
             pg_table: spec.pg_table.to_owned(),
@@ -396,12 +403,15 @@ fn copy_table(
         });
     }
 
-    let select_cols = spec
-        .cols
-        .iter()
-        .map(|c| c.sqlite_expr)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let select_cols = match &spec.sqlite_projection {
+        Some(projection) => projection.select.to_owned(),
+        None => spec
+            .cols
+            .iter()
+            .map(|c| c.sqlite_expr)
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
     let select_sql = format!("SELECT {select_cols} FROM {}", spec.sqlite_from);
     let mut stmt = sqlite.prepare(&select_sql)?;
     let mut rows = stmt.query([])?;
@@ -418,8 +428,12 @@ fn copy_table(
     let mut next_progress = progress_step;
     let mut copied = 0_i64;
     while let Some(row) = rows.next()? {
-        for (idx, col) in spec.cols.iter().enumerate() {
-            bufs[idx].push_cell(row.get_ref(idx)?, col.kind)?;
+        if let Some(projection) = &spec.sqlite_projection {
+            (projection.push)(row, &mut bufs)?;
+        } else {
+            for (idx, col) in spec.cols.iter().enumerate() {
+                bufs[idx].push_cell(row.get_ref(idx)?, col.kind)?;
+            }
         }
         copied += 1;
         if bufs[0].len() >= batch_size {
@@ -1042,6 +1056,7 @@ const MEMORY_INDEX_TABLES: &[TableSpec] = &[
     TableSpec {
         sqlite_table: "rag_chunks",
         sqlite_from: "rag_chunks r LEFT JOIN rag_chunks_fts f ON f.rowid = r.rowid",
+        sqlite_projection: None,
         pg_table: "memory_index.rag_chunks",
         cols: &[
             ColSpec {
@@ -1190,6 +1205,7 @@ const HOST_INDEX_TABLES: &[TableSpec] = &[
         // `f.tokens` via `LEFT JOIN host_fts` always yields NULL while triggering a
         // random per-row virtual-table probe across millions of rows.
         sqlite_from: "host_windows w",
+        sqlite_projection: None,
         pg_table: "host_index.host_windows",
         cols: &[
             ColSpec {

@@ -10,12 +10,14 @@ use crate::{AgentId, Error, db_params};
 mod access;
 mod proposals;
 mod search;
+pub(super) mod sqlite_index;
 mod wake;
 
 pub use access::{Actor, Grant, Mode, Scope};
 use access::{require, require_scope, visibility};
 pub use proposals::Proposal;
 pub use search::SearchHit;
+pub(crate) use search::projection_fields;
 
 const DOC: &str = "d.id, d.namespace, d.topic, d.title, d.description, d.body, d.pinned, d.version, d.updated_by, d.created_at_ms, d.updated_at_ms, d.deleted_at_ms, d.content_hash";
 const MAX_BODY: usize = 16 * 1024;
@@ -358,7 +360,9 @@ fn save(
             prior.as_ref().map(|d| d.body.as_str()), edit.reason, edit.sim_problem, edit.sim_expected, edit.sim_observed,
             edit.sim_context, now, doc.deleted_at_ms],
     )?;
-    search::project(tx, &doc)?;
+    if tx.backend() == crate::db::DbBackend::Postgres {
+        search::project_postgres(tx, &doc)?;
+    }
     Ok(doc)
 }
 

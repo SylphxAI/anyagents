@@ -1,5 +1,10 @@
-//! Knowledge table specifications in dependency order.
-use super::{ColSpec, TableSpec};
+//! Durable knowledge table specifications and the optional search rebuild.
+
+use rusqlite::Row;
+
+use super::{ColBuf, ColSpec, SqliteProjection, TableSpec, sqlite_cell_to_string};
+use crate::error::Error;
+use crate::store::knowledge::projection_fields;
 
 // Run after agents (grants) and before the optional projection (documents).
 pub(super) const KNOWLEDGE_TABLES: &[TableSpec] = &[
@@ -76,15 +81,38 @@ pub(super) const KNOWLEDGE_TABLES: &[TableSpec] = &[
 ];
 
 pub(super) const KNOWLEDGE_INDEX: TableSpec = TableSpec {
-    sqlite_table: "knowledge_rag_chunks",
-    sqlite_from: "knowledge_rag_chunks r JOIN knowledge_rag_chunks_fts f ON f.chunk_id = r.chunk_id",
+    sqlite_table: "knowledge_docs",
+    sqlite_from: "knowledge_docs WHERE deleted_at_ms IS NULL",
     pg_table: "knowledge_index.rag_chunks",
     cols: &[
-        ColSpec::expr_txt("r.chunk_id", "chunk_id"),
-        ColSpec::expr_txt("r.content_hash", "content_hash"),
-        ColSpec::expr_txt("f.search_tokens", "search_tsv"),
+        ColSpec::txt("chunk_id"),
+        ColSpec::txt("content_hash"),
+        ColSpec::txt("search_tsv"),
     ],
     extra_pg_cols: None,
-    // SQLite stores the same hybrid/CJK tokens the PostgreSQL writer uses.
     pg_select: Some("t.chunk_id, t.content_hash, to_tsvector('simple', t.search_tsv)"),
+    sqlite_projection: Some(SqliteProjection {
+        select: "id, topic, title, description, body",
+        push: push_projection,
+    }),
 };
+
+fn push_projection(row: &Row<'_>, bufs: &mut [ColBuf]) -> Result<(), Error> {
+    let [
+        ColBuf::Text(ids),
+        ColBuf::Text(hashes),
+        ColBuf::Text(tokens),
+    ] = bufs
+    else {
+        unreachable!("knowledge projection requires three text buffers");
+    };
+    // Use the same text sanitization as the durable document copy.
+    let text =
+        |idx: usize| Ok::<_, Error>(sqlite_cell_to_string(row.get_ref(idx)?)?.unwrap_or_default());
+    let (id, topic, title, description, body) = (text(0)?, text(1)?, text(2)?, text(3)?, text(4)?);
+    let (hash, search_tokens) = projection_fields(&topic, &title, &description, &body);
+    ids.push(id);
+    hashes.push(hash);
+    tokens.push(search_tokens);
+    Ok(())
+}
