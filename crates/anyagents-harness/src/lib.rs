@@ -10,6 +10,8 @@ pub mod masking;
 pub mod media;
 mod name;
 pub mod quota;
+pub mod remote;
+pub mod runtime;
 mod seat;
 mod stamp;
 
@@ -23,6 +25,17 @@ pub use atomic_fs::{
 };
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;
+pub use remote::{
+    FakeRemoteProvider, RemoteBudget, RemoteCapabilities, RemoteConsumptionProof,
+    RemoteDeliveryAck, RemoteDeliveryInput, RemoteEvent, RemoteSessionConfig, RemoteSessionError,
+    RemoteSessionHandle, RemoteSessionHarness, RemoteSessionProvider,
+};
+pub use runtime::{
+    ExecutionRuntime, KNOWN_SANDBOX_PROVIDERS, REMOTE_BUDGET_MICROS_ENV_KEY, RUNTIME_ENV_KEY,
+    ResolvedExecution, RuntimeResolutionError, decompose_harness_selector,
+    decompose_legacy_selector, resolve_harness_and_runtime, resolve_stored_budget_micros,
+    resolve_stored_runtime, supported_runtime_kinds,
+};
 pub use stamp::FileStamp;
 
 /// Internal environment key the server sets when an agent has an OS seat. It
