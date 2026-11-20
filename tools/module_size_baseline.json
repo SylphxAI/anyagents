@@ -7,7 +7,6 @@
     "crates/anyagents-core/src/db/sqlite_to_pg.rs": 2312,
     "crates/anyagents-core/src/host_index.rs": 1862,
     "crates/anyagents-core/src/host_retrieval.rs": 2728,
-    "crates/anyagents-core/src/store/memory_index.rs": 1871,
     "crates/anyagents-harness-claude/src/lib.rs": 1941,
     "crates/anyagents-harness-codex/src/lib.rs": 1761,
     "crates/anyagents-harness-opencode/src/lib.rs": 2600,
