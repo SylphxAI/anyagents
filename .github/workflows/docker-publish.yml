@@ -17,6 +17,7 @@ name: docker-publish
 
 on:
   push:
+    branches: [main]
     tags:
       - 'v*'
   release:
@@ -41,7 +42,7 @@ on:
       platforms:
         description: Comma-separated OCI target platforms
         required: false
-        # Avoid slow QEMU arm64 builds by default. Dispatch can opt in; tags/releases stay multi-arch.
+        # Main and dispatch default to native amd64; tags and releases remain multi-arch.
         default: linux/amd64
         type: string
       install_harnesses:
@@ -102,13 +103,18 @@ jobs:
           INPUT_PUSH: ${{ inputs.push }}
           REPO_OWNER: ${{ github.repository_owner }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           registry="${INPUT_REGISTRY:-ghcr.io}"
           registry="${registry%/}"
           raw_ns="${INPUT_NAMESPACE:-$REPO_OWNER}"
           namespace="$(printf '%s' "$raw_ns" | tr '[:upper:]' '[:lower:]')"
-          platforms="${INPUT_PLATFORMS:-linux/amd64,linux/arm64}"
+          default_platforms="linux/amd64,linux/arm64"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || { [ "$EVENT_NAME" = "push" ] && [ "$REF" = "refs/heads/main" ]; }; then
+            default_platforms="linux/amd64"
+          fi
+          platforms="${INPUT_PLATFORMS:-$default_platforms}"
           harnesses="${INPUT_HARNESSES:-claude-code codex opencode}"
           spiron_install_url="${INPUT_SPIRON_INSTALL_URL:-}"
           spiron_npm_pkg="${INPUT_SPIRON_NPM_PKG:-}"
@@ -177,6 +183,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=tag
             type=sha,prefix=sha-
+            type=ref,event=branch
             type=raw,value=latest,enable=${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=${{ needs.resolve.outputs.extra_tag }},enable=${{ needs.resolve.outputs.extra_tag != '' }}
 
@@ -186,6 +193,8 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-args: |
+            ANYAGENTS_GIT_SHA=${{ github.sha }}
           platforms: ${{ needs.resolve.outputs.platforms }}
           push: ${{ needs.resolve.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -266,7 +275,8 @@ jobs:
             type=semver,pattern=${{ matrix.tag_prefix }}-{{major}}.{{minor}}
             type=ref,event=tag,prefix=${{ matrix.tag_prefix }}-
             type=sha,prefix=${{ matrix.tag_prefix }}-sha-
-            type=raw,value=${{ matrix.tag_prefix }},enable=${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || needs.resolve.outputs.extra_tag == '' }}
+            type=ref,event=branch,prefix=${{ matrix.tag_prefix }}-
+            type=raw,value=${{ matrix.tag_prefix }},enable=${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && needs.resolve.outputs.extra_tag == '') }}
             type=raw,value=${{ matrix.tag_prefix }}-${{ needs.resolve.outputs.extra_tag }},enable=${{ needs.resolve.outputs.extra_tag != '' }}
 
       - name: Build and push ${{ matrix.target }} OCI image
@@ -313,9 +323,14 @@ jobs:
 
   summary:
     needs: [resolve, coordinator, sandbox]
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && needs.resolve.outputs.push == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      coordinator: ${{ steps.receipts.outputs.coordinator }}
+      sandbox_base: ${{ steps.receipts.outputs.sandbox_base }}
+      sandbox_dev: ${{ steps.receipts.outputs.sandbox_dev }}
+      sandbox_full: ${{ steps.receipts.outputs.sandbox_full }}
     steps:
       - name: Download digest receipts
         uses: actions/download-artifact@v4
@@ -325,12 +340,19 @@ jobs:
           merge-multiple: true
 
       - name: Emit immutable OCI digest summary
+        id: receipts
         run: |
           set -euo pipefail
           coord="$(cat "$RUNNER_TEMP/digests/coordinator.txt")"
           base="$(cat "$RUNNER_TEMP/digests/sandbox-base.txt")"
           dev="$(cat "$RUNNER_TEMP/digests/sandbox-dev.txt")"
           full="$(cat "$RUNNER_TEMP/digests/sandbox-full.txt")"
+          {
+            echo "coordinator=$coord"
+            echo "sandbox_base=$base"
+            echo "sandbox_dev=$dev"
+            echo "sandbox_full=$full"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "## Published OCI Images (Immutable Digests)"
             echo ""

@@ -3,6 +3,14 @@
 ARG RUST_IMAGE=rust:1-bookworm
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 
+# Build from console source, independent of the target Rust architecture.
+FROM --platform=$BUILDPLATFORM node:22.23.5-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS console
+WORKDIR /src/apps/console
+COPY apps/console/package.json apps/console/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY apps/console ./
+RUN npm run build
+
 FROM ${RUST_IMAGE} AS builder
 
 WORKDIR /src
@@ -15,6 +23,10 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
+RUN rm -rf crates/anyagents/src/server/console
+COPY --from=console /src/crates/anyagents/src/server/console ./crates/anyagents/src/server/console
+
+ARG ANYAGENTS_GIT_SHA
 
 RUN cargo build --release --locked -p anyagents --bin anyagents \
     && (strip /src/target/release/anyagents || true)

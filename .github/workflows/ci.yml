@@ -41,7 +41,7 @@ env:
 
 jobs:
   # Compute crate-graph path-scoping from Cargo.toml and run fast policy and
-  # module-size ratchet checks on every run. Docs/markdown/AGENTS.md/prebuilt/
+  # module-size ratchet checks on every run. Docs/markdown/AGENTS.md/
   # tools-only PRs skip heavy Rust and macOS jobs; leaf-crate-only PRs scope
   # clippy/tests to touched crates + Cargo reverse dependents; core/coordinator
   # and non-diff runs (push/main, manual) execute the full workspace suite.

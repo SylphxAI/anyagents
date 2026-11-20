@@ -1,6 +1,8 @@
 //! Native Sylphx Sandboxes v1 REST/Connect-RPC client, persistent volume/lease
 //! lifecycle, and [`SandboxMode`] isolation policy.
 
+use super::image_version::{LeaseVersion, configured_sylphx_image, desired_ref};
+
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -352,6 +354,8 @@ pub struct SylphxVolume {
 /// Sylphx Sandboxes v1 compute lease metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SylphxLease {
+    #[serde(default, flatten)]
+    pub(crate) version: LeaseVersion,
     pub resource_name: String,
     pub id: String,
     #[serde(default)]
@@ -865,31 +869,6 @@ impl SylphxSandboxClient {
         self.wait_volume_available(parent, vol, VOLUME_READY_TIMEOUT)
     }
 
-    /// Create a sandbox lease attaching `volume_resource` (`POST /v1/{parent}/leases`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_lease(
-        &self,
-        parent: &str,
-        volume_resource: &str,
-        mount_path: &str,
-        template: &str,
-        shape: &str,
-        env: &BTreeMap<String, String>,
-        ttl: Option<&str>,
-    ) -> Result<SylphxLease, String> {
-        self.create_lease_with_options(
-            parent,
-            volume_resource,
-            mount_path,
-            None,
-            Some(template),
-            shape,
-            env,
-            ttl,
-            None,
-        )
-    }
-
     /// Create a sandbox lease supporting BYO digest-pinned OCI `image`, `template`,
     /// persistent volume mount, and per-lease [`super::providers::NetworkPolicySpec`].
     #[allow(clippy::too_many_arguments)]
@@ -910,20 +889,8 @@ impl SylphxSandboxClient {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(DEFAULT_LEASE_TTL);
         let mut spec = serde_json::Map::new();
-        let image_ref = if let Some(img) = image.map(str::trim).filter(|s| !s.is_empty()) {
-            img.to_string()
-        } else {
-            let tpl = template
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_TEMPLATE);
-            if tpl.starts_with("template:") {
-                tpl.to_string()
-            } else {
-                format!("template:{tpl}")
-            }
-        };
-        spec.insert("image".into(), serde_json::json!(image_ref));
+        let image_ref = desired_ref(image, template.unwrap_or(DEFAULT_TEMPLATE));
+        spec.insert("image".into(), serde_json::json!(&image_ref));
         if !shape.trim().is_empty() {
             spec.insert("shape".into(), serde_json::json!(shape.trim()));
         }
@@ -984,7 +951,9 @@ impl SylphxSandboxClient {
                 compact_error_body(&val)
             ));
         }
-        parse_lease_response(&val, parent)
+        let mut lease = parse_lease_response(&val, parent)?;
+        lease.version.image.get_or_insert(image_ref);
+        Ok(lease)
     }
 
     /// Update outbound egress policy on a live lease (`POST /v1/{lease_resource}:setNetwork`).
@@ -1176,6 +1145,8 @@ impl SylphxSandboxClient {
                 format!("Sylphx lease {resource} disappeared while waiting for READY")
             })?;
             if current.is_ready() {
+                let mut current = current;
+                current.version.inherit_missing(lease.version);
                 return Ok(current);
             }
             if current.is_terminal() {
@@ -1188,14 +1159,18 @@ impl SylphxSandboxClient {
     }
 
     /// Renew an active lease TTL (`POST /v1/{lease_resource}:renew`).
-    pub fn renew_lease(
+    pub(crate) fn renew_matching_lease(
         &self,
-        parent: &str,
-        lease_id_or_name: &str,
+        lease: &SylphxLease,
+        desired: &str,
         ttl: Option<&str>,
     ) -> Result<SylphxLease, String> {
-        let resource = self.resolve_resource(parent, "leases", lease_id_or_name);
-        let url = format!("{}:renew", self.v1_resource_url(&resource));
+        if lease.is_terminal() || !lease.version.matches(desired) {
+            return Err(
+                "Sylphx lease image does not match desired image; wait for a safe drain".into(),
+            );
+        }
+        let url = format!("{}:renew", self.v1_resource_url(&lease.resource_name));
         let ttl_val = ttl
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(DEFAULT_LEASE_TTL);
@@ -1207,7 +1182,13 @@ impl SylphxSandboxClient {
                 compact_error_body(&val)
             ));
         }
-        parse_lease_response(&val, parent)
+        let parent = lease
+            .resource_name
+            .rsplit_once("/leases/")
+            .map_or("", |(p, _)| p);
+        let mut renewed = parse_lease_response(&val, parent)?;
+        renewed.version.inherit_missing(lease.version.clone());
+        Ok(renewed)
     }
 
     /// Release an active lease on idle / pause / archive (`POST /v1/{lease_resource}:release`).
@@ -1257,24 +1238,27 @@ impl SylphxSandboxClient {
                 Some(self.wait_lease_ready(&provider.parent, fetched, LEASE_READY_TIMEOUT)?);
         }
 
+        let (image, desired) = configured_sylphx_image(config_dir, &provider.template)?;
         let lease = match reused_lease {
-            Some(active) => {
-                let _ = self.renew_lease(
-                    &provider.parent,
-                    &active.resource_name,
-                    Some(DEFAULT_LEASE_TTL),
+            Some(active) if !active.version.matches(&desired) => {
+                return Err(
+                    "Sylphx lease image does not match desired image; wait for a safe drain".into(),
                 );
-                active
             }
+            Some(active) => self
+                .renew_matching_lease(&active, &desired, None)
+                .unwrap_or(active),
             None => {
-                let created = self.create_lease(
+                let created = self.create_lease_with_options(
                     &provider.parent,
                     &vol.resource_name,
                     &provider.mount_path,
-                    &provider.template,
+                    image.as_deref(),
+                    Some(&provider.template),
                     &provider.shape,
                     env,
-                    Some(DEFAULT_LEASE_TTL),
+                    None,
+                    None,
                 )?;
                 self.wait_lease_ready(&provider.parent, created, LEASE_READY_TIMEOUT)?
             }
@@ -1944,9 +1928,12 @@ pub fn renew_lease_for_config_dir(config_dir: &Path) -> Result<bool, String> {
     else {
         return Ok(false);
     };
-    let renewed = cfg
-        .client()
-        .renew_lease(&cfg.parent, &lease_ref, Some(DEFAULT_LEASE_TTL))?;
+    let client = cfg.client();
+    let (_, desired) = configured_sylphx_image(config_dir, &cfg.template)?;
+    let Some(lease) = client.get_lease(&cfg.parent, &lease_ref)? else {
+        return Ok(false);
+    };
+    let renewed = client.renew_matching_lease(&lease, &desired, None)?;
     cfg.expires_at = renewed.expires_at;
     if let Some(url) = renewed.envd_url {
         cfg.envd_url = Some(url);
@@ -2315,6 +2302,7 @@ fn parse_lease_response(val: &serde_json::Value, parent: &str) -> Result<SylphxL
         }
     }
     Ok(SylphxLease {
+        version: LeaseVersion::from_response(root),
         resource_name,
         id,
         state,

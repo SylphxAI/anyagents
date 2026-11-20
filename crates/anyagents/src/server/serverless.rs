@@ -544,15 +544,30 @@ async fn dispatch_sandbox_turn(
         metadata_json: Some(Value::Object(meta)),
         next_poll_at_ms: None,
     };
-    let Some(created) =
-        run_store_blocking(
-            move || match store_create.remote_turn_store().create_turn(&new_turn) {
-                Ok(turn) => Ok(Some(turn)),
-                Err(err) if err.is_active_turn_conflict() => Ok(None),
-                Err(err) => Err(format!("failed to persist pending sandbox turn: {err}")),
-            },
-        )
-        .await?
+    let upgrade_provider = Arc::clone(&provider);
+    let Some(created) = run_store_blocking(move || {
+        let _guard = match store_create.try_lock_agent(&new_turn.agent_id) {
+            Ok(guard) => guard,
+            Err(anyagents_core::Error::AgentBusy) => {
+                return Err("agent lease is being reconciled; retry dispatch".into());
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+        if crate::sandbox_upgrade::recycle_at_boundary(
+            &store_create,
+            &new_turn.agent_id,
+            Some(upgrade_provider.as_ref()),
+        )? == crate::sandbox_upgrade::Action::DrainScheduled
+        {
+            return Ok(None);
+        }
+        match store_create.remote_turn_store().create_turn(&new_turn) {
+            Ok(turn) => Ok(Some(turn)),
+            Err(err) if err.is_active_turn_conflict() => Ok(None),
+            Err(err) => Err(format!("failed to persist pending sandbox turn: {err}")),
+        }
+    })
+    .await?
     else {
         return Ok(None);
     };

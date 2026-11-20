@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use super::super::sylphx::{DEFAULT_SHAPE, DEFAULT_TEMPLATE, SylphxSandboxClient};
+use super::super::image_version::desired_ref;
+use super::super::sylphx::{DEFAULT_SHAPE, DEFAULT_TEMPLATE, SylphxLease, SylphxSandboxClient};
 use agent_tools::base64_encode;
 
 static TAR_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -200,30 +201,34 @@ impl SandboxProvider for SylphxProvider {
                     Some(client.wait_lease_ready(&cfg.parent, discovered, LEASE_READY_TIMEOUT)?);
             }
 
+            let image = req
+                .image
+                .image
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(cfg.default_image.as_deref());
+            let template = req
+                .image
+                .template
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cfg.default_template);
+            let desired = desired_ref(image, template);
+            let reuse = |active: SylphxLease| -> Result<SylphxLease, String> {
+                if !active.version.matches(&desired) {
+                    return Err(
+                        "Sylphx lease image does not match desired image; wait for a safe drain"
+                            .into(),
+                    );
+                }
+                Ok(client
+                    .renew_matching_lease(&active, &desired, Some(&ttl_str))
+                    .unwrap_or(active))
+            };
             let lease = match reused_lease {
-                Some(active) => client
-                    .renew_lease(&cfg.parent, &active.resource_name, Some(&ttl_str))
-                    .unwrap_or(active),
+                Some(active) => reuse(active)?,
                 None => {
-                    let image = req
-                        .image
-                        .image
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| {
-                            cfg.default_image
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                        });
-                    let template = req
-                        .image
-                        .template
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(&cfg.default_template);
                     let shape = req
                         .shape
                         .as_deref()
@@ -264,13 +269,7 @@ impl SandboxProvider for SylphxProvider {
                                         discovered,
                                         LEASE_READY_TIMEOUT,
                                     )?;
-                                    break client
-                                        .renew_lease(
-                                            &cfg.parent,
-                                            &ready.resource_name,
-                                            Some(&ttl_str),
-                                        )
-                                        .unwrap_or(ready);
+                                    break reuse(ready)?;
                                 }
                                 if attempt < COLLISION_BACKOFF_MS.len() {
                                     std::thread::sleep(Duration::from_millis(
@@ -311,6 +310,11 @@ impl SandboxProvider for SylphxProvider {
             });
 
             let mut metadata = BTreeMap::new();
+            metadata.insert(
+                "lease_version".into(),
+                serde_json::to_string(&lease.version).map_err(|e| e.to_string())?,
+            );
+            metadata.insert("desired_image".into(), desired);
             metadata.insert("parent".to_string(), cfg.parent.clone());
             metadata.insert("volume_resource".to_string(), volume.resource_name.clone());
             metadata.insert("lease_resource".to_string(), lease.resource_name.clone());

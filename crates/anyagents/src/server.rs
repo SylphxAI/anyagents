@@ -65,6 +65,7 @@ pub(crate) mod serverless_watches;
 mod takeover_tunnel;
 pub(crate) mod timer_fire;
 mod types;
+mod versions;
 mod webhooks_mcp;
 
 pub(crate) use profiles::ServedProfile;

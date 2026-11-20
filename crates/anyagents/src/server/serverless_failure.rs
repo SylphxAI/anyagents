@@ -162,11 +162,19 @@ pub(super) fn finalize_settled_turn_runtime_and_binding(
     now: i64,
     inflight_children: i32,
 ) {
+    let _guard = if turn.harness_kind == "sandbox" {
+        let Ok(guard) = store.try_lock_agent(&turn.agent_id) else {
+            return;
+        };
+        Some(guard)
+    } else {
+        None
+    };
     let still_active = store
         .remote_turn_store()
         .list_active_for_agent(&turn.agent_id)
         .map(|v| !v.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !still_active {
         let _ = store.reconcile_stale_open_turn(&turn.agent_id);
     }
@@ -183,7 +191,7 @@ pub(super) fn finalize_settled_turn_runtime_and_binding(
             inflight_children: inflight_children.max(0),
         },
     );
-    if turn.status == "failed" && turn.harness_kind == "sandbox" && !still_active {
+    if turn.status == "failed" && turn.harness_kind == "sandbox" && !busy {
         release_and_clear_sandbox_lease(store, &turn.agent_id);
     } else if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
         let _ = store
@@ -204,17 +212,29 @@ pub(super) fn finalize_settled_turn_runtime_and_binding(
             }
         }
     }
+    if !busy
+        && turn.harness_kind == "sandbox"
+        && let Err(err) = crate::sandbox_upgrade::recycle_at_boundary(store, &turn.agent_id, None)
+    {
+        eprintln!(
+            "anyagents-sandbox: turn-boundary drain failed for {}: {err}",
+            turn.agent_id
+        );
+    }
 }
 
 /// Detach any stale/failed sandbox lease and clear orphaned turn-recovery/runtime
 /// state after an abnormal sandbox turn failure so the next wake provisions a
 /// fresh sandbox (preserving persistent volumes) instead of wedging on a dead lease.
 pub(super) fn cleanup_after_failed_sandbox_turn(store: &Store, agent_id: &AgentId, now_ms: i64) {
+    let Ok(_guard) = store.try_lock_agent(agent_id) else {
+        return;
+    };
     let still_active = store
         .remote_turn_store()
         .list_active_for_agent(agent_id)
         .map(|v| !v.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if still_active {
         return;
     }

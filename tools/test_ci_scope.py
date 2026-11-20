@@ -26,7 +26,6 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                 "AGENTS.md",
                 "README.md",
                 "docs/architecture.md",
-                "Dockerfile.prebuilt",
                 "sylphx.toml",
                 "tools/module_size_scan.py",
                 "tools/module_size_baseline.json",
