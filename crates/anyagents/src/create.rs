@@ -8,6 +8,7 @@ use anyagents_core::{Agent, Error, Store};
 
 mod archetypes;
 mod credentials;
+mod model_defaults;
 mod profile_identity;
 mod profile_rotation;
 mod profiles;
@@ -39,12 +40,16 @@ pub(crate) use credentials::{
     sync_fresher_bound_agent_credentials, sync_fresher_bound_agent_credentials_in,
     write_profile_marker,
 };
+pub(crate) use model_defaults::{
+    persist_spawned_agent_config_to_store, resolve_default_model_for_harness,
+};
 pub(crate) use profile_identity::{extract_profile_account_identity, update_profile_json_identity};
 pub(crate) use profile_rotation::{force_refresh_provider_profiles, try_rotate_exhausted_profile};
 pub(crate) use profiles::{
     ProviderProfileEntry, bound_profile_name, bound_profile_of_provider, compatible_harnesses_for,
-    ensure_harness_runs_profile, ensure_profile_compatible_and_mapped, list_harness_profiles,
-    list_provider_profiles_fast, set_provider_profile, sync_and_list_provider_profiles,
+    ensure_harness_runs_profile, ensure_profile_compatible_and_mapped,
+    hydrate_profiles_from_store_if_postgres, list_harness_profiles, list_provider_profiles_fast,
+    set_provider_profile, sync_and_list_provider_profiles,
     sync_and_list_provider_profiles_with_options, upstream_provider_of,
 };
 pub(crate) use quota::{

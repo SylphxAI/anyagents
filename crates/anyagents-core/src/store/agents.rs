@@ -520,6 +520,12 @@ impl Store {
             .into_iter()
             .map(|(id, errors)| (id.to_string(), errors))
             .collect();
+        let fresh_since =
+            now_ms().saturating_sub(crate::stateless::ACTIVE_REMOTE_TURN_FRESHNESS_MS);
+        metadata.active_remote_turns = self
+            .remote_turn_store()
+            .list_active_fresh_by_agent(fresh_since)
+            .unwrap_or_default();
         Ok(metadata)
     }
 

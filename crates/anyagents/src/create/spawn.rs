@@ -247,13 +247,21 @@ pub(super) fn create_with_seat_and_sandbox_mode(
             .unwrap_or(DEFAULT_AGENT_ROLE)
             .to_string(),
     );
+    let parent_for_model = request
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok());
     new.model = request
         .model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            (normalized_harness == "spiron" || normalized_harness == "spiron-local")
-                .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
+            super::resolve_default_model_for_harness(
+                data,
+                &normalized_harness,
+                request.profile.as_deref(),
+                parent_for_model.as_ref(),
+            )
         });
     new.description = request
         .description
@@ -671,6 +679,7 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         let mut pre_running = agent.clone();
         pre_running.workdir = Some(cwd.display().to_string());
         reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd)?;
+        super::persist_spawned_agent_config_to_store(store, &agent.id, &config);
         let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
         Ok(running)
     })();

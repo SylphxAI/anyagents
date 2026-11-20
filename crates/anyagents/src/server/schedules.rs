@@ -115,14 +115,47 @@ pub(super) fn list_fleet_schedules(
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     // Reject unknown/absent agent principals fail-closed even when no schedules exist.
-    if let Principal::Agent { agent_id, .. } = principal {
-        store.agent(agent_id).map_err(ApiError::from_store)?;
-    }
-    // Load all schedules in a single query instead of iterating every archived/active
-    // agent (which caused O(N) queries across thousands of archived agents).
+    let caller_agent = match principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => {
+            Some(store.agent(agent_id).map_err(ApiError::from_store)?)
+        }
+    };
+    let caller_is_admin = caller_agent.as_ref().is_some_and(|a| a.is_admin);
+    // Load active schedules and live agents in 2 batched queries instead of N+1
+    // per-owner ancestry lookups.
     let all_schedules = store
         .list_schedules(None, true)
         .map_err(ApiError::from_store)?;
+    if all_schedules.is_empty() {
+        return Ok(serde_json::json!({"agent": "all", "schedules": []}));
+    }
+    let live_agents: HashMap<anyagents_core::AgentId, Agent> = store
+        .list_live_agents()
+        .map_err(ApiError::from_store)?
+        .into_iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+    let is_descendant_in_map = |ancestor: &anyagents_core::AgentId, target: &Agent| -> bool {
+        if &target.id == ancestor {
+            return true;
+        }
+        let mut cur = target.parent_id.clone();
+        for _ in 0..16 {
+            let Some(pid) = cur else {
+                return false;
+            };
+            if &pid == ancestor {
+                return true;
+            }
+            cur = live_agents
+                .get(&pid)
+                .map(|p| p.parent_id.clone())
+                .unwrap_or_else(|| store.agent(&pid).ok().and_then(|p| p.parent_id));
+        }
+        false
+    };
+
     let mut authorized_names: HashMap<String, Option<String>> = HashMap::new();
     let mut schedules = Vec::with_capacity(all_schedules.len());
     for sched in all_schedules {
@@ -130,11 +163,18 @@ pub(super) fn list_fleet_schedules(
         let owner_name = if let Some(cached) = authorized_names.get(&owner_id) {
             cached.clone()
         } else {
-            let resolved = match authorize_schedule_target(store, principal, Some(&owner_id)) {
-                Ok(agent) => Some(agent.name),
-                Err(error) if error.status == StatusCode::FORBIDDEN => None,
-                Err(error) if error.status == StatusCode::NOT_FOUND => None,
-                Err(error) => return Err(error),
+            let owner_opt = live_agents
+                .get(&sched.agent_id)
+                .cloned()
+                .or_else(|| store.agent(&sched.agent_id).ok());
+            let resolved = match (&caller_agent, owner_opt) {
+                (_, None) => None,
+                (None, Some(agent)) => Some(agent.name),
+                (Some(_), Some(agent)) if caller_is_admin => Some(agent.name),
+                (Some(caller), Some(agent)) if is_descendant_in_map(&caller.id, &agent) => {
+                    Some(agent.name)
+                }
+                (Some(_), Some(_)) => None,
             };
             authorized_names.insert(owner_id.clone(), resolved.clone());
             resolved
@@ -296,9 +336,15 @@ pub(super) async fn handle_schedule_action(
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let prompt = body.prompt.as_deref().unwrap_or("");
+                let (effective_health, _) =
+                    super::serverless_watches::effective_health_with_remote_turns(
+                        &state.store,
+                        &state.health,
+                        anyagents_core::now_ms(),
+                    );
                 let created = crate::schedule::create_agent_schedule(
                     &state.store,
-                    &state.health,
+                    &effective_health,
                     &target,
                     body.at.as_deref(),
                     body.every.as_deref(),

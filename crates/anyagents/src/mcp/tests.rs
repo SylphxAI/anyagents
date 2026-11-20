@@ -854,6 +854,7 @@ mod spawn_args_tests {
             state: "active".into(),
             created_at_ms: 1_794_500_000_000,
         }];
+        let single_agent_body = serde_json::to_vec(&child).unwrap();
         let agents_body = serde_json::to_vec(&AgentsResponse {
             archived_count: 0,
             agents: vec![child],
@@ -886,6 +887,8 @@ mod spawn_args_tests {
                 let path = line.split_whitespace().nth(1).unwrap();
                 let body = if path.contains("/conversation") {
                     &conv_body
+                } else if path.contains("/v1/agents/") {
+                    &single_agent_body
                 } else {
                     &agents_body
                 };

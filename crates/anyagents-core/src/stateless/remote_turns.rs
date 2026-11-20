@@ -33,7 +33,7 @@ pub fn is_terminal_remote_turn_status(status: &str) -> bool {
     TERMINAL_REMOTE_TURN_STATUSES.contains(&status)
 }
 
-fn validate_status(status: &str) -> Result<&'static str, Error> {
+pub(super) fn validate_status(status: &str) -> Result<&'static str, Error> {
     VALID_REMOTE_TURN_STATUSES
         .iter()
         .copied()
@@ -41,7 +41,7 @@ fn validate_status(status: &str) -> Result<&'static str, Error> {
         .ok_or_else(|| Error::Message(format!("invalid remote turn status `{status}`")))
 }
 
-fn validate_terminal_status(status: &str) -> Result<&'static str, Error> {
+pub(super) fn validate_terminal_status(status: &str) -> Result<&'static str, Error> {
     TERMINAL_REMOTE_TURN_STATUSES
         .iter()
         .copied()
@@ -53,7 +53,7 @@ fn validate_terminal_status(status: &str) -> Result<&'static str, Error> {
         })
 }
 
-fn validate_turn_id(turn_id: &str) -> Result<&str, Error> {
+pub(super) fn validate_turn_id(turn_id: &str) -> Result<&str, Error> {
     let trimmed = turn_id.trim();
     if trimmed.is_empty()
         || trimmed.len() > 128
@@ -328,6 +328,16 @@ pub trait RemoteTurnStore: Send + Sync {
         now_ms: i64,
     ) -> Result<bool, Error>;
     fn delete_turn(&self, turn_id: &str) -> Result<bool, Error>;
+    fn list_active_fresh_by_agent(
+        &self,
+        fresh_since_ms: i64,
+    ) -> Result<HashMap<String, i64>, Error>;
+    fn record_agent_inbox_read_seq(
+        &self,
+        agent_id: &AgentId,
+        max_read_seq: i64,
+        now_ms: i64,
+    ) -> Result<usize, Error>;
 }
 
 const SELECT_TURN_COLS: &str = "turn_id, agent_id, harness_kind, provider_kind, remote_run_id, \
@@ -838,6 +848,27 @@ impl RemoteTurnStore for PgRemoteTurnStore {
         })?;
         Ok(affected > 0)
     }
+
+    fn list_active_fresh_by_agent(
+        &self,
+        fresh_since_ms: i64,
+    ) -> Result<HashMap<String, i64>, Error> {
+        super::remote_turns_ext::pg_list_active_fresh_by_agent(&self.pool, fresh_since_ms)
+    }
+
+    fn record_agent_inbox_read_seq(
+        &self,
+        agent_id: &AgentId,
+        max_read_seq: i64,
+        now: i64,
+    ) -> Result<usize, Error> {
+        super::remote_turns_ext::pg_record_agent_inbox_read_seq(
+            &self.pool,
+            agent_id,
+            max_read_seq,
+            now,
+        )
+    }
 }
 
 /// Local filesystem fallback (`<data_dir>/remote-turns/<turn_id>.json`) for SQLite mode.
@@ -1170,276 +1201,44 @@ impl RemoteTurnStore for FsRemoteTurnStore {
             Err(e) => Err(e.into()),
         }
     }
-}
 
-/// Pure in-memory [`RemoteTurnStore`] implementation for isolated unit tests.
-#[derive(Clone, Default)]
-pub struct InMemoryRemoteTurnStore {
-    rows: Arc<Mutex<HashMap<String, PendingRemoteTurn>>>,
-}
-
-impl InMemoryRemoteTurnStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl RemoteTurnStore for InMemoryRemoteTurnStore {
-    fn create_turn(&self, input: &NewRemoteTurn) -> Result<PendingRemoteTurn, Error> {
-        let turn_id = validate_turn_id(&input.turn_id)?.to_string();
-        let status = validate_status(&input.status)?.to_string();
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        if map.contains_key(&turn_id) {
-            return Err(Error::Message(format!(
-                "remote turn `{turn_id}` already exists"
-            )));
-        }
-        let now = now_ms();
-        let turn = PendingRemoteTurn {
-            turn_id: turn_id.clone(),
-            agent_id: input.agent_id.clone(),
-            harness_kind: sanitize_pg_text(&input.harness_kind),
-            provider_kind: input.provider_kind.as_deref().map(sanitize_pg_text),
-            remote_run_id: input.remote_run_id.as_deref().map(sanitize_pg_text),
-            callback_token_hash: input.callback_token_hash.clone(),
-            cursor: input.cursor.as_deref().map(sanitize_pg_text),
-            status,
-            result_text: None,
-            error_text: None,
-            usage_json: None,
-            metadata_json: input.metadata_json.as_ref().map(sanitize_pg_json),
-            created_at_ms: now,
-            updated_at_ms: now,
-            last_event_at_ms: now,
-            next_poll_at_ms: input.next_poll_at_ms,
-        };
-        map.insert(turn_id, turn.clone());
-        Ok(turn)
-    }
-
-    fn get_turn(&self, turn_id: &str) -> Result<Option<PendingRemoteTurn>, Error> {
-        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(map.get(turn_id).cloned())
-    }
-
-    fn find_by_remote_run_id(
+    fn list_active_fresh_by_agent(
         &self,
-        harness_kind: Option<&str>,
-        remote_run_id: &str,
-    ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let trimmed = remote_run_id.trim();
-        let kind = harness_kind.map(str::trim).filter(|s| !s.is_empty());
-        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let mut matches: Vec<PendingRemoteTurn> = map
-            .values()
-            .filter(|t| {
-                t.remote_run_id.as_deref() == Some(trimmed)
-                    && kind.is_none_or(|hk| t.harness_kind == hk)
-            })
-            .cloned()
-            .collect();
-        matches.sort_by_key(|t| std::cmp::Reverse(t.created_at_ms));
-        Ok(matches.into_iter().next())
+        fresh_since_ms: i64,
+    ) -> Result<HashMap<String, i64>, Error> {
+        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let all = self.list_all_unlocked()?;
+        Ok(super::remote_turns_ext::collect_active_fresh_by_agent(
+            all.iter(),
+            fresh_since_ms,
+        ))
     }
 
-    fn verify_callback_token(
+    fn record_agent_inbox_read_seq(
         &self,
-        turn_id: &str,
-        bearer_token: &str,
-    ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let Some(turn) = self.get_turn(turn_id)? else {
-            return Ok(None);
-        };
-        if verify_callback_token_hash(&turn.callback_token_hash, bearer_token) {
-            Ok(Some(turn))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn update_remote_run(
-        &self,
-        turn_id: &str,
-        remote_run_id: Option<&str>,
-        status: Option<&str>,
-        next_poll_at_ms: Option<Option<i64>>,
-        metadata_json: Option<&Value>,
-    ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(turn) = map.get_mut(turn_id) else {
-            return Ok(None);
-        };
-        if let Some(rid) = remote_run_id {
-            turn.remote_run_id = Some(sanitize_pg_text(rid));
-        }
-        if !turn.is_terminal() {
-            if let Some(st) = status {
-                turn.status = validate_status(st)?.to_string();
-            }
-            if let Some(np) = next_poll_at_ms {
-                turn.next_poll_at_ms = np;
-            }
-        }
-        if let Some(meta) = metadata_json {
-            turn.metadata_json = Some(sanitize_pg_json(meta));
-        }
-        turn.updated_at_ms = turn.updated_at_ms.max(now_ms());
-        Ok(Some(turn.clone()))
-    }
-
-    fn record_event(
-        &self,
-        turn_id: &str,
-        update: &RemoteTurnEventUpdate,
-    ) -> Result<Option<PendingRemoteTurn>, Error> {
-        let next_status = match update.status.as_deref() {
-            Some(s) => {
-                let valid = validate_status(s)?;
-                if is_terminal_remote_turn_status(valid) {
-                    return Err(Error::Message(
-                        "record_event cannot write terminal status; use settle_turn".into(),
-                    ));
-                }
-                valid
-            }
-            None => "running",
-        };
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(turn) = map.get_mut(turn_id) else {
-            return Ok(None);
-        };
-        let event_ts = if update.last_event_at_ms > 0 {
-            update.last_event_at_ms
-        } else {
-            now_ms()
-        };
-        if !turn.is_terminal() {
-            turn.status = next_status.to_string();
-            if let Some(np) = update.next_poll_at_ms {
-                turn.next_poll_at_ms = np;
-            }
-        }
-        if let Some(ref cur) = update.cursor {
-            turn.cursor = Some(sanitize_pg_text(cur));
-        }
-        if let Some(ref rid) = update.remote_run_id {
-            turn.remote_run_id = Some(sanitize_pg_text(rid));
-        }
-        turn.last_event_at_ms = turn.last_event_at_ms.max(event_ts);
-        turn.updated_at_ms = turn.updated_at_ms.max(now_ms().max(event_ts));
-        Ok(Some(turn.clone()))
-    }
-
-    fn settle_turn(
-        &self,
-        turn_id: &str,
-        settlement: &SettleRemoteTurn,
-    ) -> Result<Option<SettleOutcome>, Error> {
-        let terminal = validate_terminal_status(&settlement.status)?;
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(turn) = map.get_mut(turn_id) else {
-            return Ok(None);
-        };
-        if turn.is_terminal() {
-            return Ok(Some(SettleOutcome {
-                turn: turn.clone(),
-                transitioned: false,
-            }));
-        }
-        let settled_at = if settlement.settled_at_ms > 0 {
-            settlement.settled_at_ms
-        } else {
-            now_ms()
-        };
-        turn.status = terminal.to_string();
-        turn.result_text = settlement.result_text.as_deref().map(sanitize_pg_text);
-        turn.error_text = settlement.error_text.as_deref().map(sanitize_pg_text);
-        turn.usage_json = settlement.usage_json.as_ref().map(sanitize_pg_json);
-        if let Some(ref cur) = settlement.cursor {
-            turn.cursor = Some(sanitize_pg_text(cur));
-        }
-        turn.last_event_at_ms = turn.last_event_at_ms.max(settled_at);
-        turn.updated_at_ms = turn.updated_at_ms.max(now_ms().max(settled_at));
-        turn.next_poll_at_ms = None;
-        Ok(Some(SettleOutcome {
-            turn: turn.clone(),
-            transitioned: true,
-        }))
-    }
-
-    fn list_due_polls(&self, now: i64, limit: usize) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let mut due: Vec<PendingRemoteTurn> = map
-            .values()
-            .filter(|t| !t.is_terminal() && t.next_poll_at_ms.is_some_and(|at| at <= now))
-            .cloned()
-            .collect();
-        due.sort_by_key(|t| (t.next_poll_at_ms.unwrap_or(i64::MAX), t.created_at_ms));
-        due.truncate(limit.max(1));
-        Ok(due)
-    }
-
-    fn list_active_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let mut active: Vec<PendingRemoteTurn> = map
-            .values()
-            .filter(|t| &t.agent_id == agent_id && !t.is_terminal())
-            .cloned()
-            .collect();
-        active.sort_by_key(|t| t.created_at_ms);
-        Ok(active)
-    }
-
-    fn list_stale_active(
-        &self,
-        harness_kind: Option<&str>,
-        stale_before_ms: i64,
-        limit: usize,
-    ) -> Result<Vec<PendingRemoteTurn>, Error> {
-        let kind = harness_kind.map(str::trim).filter(|s| !s.is_empty());
-        let map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stale: Vec<PendingRemoteTurn> = map
-            .values()
-            .filter(|t| {
-                !t.is_terminal()
-                    && kind.is_none_or(|hk| t.harness_kind == hk)
-                    && t.last_event_at_ms <= stale_before_ms
-            })
-            .cloned()
-            .collect();
-        stale.sort_by_key(|t| t.last_event_at_ms);
-        stale.truncate(limit.max(1));
-        Ok(stale)
-    }
-
-    fn schedule_next_poll(
-        &self,
-        turn_id: &str,
-        next_poll_at_ms: Option<i64>,
-        cursor: Option<&str>,
+        agent_id: &AgentId,
+        max_read_seq: i64,
         now: i64,
-    ) -> Result<bool, Error> {
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(turn) = map.get_mut(turn_id) else {
-            return Ok(false);
-        };
-        if turn.is_terminal() {
-            return Ok(false);
+    ) -> Result<usize, Error> {
+        let _lock = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut updated = 0usize;
+        for mut turn in self.list_all_unlocked()? {
+            if &turn.agent_id == agent_id
+                && super::remote_turns_ext::apply_inbox_read_seq_to_turn(
+                    &mut turn,
+                    max_read_seq,
+                    now,
+                )
+            {
+                self.write_unlocked(&turn)?;
+                updated += 1;
+            }
         }
-        turn.next_poll_at_ms = next_poll_at_ms;
-        if let Some(cur) = cursor {
-            turn.cursor = Some(sanitize_pg_text(cur));
-        }
-        turn.last_event_at_ms = turn.last_event_at_ms.max(now);
-        turn.updated_at_ms = turn.updated_at_ms.max(now);
-        Ok(true)
-    }
-
-    fn delete_turn(&self, turn_id: &str) -> Result<bool, Error> {
-        let mut map = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(map.remove(turn_id).is_some())
+        Ok(updated)
     }
 }
+
+pub use super::remote_turns_ext::InMemoryRemoteTurnStore;
 
 #[cfg(test)]
 mod tests {

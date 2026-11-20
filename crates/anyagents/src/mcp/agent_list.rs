@@ -42,8 +42,8 @@ pub(super) fn agent_matches_query(agent: &AgentView, query: &str) -> bool {
 }
 
 pub(super) fn agent_list_priority(agent: &AgentView) -> u8 {
-    if agent.turn_state == "errored" || (agent.state == "running" && agent.turn_state == "working")
-    {
+    let active_turn = matches!(agent.turn_state.as_str(), "working" | "in_turn");
+    if agent.turn_state == "errored" || (agent.state == "running" && active_turn) {
         0
     } else if agent.state == "running" {
         1
@@ -71,13 +71,16 @@ pub(crate) fn filter_and_summarize_agent_list(
     let running = agents.iter().filter(|a| a.state == "running").count();
     let working = agents
         .iter()
-        .filter(|a| a.state == "running" && a.turn_state == "working")
+        .filter(|a| a.state == "running" && matches!(a.turn_state.as_str(), "working" | "in_turn"))
         .count();
     let errored = agents.iter().filter(|a| a.turn_state == "errored").count();
     let scaled_to_zero = agents.iter().filter(|a| a.state == "idle").count();
     let running_idle = agents
         .iter()
-        .filter(|a| a.state == "running" && a.turn_state != "working" && a.turn_state != "errored")
+        .filter(|a| {
+            a.state == "running"
+                && !matches!(a.turn_state.as_str(), "working" | "in_turn" | "errored")
+        })
         .count();
     let idle = running_idle + scaled_to_zero;
     let paused = agents.iter().filter(|a| a.state == "paused").count();

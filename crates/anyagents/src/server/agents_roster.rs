@@ -533,13 +533,31 @@ fn agent_view_preloaded(
     } else {
         store.lag(&agent.id, now).map_err(ApiError::from_store)?
     };
-    let has_open_turn = if let Some(metadata) = metadata.as_ref() {
+    let store_has_open_turn = if let Some(metadata) = metadata.as_ref() {
         metadata.open_turns.contains_key(agent.id.as_str())
     } else {
         store
             .has_open_turn(&agent.id)
             .map_err(ApiError::from_store)?
     };
+    let active_remote_started_ms = if let Some(metadata) = metadata.as_ref() {
+        metadata.active_remote_turns.get(agent.id.as_str()).copied()
+    } else {
+        let fresh_since =
+            now.saturating_sub(anyagents_core::stateless::ACTIVE_REMOTE_TURN_FRESHNESS_MS);
+        store
+            .remote_turn_store()
+            .list_active_for_agent(&agent.id)
+            .ok()
+            .and_then(|turns| {
+                turns
+                    .into_iter()
+                    .filter(|t| !t.is_terminal() && t.last_event_at_ms >= fresh_since)
+                    .map(|t| t.created_at_ms)
+                    .min()
+            })
+    };
+    let has_open_turn = store_has_open_turn || active_remote_started_ms.is_some();
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let files = file_cache::cache();
     let markers = Markers { files, cfg: &cfg };
@@ -591,7 +609,7 @@ fn agent_view_preloaded(
                 if working { "working" } else { "idle" },
                 live.delivery
                     .clone()
-                    .unwrap_or_else(|| crate::vendor::declared_delivery(&agent.harness)),
+                    .unwrap_or_else(|| declared_delivery_for_mode(&agent.harness)),
                 effective_quota,
                 if live.process_alive {
                     live.live_harness.clone()
@@ -610,32 +628,47 @@ fn agent_view_preloaded(
             )
         }
         None => {
-            let lock_busy = matches!(
-                store.try_lock_agent(&agent.id),
-                Err(anyagents_core::Error::AgentBusy)
-            );
-            let proc_str = if lock_busy { "alive" } else { "down" };
-            let turn_str = if lock_busy { "working" } else { "idle" };
-            (
-                proc_str,
-                turn_str,
-                crate::vendor::declared_delivery(&agent.harness),
-                session_quota,
-                if proc_str == "alive" {
-                    Some(agent.harness.clone())
-                } else {
-                    None
-                },
-                if proc_str == "alive" {
-                    agent.model.clone()
-                } else {
-                    None
-                },
-                None,
-                false,
-                session_error,
-                None,
-            )
+            if let Some(started_ms) = active_remote_started_ms {
+                (
+                    "up",
+                    "in_turn",
+                    declared_delivery_for_mode(&agent.harness),
+                    session_quota,
+                    Some(agent.harness.clone()),
+                    agent.model.clone(),
+                    Some(started_ms),
+                    false,
+                    session_error,
+                    None,
+                )
+            } else {
+                let lock_busy = matches!(
+                    store.try_lock_agent(&agent.id),
+                    Err(anyagents_core::Error::AgentBusy)
+                );
+                let proc_str = if lock_busy { "alive" } else { "down" };
+                let turn_str = if lock_busy { "working" } else { "idle" };
+                (
+                    proc_str,
+                    turn_str,
+                    declared_delivery_for_mode(&agent.harness),
+                    session_quota,
+                    if proc_str == "alive" {
+                        Some(agent.harness.clone())
+                    } else {
+                        None
+                    },
+                    if proc_str == "alive" {
+                        agent.model.clone()
+                    } else {
+                        None
+                    },
+                    None,
+                    false,
+                    session_error,
+                    None,
+                )
+            }
         }
     };
     // Rotation rewrites the agent's profile markers; an agent whose creation
@@ -687,7 +720,7 @@ fn agent_view_preloaded(
         compute_block_reason(quota, last_error.as_deref(), now)
     };
     let open_turn_age_ms = if has_open_turn {
-        if let Some(metadata) = metadata.as_ref() {
+        let store_age = if let Some(metadata) = metadata.as_ref() {
             metadata
                 .open_turns
                 .get(agent.id.as_str())
@@ -699,14 +732,17 @@ fn agent_view_preloaded(
                     .map(|m| now.saturating_sub(m.received_at_ms).max(0))
                     .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms).max(0))
             })
-        }
+        };
+        store_age.or_else(|| active_remote_started_ms.map(|ms| now.saturating_sub(ms).max(0)))
     } else {
         None
     };
     let oldest_undelivered_age_ms = match lag.oldest_undelivered_age_ms {
         Some(age) => Some(age),
         None if has_open_turn
-            && (quota.is_some() || last_error.is_some() || turn_state != "working") =>
+            && (quota.is_some()
+                || last_error.is_some()
+                || !matches!(turn_state, "working" | "in_turn")) =>
         {
             open_turn_age_ms
         }
@@ -840,4 +876,160 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
         file_cache::Dep::Dir(root.join("harnesses").join(&harness)),
         check,
     )
+}
+
+/// Honest delivery semantics for the current runtime mode: in serverless per-turn
+/// dispatch, mid-turn stdin steering is inactive, so never advertise `steer_support: "yes"`.
+fn declared_delivery_for_mode(harness: &str) -> anyagents_harness::Delivery {
+    declared_delivery_for_serverless(harness, serverless::is_serverless_mode())
+}
+
+fn declared_delivery_for_serverless(
+    harness: &str,
+    serverless_mode: bool,
+) -> anyagents_harness::Delivery {
+    if serverless_mode {
+        anyagents_harness_stream::LINE_PER_TURN
+    } else {
+        crate::vendor::declared_delivery(harness)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyagents_core::NewAgent;
+    use anyagents_core::stateless::{
+        NewRemoteTurn, RemoteTurnEventUpdate, SettleRemoteTurn, hash_callback_token,
+    };
+
+    #[test]
+    fn agent_view_projects_live_state_from_fresh_pending_remote_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let active_agent = store
+            .create_agent(NewAgent::new("remote-worker", "claude-code"))
+            .unwrap();
+        let stale_agent = store
+            .create_agent(NewAgent::new("stale-worker", "codex"))
+            .unwrap();
+        let done_agent = store
+            .create_agent(NewAgent::new("done-worker", "agy"))
+            .unwrap();
+        for a in [&active_agent, &stale_agent, &done_agent] {
+            store.set_agent_running(&a.id, "/work").unwrap();
+        }
+        let active_agent = store.agent(&active_agent.id).unwrap();
+        let stale_agent = store.agent(&stale_agent.id).unwrap();
+        let done_agent = store.agent(&done_agent.id).unwrap();
+
+        let created = store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "trn_view_active".into(),
+                agent_id: active_agent.id.clone(),
+                harness_kind: "claude-code".into(),
+                provider_kind: Some("sandbox".into()),
+                remote_run_id: Some("run-active".into()),
+                callback_token_hash: hash_callback_token("tok-a"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        let _ = store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: "trn_view_done".into(),
+                agent_id: done_agent.id.clone(),
+                harness_kind: "agy".into(),
+                provider_kind: Some("sandbox".into()),
+                remote_run_id: Some("run-done".into()),
+                callback_token_hash: hash_callback_token("tok-d"),
+                cursor: None,
+                status: "dispatched".into(),
+                metadata_json: None,
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+        store
+            .remote_turn_store()
+            .settle_turn(
+                "trn_view_done",
+                &SettleRemoteTurn {
+                    status: "completed".into(),
+                    result_text: Some("done".into()),
+                    error_text: None,
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: created.created_at_ms + 50,
+                },
+            )
+            .unwrap();
+        // Record a fresh event timestamp on the active turn.
+        store
+            .remote_turn_store()
+            .record_event(
+                "trn_view_active",
+                &RemoteTurnEventUpdate {
+                    status: Some("running".into()),
+                    cursor: None,
+                    remote_run_id: None,
+                    last_event_at_ms: now_ms(),
+                    next_poll_at_ms: None,
+                },
+            )
+            .unwrap();
+
+        // Single-agent inspect projection.
+        let single = agent_view(&store, &health, &active_agent).unwrap();
+        assert_eq!(single.process, "up");
+        assert_eq!(single.turn_state, "in_turn");
+        assert!(single.has_open_turn);
+        assert!(single.open_turn_age_ms.is_some());
+
+        // Batched `agent_query_metadata` + `roster_views` projection.
+        let listed = roster_views(
+            &store,
+            &health,
+            &[&active_agent, &stale_agent, &done_agent],
+            0,
+            &ListAgentsQuery::default(),
+        )
+        .unwrap();
+        let active_view = listed
+            .agents
+            .iter()
+            .find(|v| v.id == active_agent.id.as_str())
+            .unwrap();
+        let stale_view = listed
+            .agents
+            .iter()
+            .find(|v| v.id == stale_agent.id.as_str())
+            .unwrap();
+        let done_view = listed
+            .agents
+            .iter()
+            .find(|v| v.id == done_agent.id.as_str())
+            .unwrap();
+        assert_eq!(active_view.process, "up");
+        assert_eq!(active_view.turn_state, "in_turn");
+        assert!(active_view.has_open_turn);
+        assert_eq!(stale_view.process, "down");
+        assert_eq!(stale_view.turn_state, "idle");
+        assert!(!stale_view.has_open_turn);
+        assert_eq!(done_view.process, "down");
+        assert_eq!(done_view.turn_state, "idle");
+        assert!(!done_view.has_open_turn);
+    }
+
+    #[test]
+    fn serverless_mode_reports_honest_followup_and_no_steer_support() {
+        let delivery = declared_delivery_for_serverless("claude-code", true);
+        let view = crate::api::DeliveryView::from(&delivery);
+        assert_eq!(view.legacy_mode(), "followup");
+        assert_eq!(view.legacy_steer(), "no");
+    }
 }

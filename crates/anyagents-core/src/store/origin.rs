@@ -262,9 +262,7 @@ pub(super) fn message_by_origin(
         // assign each bot its own account-local `message_id` for the same human
         // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
         // passive relay and direct webhook delivery coalesce into a single message.
-        let matched_by_group_relay = (in_is_relay
-            || stored_is_relay
-            || (is_basic_group && origin.message_id == Some(message_id)))
+        let matched_by_group_relay = (in_is_relay || stored_is_relay || is_basic_group)
             && normalize_telegram_body_for_dedup(strip_quoted_block(&msg.text))
                 == normalize_telegram_body_for_dedup(strip_quoted_block(incoming_body))
             && in_user.is_some()
@@ -377,7 +375,7 @@ pub(super) fn message_by_origin(
     Ok(None)
 }
 
-fn normalize_telegram_body_for_dedup(s: &str) -> String {
+pub(super) fn normalize_telegram_body_for_dedup(s: &str) -> String {
     let mut lines = Vec::new();
     for line in s.lines() {
         let trimmed = line.trim();

@@ -1245,10 +1245,7 @@ pub(crate) fn resolve_subagent_defaults(
         let model = m_trim
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
             .map(str::to_string)
-            .or_else(|| {
-                (harness == "spiron" || harness == "spiron-local")
-                    .then(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
-            });
+            .or_else(|| super::resolve_default_model_for_harness(data, &harness, p_trim, None));
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
             .map(str::to_string);
@@ -1315,14 +1312,23 @@ pub(crate) fn resolve_subagent_defaults(
         None
     }
     .or_else(|| {
-        (resolved_harness == "spiron" || resolved_harness == "spiron-local").then(|| {
-            spec.model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| m.starts_with("sylphx/"))
-                .map(str::to_string)
-                .unwrap_or_else(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string())
-        })
+        if resolved_harness == "spiron" || resolved_harness == "spiron-local" {
+            Some(
+                spec.model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| m.starts_with("sylphx/"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::spiron::DEFAULT_SPIRON_MODEL.to_string()),
+            )
+        } else {
+            super::resolve_default_model_for_harness(
+                data,
+                &resolved_harness,
+                p_trim.or(parent_bound_profile.as_deref()),
+                Some(parent_agent),
+            )
+        }
     });
 
     let target_provider = upstream_provider_of(&resolved_harness, resolved_model.as_deref());

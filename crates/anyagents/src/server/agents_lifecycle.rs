@@ -93,6 +93,7 @@ pub(super) fn mark_archive_generation_locked(store: &Store, data_dir: &Path, age
             let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
         }
     }
+    let _ = super::serverless_watches::cancel_watches_targeting_agent(store, agent);
     crate::schedule::schedules_changed(store.data_dir());
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
 }

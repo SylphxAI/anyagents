@@ -1,13 +1,22 @@
 //! Named groups, room fan-out, chat membership, and inter-agent reachability.
 
 use super::channels::telegram_chat_links;
-use super::helpers::agent_exists;
+use super::helpers::{agent_exists, decode_env};
 use super::types::{Agent, Incoming, ReceiveOutcome};
 use super::{Store, now_ms};
 use crate::db::{DbExec, DbExecExt};
 use crate::db_params;
 use crate::error::Error;
 use crate::id::AgentId;
+
+/// Batched group metadata and full member agent rows loaded in 2 queries.
+#[derive(Clone, Debug)]
+pub struct GroupSummary {
+    pub name: String,
+    pub public: bool,
+    pub owner_agent_id: Option<AgentId>,
+    pub members: Vec<Agent>,
+}
 
 impl Store {
     /// Append one message to every agent in a room: all of them except the
@@ -240,17 +249,73 @@ impl Store {
 
     /// Every named group and its current members, ordered by group name.
     pub fn list_groups(&self) -> Result<Vec<(String, Vec<String>)>, Error> {
+        let summaries = self.list_groups_with_roster()?;
+        Ok(summaries
+            .into_iter()
+            .map(|g| (g.name, g.members.into_iter().map(|a| a.name).collect()))
+            .collect())
+    }
+
+    /// Batched group listing with metadata (`public`, `owner_agent_id`) and full
+    /// member `Agent` rows loaded in 2 SQL queries (zero N+1 queries).
+    pub fn list_groups_with_roster(&self) -> Result<Vec<GroupSummary>, Error> {
         let conn = self.read_conn();
-        let names: Vec<String> =
-            conn.db_query_vec("SELECT name FROM groups ORDER BY name", &[], |row| {
-                row.get(0)
-            })?;
-        let mut groups = Vec::with_capacity(names.len());
-        for name in names {
-            let members = group_members_on(&conn, &name)?;
-            groups.push((name, members));
+        let meta_rows: Vec<(String, bool, Option<String>)> = conn.db_query_vec(
+            "SELECT name, public, owner_agent_id FROM groups ORDER BY name",
+            &[],
+            |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0, row.get(2)?)),
+        )?;
+        let member_rows: Vec<(String, Agent)> = conn.db_query_vec(
+            "SELECT g.group_name, a.id, a.name, a.harness, a.model, a.workdir, a.instructions, \
+             a.state, a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
+             FROM group_agents AS g \
+             JOIN agents AS a ON a.id = g.agent_id \
+             ORDER BY g.group_name, a.name",
+            &[],
+            |row| {
+                let group_name: String = row.get(0)?;
+                let agent_id = row.parse_str(1)?;
+                let parent_id = match row.get::<Option<String>>(10)? {
+                    Some(raw) if !raw.is_empty() => Some(AgentId::parse(&raw)?),
+                    _ => None,
+                };
+                let agent = Agent {
+                    id: agent_id,
+                    name: row.get(2)?,
+                    harness: row.get(3)?,
+                    model: row.get(4)?,
+                    workdir: row.get(5)?,
+                    instructions: row.get(6)?,
+                    state: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                    launch_env: row
+                        .get::<Option<String>>(9)?
+                        .map(|json| decode_env(&json))
+                        .unwrap_or_default(),
+                    parent_id,
+                    is_admin: row.get(11)?,
+                    role: row.get(12)?,
+                    description: row.get(13)?,
+                };
+                Ok((group_name, agent))
+            },
+        )?;
+        let mut by_group: std::collections::HashMap<String, Vec<Agent>> =
+            std::collections::HashMap::with_capacity(meta_rows.len());
+        for (group_name, agent) in member_rows {
+            by_group.entry(group_name).or_default().push(agent);
         }
-        Ok(groups)
+        let mut out = Vec::with_capacity(meta_rows.len());
+        for (name, public, owner_raw) in meta_rows {
+            let members = by_group.remove(&name).unwrap_or_default();
+            out.push(GroupSummary {
+                name,
+                public,
+                owner_agent_id: owner_raw.as_deref().and_then(|s| AgentId::parse(s).ok()),
+                members,
+            });
+        }
+        Ok(out)
     }
 
     /// Returns `true` when `agent_a` and `agent_b` are members of at least one shared

@@ -2,10 +2,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use clap::Args;
 use serde_json::{Value, json};
+
+const MAX_CONCURRENT_RPC: usize = 32;
 
 #[derive(Args, Clone, Debug)]
 pub struct McpProxyArgs {
@@ -37,11 +40,93 @@ pub fn run_mcp_proxy(mut args: McpProxyArgs) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut writer = std::io::BufWriter::new(stdout.lock());
+    let mut writer = std::io::BufWriter::new(stdout);
     run_proxy_io(&args, &mut reader, &mut writer)
 }
 
-pub(crate) fn run_proxy_io<R: BufRead, W: Write>(
+#[derive(Default)]
+struct ProxyState {
+    session_id: Option<String>,
+    use_base64_payload: bool,
+    negotiated: bool,
+}
+
+struct InFlightGate {
+    state: Mutex<usize>,
+    cvar: Condvar,
+    max: usize,
+}
+
+impl InFlightGate {
+    fn new(max: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            cvar: Condvar::new(),
+            max: max.max(1),
+        }
+    }
+
+    fn acquire(&self) -> InFlightPermit<'_> {
+        let mut count = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while *count >= self.max {
+            count = self.cvar.wait(count).unwrap_or_else(|e| e.into_inner());
+        }
+        *count += 1;
+        InFlightPermit { gate: self }
+    }
+}
+
+struct InFlightPermit<'a> {
+    gate: &'a InFlightGate,
+}
+
+impl Drop for InFlightPermit<'_> {
+    fn drop(&mut self) {
+        let mut count = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        self.gate.cvar.notify_one();
+    }
+}
+
+fn write_response_lines<W: Write>(writer: &Mutex<&mut W>, lines: &[String]) -> Result<(), String> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+    for resp in lines {
+        writeln!(*guard, "{resp}").map_err(|e| e.to_string())?;
+    }
+    guard.flush().map_err(|e| e.to_string())
+}
+
+fn dispatch_single_rpc<W: Write>(
+    http: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+    state: &Mutex<ProxyState>,
+    writer: &Mutex<&mut W>,
+    req_id: Option<Value>,
+    body: &str,
+) -> Result<(), String> {
+    match forward_rpc(http, url, token, state, body) {
+        Ok(responses) => write_response_lines(writer, &responses),
+        Err(err_msg) => {
+            if let Some(id) = req_id {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32000, "message": err_msg }
+                });
+                write_response_lines(writer, &[err_resp.to_string()])
+            } else {
+                eprintln!("anyagents-guest mcp-proxy notification failed: {err_msg}");
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(crate) fn run_proxy_io<R: BufRead, W: Write + Send>(
     args: &McpProxyArgs,
     reader: &mut R,
     writer: &mut W,
@@ -59,65 +144,96 @@ pub(crate) fn run_proxy_io<R: BufRead, W: Write>(
         .build()
         .new_agent();
 
-    let mut session_id: Option<String> = None;
-    let mut use_base64_payload = false;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|err| format!("mcp-proxy stdin read error: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let req_val: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(err) => {
-                let err_resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": { "code": -32700, "message": format!("parse error: {err}") }
-                });
-                writeln!(writer, "{err_resp}").map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
+    let state = Mutex::new(ProxyState::default());
+    let writer = Mutex::new(writer);
+    let gate = InFlightGate::new(MAX_CONCURRENT_RPC);
+    let first_write_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let read_result: Result<(), String> = std::thread::scope(|scope| {
+        let mut line = String::new();
+        loop {
+            if let Some(err) = first_write_err
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                return Err(err);
+            }
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|err| format!("mcp-proxy stdin read error: {err}"))?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-        };
-        let req_id = req_val.get("id").cloned();
-        let token = resolve_token(args);
-
-        match forward_rpc(
-            &http,
-            url,
-            token.as_deref(),
-            &mut session_id,
-            &mut use_base64_payload,
-            trimmed,
-        ) {
-            Ok(responses) => {
-                for resp in responses {
-                    writeln!(writer, "{resp}").map_err(|e| e.to_string())?;
-                }
-                writer.flush().map_err(|e| e.to_string())?;
-            }
-            Err(err_msg) => {
-                if let Some(id) = req_id {
+            let req_val: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(err) => {
                     let err_resp = json!({
                         "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32000, "message": err_msg }
+                        "id": Value::Null,
+                        "error": { "code": -32700, "message": format!("parse error: {err}") }
                     });
-                    writeln!(writer, "{err_resp}").map_err(|e| e.to_string())?;
-                    writer.flush().map_err(|e| e.to_string())?;
-                } else {
-                    eprintln!("anyagents-guest mcp-proxy notification failed: {err_msg}");
+                    write_response_lines(&writer, &[err_resp.to_string()])?;
+                    continue;
                 }
+            };
+            let req_id = req_val.get("id").cloned();
+            let method = req_val
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let token = resolve_token(args);
+            let body = trimmed.to_string();
+
+            // Run the very first request (typically `initialize`) synchronously so
+            // `mcp-session-id` and base64 framing negotiation complete before concurrent
+            // tool calls fan out. All subsequent requests run concurrently with zero HoL.
+            let should_run_sync = method == "initialize"
+                || !state.lock().unwrap_or_else(|e| e.into_inner()).negotiated;
+            if should_run_sync {
+                dispatch_single_rpc(&http, url, token.as_deref(), &state, &writer, req_id, &body)?;
+                state.lock().unwrap_or_else(|e| e.into_inner()).negotiated = true;
+                continue;
             }
+
+            let permit = gate.acquire();
+            let http_ref = &http;
+            let state_ref = &state;
+            let writer_ref = &writer;
+            let err_slot = Arc::clone(&first_write_err);
+            scope.spawn(move || {
+                let _permit = permit;
+                if let Err(err) = dispatch_single_rpc(
+                    http_ref,
+                    url,
+                    token.as_deref(),
+                    state_ref,
+                    writer_ref,
+                    req_id,
+                    &body,
+                ) {
+                    let mut slot = err_slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(err);
+                    }
+                }
+            });
         }
+        Ok(())
+    });
+
+    read_result?;
+    if let Some(err) = first_write_err
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        return Err(err);
     }
     Ok(())
 }
@@ -197,38 +313,54 @@ fn forward_rpc(
     http: &ureq::Agent,
     url: &str,
     token: Option<&str>,
-    session_id: &mut Option<String>,
-    use_base64_payload: &mut bool,
+    state: &Mutex<ProxyState>,
     body: &str,
 ) -> Result<Vec<String>, String> {
-    let attempt_b64 = *use_base64_payload;
+    let (session_snapshot, attempt_b64) = {
+        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.session_id.clone(), guard.use_base64_payload)
+    };
     let (mut status, mut next_sid, mut advertises_b64, mut content_type, mut raw_body) =
-        send_rpc_once(http, url, token, session_id.as_deref(), body, attempt_b64)?;
+        send_rpc_once(
+            http,
+            url,
+            token,
+            session_snapshot.as_deref(),
+            body,
+            attempt_b64,
+        )?;
 
     // If an intermediate WAF blocks plaintext JSON containing shell/SQL fragments with
     // HTTP 403, retry once with opaque base64 framing (`application/octet-stream`).
+    let mut next_b64 = None;
     if status == 403 && !attempt_b64 {
-        if let Ok(retry) = send_rpc_once(http, url, token, session_id.as_deref(), body, true)
+        if let Ok(retry) = send_rpc_once(http, url, token, session_snapshot.as_deref(), body, true)
             && retry.0 != 415
             && retry.0 != 400
         {
             (status, next_sid, advertises_b64, content_type, raw_body) = retry;
             if (200..300).contains(&status) {
-                *use_base64_payload = true;
+                next_b64 = Some(true);
             }
         }
     } else if attempt_b64 && status == 415 {
         // Older coordinators without base64 framing support return 415; fall back cleanly.
-        *use_base64_payload = false;
+        next_b64 = Some(false);
         (status, next_sid, advertises_b64, content_type, raw_body) =
-            send_rpc_once(http, url, token, session_id.as_deref(), body, false)?;
+            send_rpc_once(http, url, token, session_snapshot.as_deref(), body, false)?;
     }
 
-    if advertises_b64 {
-        *use_base64_payload = true;
-    }
-    if let Some(sid) = next_sid {
-        *session_id = Some(sid);
+    if advertises_b64 || next_b64.is_some() || next_sid.is_some() {
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = next_b64 {
+            guard.use_base64_payload = b;
+        }
+        if advertises_b64 {
+            guard.use_base64_payload = true;
+        }
+        if let Some(sid) = next_sid {
+            guard.session_id = Some(sid);
+        }
     }
 
     if !(200..300).contains(&status) {
@@ -507,5 +639,86 @@ mod tests {
             encs.as_slice(),
             &[None, Some("base64".to_string()), Some("base64".to_string())]
         );
+    }
+
+    #[test]
+    fn concurrent_mcp_calls_do_not_head_of_line_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    use std::io::BufReader as BufReader_;
+                    let mut reader = BufReader_::new(stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    let mut content_len = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).is_err()
+                            || h == "\r\n"
+                            || h == "\n"
+                            || h.is_empty()
+                        {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_len];
+                    if content_len > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let tool = req
+                        .pointer("/params/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if tool == "slow_tool" {
+                        std::thread::sleep(Duration::from_millis(350));
+                    }
+                    let resp = serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": { "tool": tool }
+                    }))
+                    .unwrap();
+                    let mut stream = reader.into_inner();
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-conc\r\nContent-Length: {}\r\n\r\n",
+                        resp.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&resp);
+                });
+            }
+        });
+
+        let args = McpProxyArgs {
+            url: Some(format!("http://{addr}/mcp")),
+            token_file: None,
+            token: Some("cap-conc".into()),
+            timeout_secs: 10,
+        };
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"slow_tool\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"fast_tool\"}}\n",
+        );
+        let mut out = Vec::new();
+        run_proxy_io(&args, &mut Cursor::new(input.as_bytes()), &mut out).unwrap();
+        let parsed: Vec<Value> = std::str::from_utf8(&out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["id"], 1);
+        // `fast_tool` (id=3) must complete and flush BEFORE `slow_tool` (id=2).
+        assert_eq!(parsed[1]["id"], 3);
+        assert_eq!(parsed[2]["id"], 2);
     }
 }
