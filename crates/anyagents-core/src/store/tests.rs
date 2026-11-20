@@ -4433,3 +4433,23 @@ fn history_cjk_bigrams_cover_han_kana_hangul_and_mixed_queries() {
         assert!(hits.len() >= 2, "{query}");
     }
 }
+
+#[test]
+fn overview_mailbox_counts_match_the_capped_delivery_view() {
+    let (_dir, store) = setup();
+    let busy = agent(&store, "busy");
+    let archived = agent(&store, "gone");
+    let quiet = agent(&store, "quiet");
+    for _ in 0..104 {
+        store.receive(&busy.id, Incoming::new("fixture")).unwrap();
+    }
+    store
+        .receive(&archived.id, Incoming::new("fixture"))
+        .unwrap();
+    store.set_agent_state(&archived.id, "archived").unwrap();
+    let (meta, sandboxes) = store.agent_overview_metadata(&store.agent_summaries(true).unwrap());
+    assert_eq!(meta[&busy.id].unread_count, 100);
+    assert_eq!(meta[&archived.id].unread_count, 0);
+    assert_eq!(meta[&quiet.id].unread_count, 0);
+    assert_eq!(sandboxes, 0);
+}
