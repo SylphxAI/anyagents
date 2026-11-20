@@ -4988,7 +4988,7 @@ done
         else {
             panic!("expected new m1");
         };
-        let anyagents_core::ReceiveOutcome::New(m2) = store
+        let anyagents_core::ReceiveOutcome::New(_m2) = store
             .receive(&agent.id, anyagents_core::Incoming::new("mid-turn msg 2"))
             .unwrap()
         else {

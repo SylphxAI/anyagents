@@ -470,7 +470,7 @@ mod tests {
                 &anyagents_core::GroupActor::Agent(alpha.id.clone()),
                 "domain-a-private",
                 anyagents_core::GroupAction::Join,
-                &[alpha.id.clone()],
+                std::slice::from_ref(&alpha.id),
                 Some(false),
             )
             .unwrap();
@@ -480,7 +480,7 @@ mod tests {
                 &anyagents_core::GroupActor::Agent(alpha.id.clone()),
                 "open-commons",
                 anyagents_core::GroupAction::Join,
-                &[alpha.id.clone()],
+                std::slice::from_ref(&alpha.id),
                 Some(true),
             )
             .unwrap();
@@ -490,7 +490,7 @@ mod tests {
                 &anyagents_core::GroupActor::Operator,
                 "legacy-archived-room",
                 anyagents_core::GroupAction::Join,
-                &[archived_member.id.clone()],
+                std::slice::from_ref(&archived_member.id),
                 Some(true),
             )
             .unwrap();
