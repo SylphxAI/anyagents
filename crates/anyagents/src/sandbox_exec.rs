@@ -5,6 +5,10 @@
 //! inside the remote workspace with the agent's Streamable HTTP `/mcp` URL and
 //! bearer capability token.
 
+mod sylphx_binding;
+pub(crate) use sylphx_binding::client_for_binding as sylphx_client_for_binding;
+use sylphx_binding::sylphx_lease_from_handle;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
@@ -1148,108 +1152,6 @@ fn binding_from_handle(
     binding
 }
 
-fn sylphx_lease_from_handle(
-    handle: &SandboxHandle,
-    registry: &ProviderRegistry,
-    binding: Option<&SandboxBinding>,
-    data_dir: Option<&Path>,
-    config_dir: &Path,
-) -> Result<SylphxLeaseConfig, String> {
-    let spec = binding.map(binding_spec_value).unwrap_or_else(|| json!({}));
-    let existing = SylphxLeaseConfig::from_config_dir(config_dir);
-    let sylphx_cfg = SylphxProviderConfig::resolve(data_dir).ok().flatten();
-    let endpoint = spec
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| sylphx_cfg.as_ref().map(|c| c.endpoint.clone()))
-        .or_else(|| existing.as_ref().map(|c| c.endpoint.clone()))
-        .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_ENDPOINT"))
-        .or_else(|| env_non_empty("SYLPHX_SANDBOX_URL"))
-        .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_ENDPOINT"))
-        .unwrap_or_else(|| "https://api.sylphx.com".to_string());
-    let token = sylphx_cfg
-        .as_ref()
-        .and_then(|c| c.token.clone())
-        .or_else(|| existing.as_ref().and_then(|c| c.token.clone()))
-        .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_TOKEN"))
-        .or_else(|| env_non_empty("SYLPHX_API_KEY"))
-        .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_TOKEN"));
-    let parent = handle
-        .metadata
-        .get("parent")
-        .cloned()
-        .or_else(|| {
-            spec.get("parent")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| sylphx_cfg.as_ref().map(|c| c.parent.clone()))
-        .or_else(|| existing.as_ref().map(|c| c.parent.clone()))
-        .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_PARENT"))
-        .ok_or_else(|| "Sylphx sandbox handle missing `parent` resource".to_string())?;
-    let template = binding
-        .and_then(|b| b.template.clone())
-        .or_else(|| registry.default_image_spec().template.clone())
-        .or_else(|| sylphx_cfg.as_ref().map(|c| c.template.clone()))
-        .or_else(|| existing.as_ref().map(|c| c.template.clone()))
-        .unwrap_or_else(|| crate::sandbox_providers::sylphx::DEFAULT_TEMPLATE.to_string());
-    let shape = spec
-        .get("shape")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| sylphx_cfg.as_ref().map(|c| c.shape.clone()))
-        .or_else(|| existing.as_ref().map(|c| c.shape.clone()))
-        .unwrap_or_else(|| crate::sandbox_providers::sylphx::DEFAULT_SHAPE.to_string());
-    let volume_id = handle
-        .volume_id
-        .clone()
-        .or_else(|| binding.map(|b| b.volume_id.clone()))
-        .unwrap_or_default();
-    let volume_resource = handle
-        .metadata
-        .get("volume_resource")
-        .cloned()
-        .or_else(|| binding.map(|b| b.volume_resource.clone()))
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("{parent}/volumes/{volume_id}"));
-    let lease_resource = handle
-        .metadata
-        .get("lease_resource")
-        .cloned()
-        .or_else(|| binding.and_then(|b| b.lease_resource.clone()))
-        .or_else(|| Some(format!("{parent}/leases/{}", handle.sandbox_id)));
-    let data_plane_resource = handle
-        .metadata
-        .get("data_plane_resource")
-        .cloned()
-        .or_else(|| binding.and_then(|b| b.data_plane_resource.clone()))
-        .or_else(|| lease_resource.clone());
-    Ok(SylphxLeaseConfig {
-        endpoint,
-        token,
-        parent,
-        template,
-        shape,
-        volume_size_gib: binding
-            .and_then(|b| b.volume_size_gib)
-            .and_then(|v| u64::try_from(v).ok()),
-        workdir: handle.workdir.clone(),
-        mount_path: handle.mount_path.clone(),
-        volume_id,
-        volume_resource,
-        lease_id: (!handle.sandbox_id.is_empty()).then(|| handle.sandbox_id.clone()),
-        lease_resource,
-        data_plane_resource,
-        envd_url: handle.transport_url.clone(),
-        envd_token: handle.transport_token.clone(),
-        expires_at: handle.expires_at.clone(),
-    })
-}
-
 /// Ensure a remote sandbox via an explicit [`AsyncSandboxProvider`], persisting
 /// provider/image/template/volume/lease metadata into `agent_sandbox_bindings`.
 #[allow(clippy::too_many_arguments)]
@@ -1290,11 +1192,11 @@ pub(crate) fn ensure_sandbox_with_provider(
     }
 
     let mut req_image = image.clone();
-    if req_image.image.is_none() {
-        req_image.image = existing.as_ref().and_then(|b| b.image.clone());
-    }
-    if req_image.template.is_none() {
-        req_image.template = existing.as_ref().and_then(|b| b.template.clone());
+    if provider.kind() != ProviderKind::Sylphx {
+        req_image.image = req_image.image.or_else(|| existing.as_ref()?.image.clone());
+        req_image.template = req_image
+            .template
+            .or_else(|| existing.as_ref()?.template.clone());
     }
     req_image.env.extend(extra_env.clone());
 
@@ -1590,6 +1492,23 @@ pub(crate) fn release_sandbox_for_agent(
 /// - When `idle_ttl_ms == 0` (batch policy), releases compute immediately while
 ///   preserving the persistent volume.
 pub(crate) fn handle_agent_idle_release(store: &Store, agent_id: &AgentId, config_dir: &Path) {
+    let Ok(_guard) = store.try_lock_agent(agent_id) else {
+        return;
+    };
+    match crate::sandbox_upgrade::recycle_at_boundary(store, agent_id, None) {
+        Ok(
+            crate::sandbox_upgrade::Action::RecycledNow
+            | crate::sandbox_upgrade::Action::DrainScheduled,
+        ) => return,
+        Err(err) => {
+            eprintln!("anyagents-sandbox: turn-boundary drain failed for {agent_id}: {err}");
+            return;
+        }
+        _ => {}
+    }
+    if !matches!(crate::sandbox_upgrade::busy(store, agent_id), Ok(false)) {
+        return;
+    }
     let now = anyagents_core::now_ms();
     if let Ok(Some(hb)) = store.runtime_heartbeat(agent_id)
         && hb.inflight_children > 0
@@ -1782,8 +1701,19 @@ where
 {
     let mut report = IdleSweepReport::default();
     let due = store.sandbox_binding_store().list_idle_due(now_ms)?;
-    for binding in due {
+    for candidate in due {
         report.inspected += 1;
+        let _guard = match store.try_lock_agent(&candidate.agent_id) {
+            Ok(guard) => guard,
+            Err(Error::AgentBusy) => {
+                report.skipped_busy.push(candidate.agent_id);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let Some(binding) = store.sandbox_binding(&candidate.agent_id)? else {
+            continue;
+        };
         let Some(idle_since) = binding.idle_since_ms else {
             continue;
         };
@@ -1875,6 +1805,7 @@ pub(crate) fn sweep_idle_sandboxes(
     data_dir: &Path,
     now_ms: i64,
 ) -> Result<IdleSweepReport, Error> {
+    crate::sandbox_upgrade::reconcile_ready_bindings(store)?;
     sweep_idle_sandboxes_with_resolver(store, data_dir, now_ms, |binding| {
         if binding.provider == "legacy_http" || binding.provider == "local" {
             return Ok(None);

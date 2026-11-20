@@ -6,7 +6,7 @@ Python standard library (`tomllib`), computes Cargo-accurate reverse dependents
 (transitive normal/build dependencies plus 1-hop dev-dependencies), and maps
 changed git paths to minimal, sound CI execution scopes:
 
-- Docs / markdown / `AGENTS.md` / `Dockerfile.prebuilt` / `sylphx.toml` /
+- Docs / markdown / `AGENTS.md` / `sylphx.toml` /
   `tools/` / Python policy-only PRs -> `rust_scope=none`, `run_macos=false`.
 - `packages/` / `package.json`-only PRs -> `rust_scope=none`, `run_npm=true`,
   `run_macos=false`.

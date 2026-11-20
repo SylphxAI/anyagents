@@ -67,7 +67,7 @@ Keep changes inside the crate that owns the domain. Never pull coordinator conce
 `.github/workflows/ci.yml` uses `tools/ci_scope.py` to inspect `Cargo.toml` and `crates/*/Cargo.toml` on every `pull_request` and `merge_group`:
 
 - **Always-on fast checks (`changes`):** `tools/module_size_scan.py`, `tools/test_*.py`, `tests/test_release_admission.py`, `tests/test_deploy_build.py`, plus `npm test` when `packages/` or `package.json` changes.
-- **Docs / `AGENTS.md` / `Dockerfile.prebuilt` / `sylphx.toml` / `tools/`-only PRs:** skip Rust compilation and macOS runners while passing `changes` and the required `ci-ok` gate.
+- **Docs / `AGENTS.md` / `sylphx.toml` / `tools/`-only PRs:** skip Rust compilation and macOS runners while passing `changes` and the required `ci-ok` gate.
 - **Leaf-crate PRs** (e.g. `crates/anyagents-guest/**`, `crates/anyagents-mcp-*/**`, `crates/anyagents-gateway/**`, leaf harness adapters): run `cargo clippy` / `cargo nextest` / `cargo test --doc` scoped strictly to the touched crates and their Cargo reverse dependents, skipping macOS and privileged Linux host acceptance unless a macOS/host-platform crate is affected.
 - **Core / coordinator / manifest / workflow changes** (`Cargo.toml`, `Cargo.lock`, `crates/anyagents-core/**`, `crates/anyagents/**`, `crates/anyagents-harness/**`, `.github/workflows/ci.yml`) and `push` to `main`: run the full Linux + macOS workspace suite.
 

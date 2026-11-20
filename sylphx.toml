@@ -9,7 +9,7 @@ instance_type = "standard"
 min_instances = 0
 
 [services.build]
-dockerfile = "Dockerfile.prebuilt"
+dockerfile = "Dockerfile"
 context = "."
 
 [services.health]

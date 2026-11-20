@@ -41,6 +41,7 @@ mod runtime_cli;
 mod sandbox;
 mod sandbox_exec;
 mod sandbox_providers;
+mod sandbox_upgrade;
 mod schedule;
 mod seat_tree;
 mod server;

@@ -206,6 +206,7 @@ pub(crate) fn mount_admin_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/auth/me", get(admin_auth::me_route))
         .route("/admin/api/overview", get(overview_route))
         .route("/admin/api/tick", post(trigger_tick_route))
+        .merge(super::versions::router())
 }
 
 #[cfg(test)]
@@ -277,6 +278,113 @@ mod tests {
             );
             std::env::set_var("ANYAGENTS_PUBLIC_URL", "https://console.example.com");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn versions_routes_require_operator_and_csrf_and_persist_policy() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        configure_test_oidc_env();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .create_agent(anyagents_core::NewAgent::new("fixture", "codex"))
+            .unwrap();
+        let auth = crate::auth::Mode::from_env(dir.path());
+        let app = super::super::build_webhook_router(make_state(store, auth));
+        let cookie = valid_session_cookie_header();
+        let request =
+            |method: &str, path: &str, payload: &'static str, authenticated: bool, csrf: bool| {
+                let mut req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json");
+                if authenticated {
+                    req = req.header(COOKIE, &cookie);
+                }
+                if csrf {
+                    req = req.header(admin_auth::ADMIN_CSRF_HEADER, "1");
+                }
+                app.clone().oneshot(req.body(Body::from(payload)).unwrap())
+            };
+        let versions = "/admin/api/versions";
+        let policy = "/admin/api/versions/policy";
+        let drain = "/admin/api/agents/fixture/drain-upgrade";
+        assert_eq!(
+            request("GET", versions, "", false, false)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request("POST", drain, "", true, false)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                "PATCH",
+                policy,
+                r#"{"auto_update_policy":"auto"}"#,
+                true,
+                false
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                "PATCH",
+                policy,
+                r#"{"auto_update_policy":"unknown"}"#,
+                true,
+                true
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        for value in ["auto", "manual", "pinned"] {
+            let update = Request::builder()
+                .method("PATCH")
+                .uri(policy)
+                .header(COOKIE, &cookie)
+                .header(admin_auth::ADMIN_CSRF_HEADER, "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"auto_update_policy":value}).to_string()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(update).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let inventory = request("GET", versions, "", true, false).await.unwrap();
+            assert_eq!(inventory.status(), StatusCode::OK);
+            let data: Value =
+                serde_json::from_slice(&inventory.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(data["coordinator"]["auto_update_policy"], value);
+            assert_eq!(
+                data["summary"],
+                json!({"total":1,"up_to_date":0,"outdated":0,"draining":0,"cold":1})
+            );
+            assert_eq!(data["agents"][0]["upgrade_status"], "cold_uses_latest");
+        }
+        let drained = request("POST", drain, "", true, true).await.unwrap();
+        assert_eq!(drained.status(), StatusCode::OK);
+        let data: Value =
+            serde_json::from_slice(&drained.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            data,
+            json!({"agent":"fixture", "action":"cold_next_turn_latest"})
+        );
     }
 
     fn valid_session_cookie_header() -> String {

@@ -724,6 +724,10 @@ async fn handle_turn_timeout_fire(
 
 /// Renew one ready sandbox binding's lease and persist the refreshed `lease_expires_at_ms`.
 pub(crate) fn renew_binding_lease(store: &Store, binding: &SandboxBinding) -> bool {
+    if binding.provider == "sylphx" {
+        return crate::sandbox_upgrade::renew_active_binding(store, &binding.agent_id)
+            .unwrap_or(false);
+    }
     let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &binding.agent_id);
     if crate::sandbox_providers::renew_lease_for_config_dir(&cfg_dir).is_ok_and(|renewed| renewed) {
         let mut updated = binding.clone();
