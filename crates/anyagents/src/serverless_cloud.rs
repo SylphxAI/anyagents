@@ -123,6 +123,50 @@ pub struct CloudTurnPollResult {
     pub next_poll_after_ms: Option<u64>,
 }
 
+/// Request payload passed to [`CloudTurnDriver::steer_turn`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudTurnSteerRequest {
+    /// Coordinator-assigned active turn ID.
+    pub turn_id: String,
+    /// AnyAgents agent ID.
+    pub agent_id: String,
+    /// Provider-side remote agent/session ID (e.g. Spiron remote agent UUID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_agent_id: Option<String>,
+    /// Active provider-assigned run/receipt/task ID.
+    pub remote_run_id: String,
+    /// Durable mailbox message ID (sent as `Idempotency-Key`).
+    pub message_id: String,
+    /// Monotonic mailbox sequence number.
+    pub seq: i64,
+    /// Full composed message text to inject mid-turn.
+    pub prompt: String,
+    /// Optional per-turn Streamable HTTP MCP servers attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Value>,
+}
+
+/// Verified outcome returned by [`CloudTurnDriver::steer_turn`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CloudSteerAck {
+    /// Provider proved the steer entered the running turn (safe to advance `delivered_seq`).
+    Consumed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt_id: Option<String>,
+        proof: String,
+    },
+    /// Provider accepted the steer asynchronously without a consumption proof yet.
+    /// Fail-closed: coordinator keeps `delivered_seq` unadvanced until consumption proof arrives.
+    Accepted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt_id: Option<String>,
+    },
+    /// Provider refused or does not support steering this active turn.
+    /// Message remains safely undelivered in Postgres for turn-end drain.
+    Refused { reason: String },
+}
+
 /// Normalized event returned by [`CloudTurnDriver::parse_webhook`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CloudWebhookEvent {
@@ -140,6 +184,12 @@ pub struct CloudWebhookEvent {
     pub usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_proof: Option<String>,
 }
 
 /// Universal async driver contract for pure serverless cloud agent harnesses.
@@ -148,11 +198,29 @@ pub trait CloudTurnDriver: Send + Sync {
     /// Canonical `pending_remote_turns.harness_kind` value (`"spiron"`, `"http_cloud"`, ...).
     fn harness_kind(&self) -> &'static str;
 
+    /// Whether this driver has live native mid-turn steering wired.
+    #[allow(dead_code)]
+    fn supports_steer(&self) -> bool {
+        false
+    }
+
     /// Submit a turn asynchronously (`Prefer: respond-async`, zero long-lived SSE).
     async fn submit_turn(
         &self,
         req: &CloudTurnSubmitRequest,
     ) -> Result<CloudTurnSubmission, String>;
+
+    /// Optional: push a mid-turn steer message into an active cloud turn.
+    /// Default implementation fails closed (`Refused`) so messages stay safely
+    /// undelivered for turn-end drain.
+    async fn steer_turn(&self, _req: &CloudTurnSteerRequest) -> Result<CloudSteerAck, String> {
+        Ok(CloudSteerAck::Refused {
+            reason: format!(
+                "cloud driver `{}` does not support mid-turn steering",
+                self.harness_kind()
+            ),
+        })
+    }
 
     /// Poll a pending cloud turn on `/v1/internal/tick` fallback.
     async fn poll_turn(
@@ -414,10 +482,116 @@ impl SpironServerlessDriver {
     }
 }
 
+fn classify_cloud_steer_response(
+    provider_label: &str,
+    status: u16,
+    body: &Value,
+) -> Result<CloudSteerAck, String> {
+    if matches!(status, 404 | 405 | 409 | 410 | 422 | 501) {
+        let detail = extract_error_string(body)
+            .unwrap_or_else(|| format!("{provider_label} steer refused (HTTP {status})"));
+        return Ok(CloudSteerAck::Refused { reason: detail });
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("{provider_label} steer returned HTTP {status}"));
+    }
+    let receipt_id = body
+        .get("id")
+        .or_else(|| body.get("receipt_id"))
+        .or_else(|| body.get("task_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let status_str = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        status_str.as_str(),
+        "refused" | "rejected" | "deferred" | "failed" | "cancelled" | "canceled"
+    ) {
+        let reason = extract_error_string(body)
+            .unwrap_or_else(|| format!("{provider_label} steer status `{status_str}`"));
+        return Ok(CloudSteerAck::Refused { reason });
+    }
+    let has_input_delivery = body.get("input_delivery").is_some_and(|v| !v.is_null());
+    let explicit_consumed = body.get("consumed").and_then(Value::as_bool) == Some(true)
+        || body.get("steered").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            status_str.as_str(),
+            "consumed" | "steered" | "delivered" | "completed"
+        );
+    if has_input_delivery || explicit_consumed {
+        let proof = body
+            .get("proof")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if has_input_delivery {
+                    format!("{provider_label}:input_delivery")
+                } else {
+                    format!("{provider_label}:steered")
+                }
+            });
+        return Ok(CloudSteerAck::Consumed { receipt_id, proof });
+    }
+    Ok(CloudSteerAck::Accepted { receipt_id })
+}
+
+fn extract_webhook_steer_fields(
+    data: &Value,
+    payload: &Value,
+    event_type: &str,
+) -> (Option<String>, Option<i64>, Option<String>) {
+    let lower_ev = event_type.trim().to_ascii_lowercase();
+    let has_input_delivery = data.get("input_delivery").is_some_and(|v| !v.is_null())
+        || payload.get("input_delivery").is_some_and(|v| !v.is_null());
+    let is_steer_event = matches!(
+        lower_ev.as_str(),
+        "steer_consumed" | "message.steered" | "turn.steered" | "input_delivery"
+    ) || has_input_delivery;
+    if !is_steer_event {
+        return (None, None, None);
+    }
+    let msg_id = data
+        .get("message_id")
+        .or_else(|| data.get("provider_message_id"))
+        .or_else(|| data.get("idempotency_key"))
+        .or_else(|| payload.get("message_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let seq = data
+        .get("seq")
+        .or_else(|| data.get("message_seq"))
+        .or_else(|| payload.get("seq"))
+        .and_then(Value::as_i64);
+    let proof = data
+        .get("proof")
+        .or_else(|| payload.get("proof"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| has_input_delivery.then(|| "cloud:input_delivery".to_string()))
+        .or_else(|| Some(format!("cloud:{lower_ev}")));
+    (msg_id, seq, proof)
+}
+
 #[async_trait]
 impl CloudTurnDriver for SpironServerlessDriver {
     fn harness_kind(&self) -> &'static str {
         "spiron"
+    }
+
+    fn supports_steer(&self) -> bool {
+        true
     }
 
     async fn submit_turn(
@@ -518,6 +692,46 @@ impl CloudTurnDriver for SpironServerlessDriver {
         })
         .await
         .map_err(|e| format!("spiron submit task join error: {e}"))?
+    }
+
+    async fn steer_turn(&self, req: &CloudTurnSteerRequest) -> Result<CloudSteerAck, String> {
+        let driver = self.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let remote_agent_id = req
+                .remote_agent_id
+                .clone()
+                .or_else(|| driver.remote_agent_id.clone())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let Some(raw_agent) = remote_agent_id else {
+                return Ok(CloudSteerAck::Refused {
+                    reason: "Spiron active turn missing remote_agent_id for mid-turn steer"
+                        .to_string(),
+                });
+            };
+            let target_agent = validate_path_segment(&raw_agent, "remote_agent_id")?;
+            let remote_run_id = validate_path_segment(&req.remote_run_id, "remote_run_id")?;
+            let msg_id = validate_path_segment(&req.message_id, "message_id")?;
+
+            let mut msg_body = json!({ "content": req.prompt });
+            if let Some(ref mcp_servers) = req.mcp_servers {
+                msg_body["mcp_servers"] = mcp_servers.clone();
+            }
+
+            let mut headers = driver.auth_headers();
+            headers.push(("Idempotency-Key".to_string(), msg_id));
+            headers.push(("Prefer".to_string(), "respond-async".to_string()));
+            headers.push(("X-AnyAgents-Delivery".to_string(), "steer".to_string()));
+            headers.push(("X-AnyAgents-Run-Id".to_string(), remote_run_id));
+
+            let url = format!("{}/v1/agents/{target_agent}/messages", driver.base_url);
+            let (status, resp) =
+                http_json("POST", &url, &headers, Some(&msg_body), driver.timeout_secs)?;
+            classify_cloud_steer_response("spiron", status, &resp)
+        })
+        .await
+        .map_err(|e| format!("spiron steer task join error: {e}"))?
     }
 
     async fn poll_turn(
@@ -766,6 +980,9 @@ impl CloudTurnDriver for SpironServerlessDriver {
             .and_then(Value::as_str)
             .map(str::to_string);
 
+        let (steer_message_id, steer_seq, steer_proof) =
+            extract_webhook_steer_fields(data, &payload, &event_type);
+
         Ok(CloudWebhookEvent {
             turn_id,
             remote_run_id,
@@ -776,6 +993,9 @@ impl CloudTurnDriver for SpironServerlessDriver {
             error_text,
             usage,
             cursor,
+            steer_message_id,
+            steer_seq,
+            steer_proof,
         })
     }
 }
@@ -897,6 +1117,24 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
         })
         .await
         .map_err(|e| format!("http_cloud submit task join error: {e}"))?
+    }
+
+    async fn steer_turn(&self, req: &CloudTurnSteerRequest) -> Result<CloudSteerAck, String> {
+        let driver = self.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let run_id = validate_path_segment(&req.remote_run_id, "remote_run_id")?;
+            let msg_id = validate_path_segment(&req.message_id, "message_id")?;
+            let mut headers = driver.auth_headers();
+            headers.push(("Idempotency-Key".to_string(), msg_id));
+            let payload = serde_json::to_value(&req).map_err(|e| e.to_string())?;
+            let url = format!("{}/turns/{run_id}/steer", driver.base_url);
+            let (status, resp) =
+                http_json("POST", &url, &headers, Some(&payload), driver.timeout_secs)?;
+            classify_cloud_steer_response("http_cloud", status, &resp)
+        })
+        .await
+        .map_err(|e| format!("http_cloud steer task join error: {e}"))?
     }
 
     async fn poll_turn(
@@ -1033,6 +1271,9 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
             },
         };
 
+        let (steer_message_id, steer_seq, steer_proof) =
+            extract_webhook_steer_fields(data, &payload, &event_type);
+
         Ok(CloudWebhookEvent {
             turn_id,
             remote_run_id,
@@ -1047,6 +1288,9 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
                 .or_else(|| payload.get("cursor"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            steer_message_id,
+            steer_seq,
+            steer_proof,
         })
     }
 }
@@ -1378,5 +1622,187 @@ mod tests {
         assert_eq!(ev.remote_run_id, "gen_run_99");
         assert_eq!(ev.status, CloudTurnState::Completed);
         assert_eq!(ev.result_text.as_deref(), Some("Done via webhook"));
+    }
+
+    #[tokio::test]
+    async fn cloud_drivers_steer_turn_and_parse_steer_consumed_webhooks_with_fail_closed_refusal() {
+        #[derive(Default)]
+        struct MockSteerServer {
+            mode: Mutex<String>,
+            headers_seen: Mutex<Vec<(String, String)>>,
+            bodies_seen: Mutex<Vec<Value>>,
+        }
+
+        let st = Arc::new(MockSteerServer {
+            mode: Mutex::new("consumed".into()),
+            ..MockSteerServer::default()
+        });
+        let app = Router::new()
+            .route(
+                "/v1/agents/{agent_id}/messages",
+                post(
+                    |State(st): State<Arc<MockSteerServer>>,
+                     headers: HeaderMap,
+                     Json(body): Json<Value>| async move {
+                        let delivery = headers
+                            .get("x-anyagents-delivery")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let run_id = headers
+                            .get("x-anyagents-run-id")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        st.headers_seen.lock().unwrap().push((delivery, run_id));
+                        st.bodies_seen.lock().unwrap().push(body);
+                        let mode = st.mode.lock().unwrap().clone();
+                        match mode.as_str() {
+                            "consumed" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": "rcpt_steer_1",
+                                    "status": "steered",
+                                    "input_delivery": { "delivered": true, "step": 2 }
+                                })),
+                            ),
+                            "accepted" => (
+                                StatusCode::ACCEPTED,
+                                Json(json!({
+                                    "id": "rcpt_steer_2",
+                                    "status": "accepted"
+                                })),
+                            ),
+                            _ => (
+                                StatusCode::CONFLICT,
+                                Json(json!({
+                                    "error": "turn already settling"
+                                })),
+                            ),
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/turns/{run_id}/steer",
+                post(
+                    |State(st): State<Arc<MockSteerServer>>,
+                     AxumPath(_run_id): AxumPath<String>,
+                     Json(body): Json<Value>| async move {
+                        st.bodies_seen.lock().unwrap().push(body);
+                        let mode = st.mode.lock().unwrap().clone();
+                        match mode.as_str() {
+                            "consumed" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": "gen_steer_1",
+                                    "status": "consumed",
+                                    "consumed": true,
+                                    "proof": "http_cloud:step2_consumed"
+                                })),
+                            ),
+                            _ => (
+                                StatusCode::NOT_IMPLEMENTED,
+                                Json(json!({ "error": "steer not supported" })),
+                            ),
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&st));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let spiron = SpironServerlessDriver::new(format!("http://{addr}"), Some("sk_test".into()))
+            .with_remote_agent_id(Some("agt_remote_spiron".into()))
+            .with_webhook_secret(Some("whsec_steer".into()));
+        assert!(spiron.supports_steer());
+
+        let base_req = CloudTurnSteerRequest {
+            turn_id: "turn_c_1".into(),
+            agent_id: "agt_local_1".into(),
+            remote_agent_id: Some("agt_remote_spiron".into()),
+            remote_run_id: "rcpt_open_1".into(),
+            message_id: "msg_steer_c1".into(),
+            seq: 2,
+            prompt: "Steer into step 2".into(),
+            mcp_servers: None,
+        };
+
+        // 1. Spiron synchronous Consumed ack via `input_delivery`.
+        let ack1 = spiron.steer_turn(&base_req).await.unwrap();
+        assert!(
+            matches!(
+                ack1,
+                CloudSteerAck::Consumed {
+                    receipt_id: Some(ref r),
+                    ref proof
+                } if r == "rcpt_steer_1" && proof == "spiron:input_delivery"
+            ),
+            "{ack1:?}"
+        );
+        {
+            let hdrs = st.headers_seen.lock().unwrap();
+            assert_eq!(hdrs[0], ("steer".to_string(), "rcpt_open_1".to_string()));
+        }
+
+        // 2. Spiron async Accepted ack (does NOT fabricate consumption proof).
+        *st.mode.lock().unwrap() = "accepted".into();
+        let ack2 = spiron.steer_turn(&base_req).await.unwrap();
+        assert_eq!(
+            ack2,
+            CloudSteerAck::Accepted {
+                receipt_id: Some("rcpt_steer_2".into())
+            }
+        );
+
+        // 3. Spiron HTTP 409 Refused fails closed cleanly.
+        *st.mode.lock().unwrap() = "refused".into();
+        let ack3 = spiron.steer_turn(&base_req).await.unwrap();
+        assert!(
+            matches!(ack3, CloudSteerAck::Refused { ref reason } if reason.contains("settling")),
+            "{ack3:?}"
+        );
+
+        // 4. Spiron webhook `message.steered` parses steer_message_id / steer_seq / steer_proof.
+        let wh_body = serde_json::to_vec(&json!({
+            "event": "message.steered",
+            "data": {
+                "task_id": "rcpt_open_1",
+                "turn_id": "turn_c_1",
+                "status": "running",
+                "message_id": "msg_steer_c1",
+                "seq": 2,
+                "input_delivery": { "delivered": true }
+            }
+        }))
+        .unwrap();
+        let sig = format!("sha256={}", hmac_sha256_hex(b"whsec_steer", &wh_body));
+        let parsed = spiron
+            .parse_webhook(&[("X-Spiron-Signature-256".into(), sig)], &wh_body)
+            .unwrap();
+        assert_eq!(parsed.status, CloudTurnState::Running);
+        assert_eq!(parsed.steer_message_id.as_deref(), Some("msg_steer_c1"));
+        assert_eq!(parsed.steer_seq, Some(2));
+        assert_eq!(parsed.steer_proof.as_deref(), Some("cloud:input_delivery"));
+
+        // 5. GenericHttpCloudDriver supports steer_turn when endpoint accepts & fails closed on 501.
+        let generic = GenericHttpCloudDriver::new(format!("http://{addr}"), Some("tok_g".into()));
+        *st.mode.lock().unwrap() = "consumed".into();
+        let g1 = generic.steer_turn(&base_req).await.unwrap();
+        assert!(
+            matches!(
+                g1,
+                CloudSteerAck::Consumed { ref proof, .. } if proof == "http_cloud:step2_consumed"
+            ),
+            "{g1:?}"
+        );
+        *st.mode.lock().unwrap() = "refused".into();
+        let g2 = generic.steer_turn(&base_req).await.unwrap();
+        assert!(matches!(g2, CloudSteerAck::Refused { .. }), "{g2:?}");
     }
 }

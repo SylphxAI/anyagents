@@ -59,6 +59,7 @@ mod serverless_envelope;
 mod serverless_failure;
 pub(crate) mod serverless_maintenance;
 mod serverless_memory;
+pub(crate) mod serverless_steer;
 pub(crate) mod serverless_watches;
 pub(crate) mod timer_fire;
 mod types;

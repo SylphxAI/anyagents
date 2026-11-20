@@ -1020,11 +1020,13 @@ fn installed_on_disk(files: &file_cache::FileCache, root: &Path, harness: &str) 
     )
 }
 
-/// Honest delivery semantics for the current runtime mode: in serverless per-turn
-/// dispatch, mid-turn stdin steering is inactive, so never advertise `steer_support: "yes"`.
+/// Honest delivery semantics for the current runtime mode: in serverless mode,
+/// report `NextStep` (`delivery_mode: "steer"`, `steer_support: "yes"`) ONLY for
+/// harnesses whose live mid-turn steering transport is wired and E2E-verified
+/// (failing closed to `TurnEnd` on unwired harnesses such as `gemini`).
 fn declared_delivery_for_agent_mode(agent: &Agent) -> anyagents_harness::Delivery {
     if serverless::is_serverless_mode() {
-        anyagents_harness_stream::LINE_PER_TURN
+        super::serverless_steer::declared_delivery_for_serverless_agent(agent)
     } else {
         crate::remote::declared_delivery_for_agent(agent)
     }
@@ -1033,10 +1035,13 @@ fn declared_delivery_for_agent_mode(agent: &Agent) -> anyagents_harness::Deliver
 #[cfg(test)]
 fn declared_delivery_for_serverless(
     harness: &str,
+    runtime: &anyagents_core::ExecutionRuntime,
     serverless_mode: bool,
 ) -> anyagents_harness::Delivery {
     if serverless_mode {
-        anyagents_harness_stream::LINE_PER_TURN
+        super::serverless_steer::declared_delivery_for_serverless_parts(harness, runtime)
+    } else if runtime.is_cloud() {
+        anyagents_harness_claude::CLOUD_DELIVERY
     } else {
         crate::vendor::declared_delivery(harness)
     }
@@ -1173,11 +1178,54 @@ mod tests {
     }
 
     #[test]
-    fn serverless_mode_reports_honest_followup_and_no_steer_support() {
-        let delivery = declared_delivery_for_serverless("claude-code", true);
-        let view = crate::api::DeliveryView::from(&delivery);
-        assert_eq!(view.legacy_mode(), "followup");
-        assert_eq!(view.legacy_steer(), "no");
+    fn serverless_mode_reports_honest_next_step_only_for_wired_harnesses_and_fails_closed() {
+        use anyagents_core::ExecutionRuntime;
+
+        for runtime in [
+            ExecutionRuntime::Sandbox { provider: None },
+            ExecutionRuntime::Local,
+        ] {
+            for wired in [
+                "agy",
+                "claude-code",
+                "codex",
+                "opencode",
+                "omp",
+                "muse",
+                "spiron",
+            ] {
+                let delivery = declared_delivery_for_serverless(wired, &runtime, true);
+                let view = crate::api::DeliveryView::from(&delivery);
+                assert_eq!(view.level, "next-step", "{wired} on {runtime:?}");
+                assert_eq!(view.legacy_mode(), "steer", "{wired} on {runtime:?}");
+                assert_eq!(view.legacy_steer(), "yes", "{wired} on {runtime:?}");
+            }
+            // Unwired / one-shot harnesses MUST fail closed to turn-end / followup / no.
+            for unwired in ["gemini", "unknown-harness"] {
+                let delivery = declared_delivery_for_serverless(unwired, &runtime, true);
+                let view = crate::api::DeliveryView::from(&delivery);
+                assert_eq!(view.level, "turn-end", "{unwired} on {runtime:?}");
+                assert_eq!(view.legacy_mode(), "followup", "{unwired} on {runtime:?}");
+                assert_eq!(view.legacy_steer(), "no", "{unwired} on {runtime:?}");
+            }
+        }
+
+        // Cloud runtime: `spiron` cloud has live mid-turn steering wired; unwired cloud fails closed.
+        let spiron_cloud =
+            declared_delivery_for_serverless("spiron", &ExecutionRuntime::Cloud, true);
+        let spiron_view = crate::api::DeliveryView::from(&spiron_cloud);
+        assert_eq!(spiron_view.level, "next-step");
+        assert_eq!(spiron_view.legacy_mode(), "steer");
+        assert_eq!(spiron_view.legacy_steer(), "yes");
+
+        for unwired_cloud in ["claude-code", "http-cloud", "gemini"] {
+            let delivery =
+                declared_delivery_for_serverless(unwired_cloud, &ExecutionRuntime::Cloud, true);
+            let view = crate::api::DeliveryView::from(&delivery);
+            assert_eq!(view.level, "turn-end", "{unwired_cloud} cloud");
+            assert_eq!(view.legacy_mode(), "followup", "{unwired_cloud} cloud");
+            assert_eq!(view.legacy_steer(), "no", "{unwired_cloud} cloud");
+        }
     }
 
     #[test]

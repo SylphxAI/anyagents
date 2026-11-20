@@ -739,12 +739,23 @@ async fn dispatch_sandbox_turn(
     let aid_upd = input.agent.id.clone();
     let tid_upd = turn_id.clone();
     let seq_upd = input.message_seq;
+    let state_dir_upd = ensured.handle.state_dir.clone();
+    let workdir_upd = ensured.handle.workdir.clone();
     let tb_upd = super::serverless_maintenance::resolve_timer_backend(
         input.timer_backend.as_ref(),
         store.data_dir(),
     );
     let updated = run_store_blocking(move || {
         let now = now_ms();
+        let mut updated_meta = created
+            .metadata_json
+            .clone()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = updated_meta.as_object_mut() {
+            obj.insert("state_dir".into(), json!(state_dir_upd));
+            obj.insert("workdir".into(), json!(workdir_upd));
+        }
         let updated = store_upd
             .remote_turn_store()
             .update_remote_run(
@@ -752,7 +763,7 @@ async fn dispatch_sandbox_turn(
                 remote_run_id.as_deref(),
                 Some("running"),
                 None,
-                None,
+                Some(&updated_meta),
             )
             .map_err(|e| format!("failed to update sandbox remote_run_id: {e}"))?
             .unwrap_or(created);
@@ -834,76 +845,107 @@ pub(super) async fn dispatch_next_mailbox_message_inner(
     callback_base_url: Option<String>,
     timer_backend: Option<Arc<dyn crate::timer::TimerBackend>>,
 ) -> Result<Option<DispatchedRemoteTurn>, String> {
-    let store_r = Arc::clone(&store);
-    let aid = agent_id.clone();
-    let next_batch = run_store_blocking(move || {
-        let agent = store_r
-            .agent(&aid)
-            .map_err(|e| format!("load agent {aid}: {e}"))?;
-        if matches!(agent.state.as_str(), "paused" | "archived") {
-            return Ok(None);
-        }
-        let now = now_ms();
-        let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
-        let active = store_r
-            .remote_turn_store()
-            .list_active_for_agent(&aid)
-            .map_err(|e| e.to_string())?;
-        let mut live_active = 0usize;
-        for turn in active {
-            if turn.harness_kind == "sandbox" && turn.last_event_at_ms <= stale_before {
-                super::serverless_failure::settle_timed_out_sandbox_turn(&store_r, &turn, now);
-            } else {
-                live_active += 1;
+    enum DispatchPlan {
+        Idle,
+        Steer(Agent, Box<PendingRemoteTurn>, Vec<anyagents_core::Message>),
+        Dispatch(Agent, Vec<anyagents_core::Message>),
+    }
+
+    for _attempt in 0..2 {
+        let store_r = Arc::clone(&store);
+        let aid = agent_id.clone();
+        let plan = run_store_blocking(move || {
+            let agent = store_r
+                .agent(&aid)
+                .map_err(|e| format!("load agent {aid}: {e}"))?;
+            if matches!(agent.state.as_str(), "paused" | "archived") {
+                return Ok(DispatchPlan::Idle);
+            }
+            let now = now_ms();
+            let stale_before = now.saturating_sub(sandbox_stale_threshold_ms());
+            let active = store_r
+                .remote_turn_store()
+                .list_active_for_agent(&aid)
+                .map_err(|e| e.to_string())?;
+            let mut live_turn: Option<PendingRemoteTurn> = None;
+            for turn in active {
+                if turn.harness_kind == "sandbox" && turn.last_event_at_ms <= stale_before {
+                    super::serverless_failure::settle_timed_out_sandbox_turn(&store_r, &turn, now);
+                } else if live_turn.is_none() {
+                    live_turn = Some(turn);
+                }
+            }
+            if let Some(turn) = live_turn {
+                let msgs = store_r
+                    .list_undelivered(&aid, 20)
+                    .map_err(|e| e.to_string())?;
+                if msgs.is_empty() {
+                    return Ok(DispatchPlan::Idle);
+                }
+                return Ok(DispatchPlan::Steer(agent, Box::new(turn), msgs));
+            }
+            super::serverless_failure::clear_unhealthy_sandbox_lease(&store_r, &aid);
+            if store_r.has_open_turn(&aid).unwrap_or(false) {
+                let _ = store_r.reconcile_stale_open_turn(&aid);
+            }
+            let msgs = store_r
+                .list_undelivered(&aid, 20)
+                .map_err(|e| e.to_string())?;
+            if msgs.is_empty() {
+                return Ok(DispatchPlan::Idle);
+            }
+            Ok(DispatchPlan::Dispatch(agent, msgs))
+        })
+        .await?;
+
+        match plan {
+            DispatchPlan::Idle => return Ok(None),
+            DispatchPlan::Steer(agent, active_turn, msgs) => {
+                match super::serverless_steer::try_steer_active_turn(
+                    Arc::clone(&store),
+                    agent,
+                    *active_turn,
+                    msgs,
+                    sandbox_provider.clone(),
+                    callback_base_url.clone(),
+                )
+                .await
+                {
+                    super::serverless_steer::SteerPushOutcome::TurnSettledRace => continue,
+                    _ => return Ok(None),
+                }
+            }
+            DispatchPlan::Dispatch(agent, msgs) => {
+                let last = msgs.last().expect("non-empty batch");
+                let (prompt, mut outbound) =
+                    super::serverless_envelope::build_serverless_outbound_message(&msgs);
+                super::serverless_envelope::attach_deployment_skills_to_topology(
+                    &mut outbound,
+                    store.data_dir(),
+                );
+                // Prefer the latest human/Telegram reply target in the batch over older scheduled reminders.
+                let reply_target = msgs
+                    .iter()
+                    .rev()
+                    .find_map(|m| match infer_reply_target_from_message(m) {
+                        Some(rt @ ReplyTarget::Telegram { .. }) => Some(rt),
+                        _ => None,
+                    })
+                    .or_else(|| msgs.iter().rev().find_map(infer_reply_target_from_message));
+
+                let mut input = ServerlessDispatchInput::for_agent(agent, prompt);
+                input.outbound_message = Some(outbound);
+                input.message_seq = Some(last.seq);
+                input.opener_id = Some(last.id.to_string());
+                input.reply_target = reply_target;
+                input.sandbox_provider = sandbox_provider;
+                input.callback_base_url = callback_base_url;
+                input.timer_backend = timer_backend;
+                return dispatch_serverless_turn_opt(store, input).await;
             }
         }
-        if live_active > 0 {
-            return Ok(None);
-        }
-        super::serverless_failure::clear_unhealthy_sandbox_lease(&store_r, &aid);
-        if store_r.has_open_turn(&aid).unwrap_or(false) {
-            let _ = store_r.reconcile_stale_open_turn(&aid);
-        }
-        let msgs = store_r
-            .list_undelivered(&aid, 20)
-            .map_err(|e| e.to_string())?;
-        if msgs.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some((agent, msgs)))
-    })
-    .await?;
-
-    let Some((agent, msgs)) = next_batch else {
-        return Ok(None);
-    };
-
-    let last = msgs.last().expect("non-empty batch");
-    let (prompt, mut outbound) =
-        super::serverless_envelope::build_serverless_outbound_message(&msgs);
-    super::serverless_envelope::attach_deployment_skills_to_topology(
-        &mut outbound,
-        store.data_dir(),
-    );
-    // Prefer the latest human/Telegram reply target in the batch over older scheduled reminders.
-    let reply_target = msgs
-        .iter()
-        .rev()
-        .find_map(|m| match infer_reply_target_from_message(m) {
-            Some(rt @ ReplyTarget::Telegram { .. }) => Some(rt),
-            _ => None,
-        })
-        .or_else(|| msgs.iter().rev().find_map(infer_reply_target_from_message));
-
-    let mut input = ServerlessDispatchInput::for_agent(agent, prompt);
-    input.outbound_message = Some(outbound);
-    input.message_seq = Some(last.seq);
-    input.opener_id = Some(last.id.to_string());
-    input.reply_target = reply_target;
-    input.sandbox_provider = sandbox_provider;
-    input.callback_base_url = callback_base_url;
-    input.timer_backend = timer_backend;
-    dispatch_serverless_turn_opt(store, input).await
+    }
+    Ok(None)
 }
 
 fn infer_reply_target_from_message(msg: &anyagents_core::Message) -> Option<ReplyTarget> {
@@ -1085,6 +1127,7 @@ pub(crate) fn settle_remote_turn_and_deliver(
 
     // 4. Advance durable mailbox delivery cursor & turn terminal ledger.
     super::serverless_watches::settle_turn_mailbox_cursor(store, &turn);
+    super::serverless_steer::settle_steered_turn_cursor(store, &turn);
     if turn.status != "completed"
         && let Some(seq) = turn
             .metadata_json
@@ -1143,6 +1186,14 @@ pub(crate) struct GuestEventPayload {
     pub busy: Option<bool>,
     #[serde(default)]
     pub seq: Option<u64>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub message_seq: Option<i64>,
+    #[serde(default)]
+    pub proof: Option<String>,
+    #[serde(default)]
+    pub consumed_steers: Option<Vec<anyagents_guest::steer::ConsumedSteer>>,
     #[serde(default)]
     pub result_text: Option<String>,
     #[serde(default)]
@@ -2308,7 +2359,28 @@ pub(crate) async fn guest_events_route(
                         0usize,
                     ))
                 }
+                "steer_accepted" => {
+                    let resp = super::serverless_steer::handle_guest_steer_accepted(
+                        &store, &turn, &payload, ts,
+                    )?;
+                    Ok((resp, None, None, 0usize))
+                }
+                "steer_consumed" => {
+                    let resp = super::serverless_steer::handle_guest_steer_consumed(
+                        &store, &turn, &payload, ts,
+                    )?;
+                    Ok((resp, None, None, 0usize))
+                }
+                "steer_refused" => {
+                    let resp = super::serverless_steer::handle_guest_steer_refused(
+                        &store, &turn, &payload, ts,
+                    )?;
+                    Ok((resp, None, None, 0usize))
+                }
                 "turn_complete" | "completed" => {
+                    super::serverless_steer::apply_turn_complete_consumed_steers(
+                        &store, &turn, &payload, ts,
+                    );
                     let inflight = payload.inflight_children.unwrap_or(0).max(0);
                     let settled = settle_remote_turn_and_deliver(
                         &store,
@@ -2683,6 +2755,33 @@ pub(crate) async fn cloud_events_route(
                 drain_aid,
             ))
         } else {
+            if let (Some(msg_id), Some(seq)) = (event.steer_message_id.as_deref(), event.steer_seq)
+            {
+                let proof = event.steer_proof.as_deref().unwrap_or("cloud:webhook");
+                let commit = super::serverless_steer::apply_verified_steer_consumed(
+                    &store,
+                    &turn.turn_id,
+                    msg_id,
+                    seq,
+                    proof,
+                    now,
+                )?;
+                return Ok((
+                    Json(json!({
+                        "ok": true,
+                        "turn_id": turn.turn_id,
+                        "remote_run_id": event.remote_run_id,
+                        "event_type": event.event_type,
+                        "status": "running",
+                        "settled": false,
+                        "steer_consumed": true,
+                        "message_id": msg_id,
+                        "seq": seq,
+                        "delivered_seq": commit.delivered_seq,
+                    })),
+                    None,
+                ));
+            }
             let _ = rts
                 .record_event(
                     &turn.turn_id,

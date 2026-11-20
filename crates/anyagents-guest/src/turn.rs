@@ -36,7 +36,7 @@ use crate::guest::{
     wait_wake,
 };
 
-const POLL_TICK: Duration = Duration::from_millis(60);
+const POLL_TICK: Duration = Duration::from_millis(25);
 const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 200;
 const CALLBACK_TIMEOUT_SECS: u64 = 15;
@@ -209,6 +209,10 @@ fn spawn_detached_turn(
     )
     .map_err(|e| format!("cannot persist turn callback token: {e}"))?;
 
+    // Create the per-turn atomic steer spool dir before detaching so coordinator
+    // mid-turn steers can drop immediately after accepted JSON is returned.
+    let _ = crate::steer::ensure_steer_spool_dir(turns_dir, &args.turn_id);
+
     let log_path = turns_dir.join(format!("{}.log", args.turn_id));
     let log_out = open_log_file(&log_path)?;
     let log_err = log_out
@@ -321,7 +325,7 @@ fn resolve_timeout_secs(env_key: &str, default_secs: u64) -> Option<Duration> {
 /// Prevents a deadlocked inner harness (0 stdout/stderr/activity progress) from
 /// being masked indefinitely by background heartbeats.
 #[derive(Clone)]
-struct TurnWatchdog {
+pub(crate) struct TurnWatchdog {
     started_at: Instant,
     last_activity_ms: Arc<AtomicU64>,
     silent_timeout: Option<Duration>,
@@ -348,7 +352,7 @@ impl TurnWatchdog {
         )
     }
 
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let elapsed = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_activity_ms.store(elapsed, Ordering::Relaxed);
     }
@@ -734,9 +738,25 @@ fn execute_turn_foreground(
     let mut sent_text_len = 0usize;
     let mut delta_seq = 0u64;
     let mut err_override: Option<String> = None;
+    let mut steer_pump = crate::steer::SteerPump::new(
+        turns_dir,
+        &args.turn_id,
+        &args.agent_id,
+        &harness_name,
+        callback_url,
+        callback_token,
+    );
 
     if !delivered_done {
         loop {
+            steer_pump.tick(
+                adapter.as_mut(),
+                state_dir,
+                &env,
+                file_cfg.as_ref(),
+                &watchdog,
+            );
+
             let health = adapter.health();
             let live_sid = adapter.session_id();
             if let Some(ref sid) = live_sid {
@@ -748,7 +768,10 @@ fn execute_turn_foreground(
             );
 
             // Stream incremental deltas if harness accumulated new output.
-            if let Some(current_text) = adapter.answer_for(&delivery_id, state_dir)
+            let current_answer = steer_pump
+                .latest_answer(adapter.as_ref(), state_dir)
+                .or_else(|| adapter.answer_for(&delivery_id, state_dir));
+            if let Some(current_text) = current_answer
                 && current_text.len() > sent_text_len
                 && current_text.is_char_boundary(sent_text_len)
             {
@@ -788,16 +811,20 @@ fn execute_turn_foreground(
             }
 
             let proven = adapter.proven(&delivery_id);
-            let done_by_proof = matches!(
-                proven,
-                Some(Proof::Taken {
-                    turn_finished: true
-                }) | Some(Proof::Duplicate)
-            );
-            let done_by_turns =
-                adapter.turns_served() > base_turns && health.turn_state == TurnState::Idle;
+            let steers_active = steer_pump.has_active_work(adapter.as_ref(), health.turn_state);
+            let done_by_proof = !steers_active
+                && matches!(
+                    proven,
+                    Some(Proof::Taken {
+                        turn_finished: true
+                    }) | Some(Proof::Duplicate)
+                );
+            let done_by_turns = !steers_active
+                && adapter.turns_served() > base_turns
+                && health.turn_state == TurnState::Idle;
             let failure = adapter
                 .failure_for_id(&delivery_id)
+                .or_else(|| steer_pump.first_failure(adapter.as_ref()))
                 .or_else(|| health.sign_in_fault.clone());
 
             if done_by_proof || done_by_turns || failure.is_some() || !health.process_alive {
@@ -824,20 +851,31 @@ fn execute_turn_foreground(
         }
     }
 
+    // Drain any steer proofs emitted alongside the terminal turn frame.
+    steer_pump.drain_final_proofs(adapter.as_ref());
+
     let sid = adapter
         .session_id()
         .or(initial_sid)
         .unwrap_or_else(|| format!("{harness_name}-guest-session"));
     let _ = persist_session(state_dir, &harness_name, &sid);
 
-    let usage = adapter
-        .usage_for_id(&delivery_id)
-        .unwrap_or_else(|| adapter.served_usage().difference(base_usage));
-    let reply_opt = adapter.answer_for(&delivery_id, state_dir);
+    let delta_usage = adapter.served_usage().difference(base_usage);
+    let usage = if !steer_pump.consumed_steers().is_empty()
+        && (delta_usage.input_tokens > 0 || delta_usage.output_tokens > 0)
+    {
+        delta_usage
+    } else {
+        adapter.usage_for_id(&delivery_id).unwrap_or(delta_usage)
+    };
+    let reply_opt = steer_pump
+        .latest_answer(adapter.as_ref(), state_dir)
+        .or_else(|| adapter.answer_for(&delivery_id, state_dir));
     let reply_empty = reply_opt.as_deref().is_none_or(|s| s.trim().is_empty());
     if err_override.is_none() && reply_empty {
         err_override = adapter
             .failure_for_id(&delivery_id)
+            .or_else(|| steer_pump.first_failure(adapter.as_ref()))
             .or_else(|| adapter.exit_diagnostic());
     }
 
@@ -850,6 +888,8 @@ fn execute_turn_foreground(
         GuestActivitySnapshot::capture_current(&harness_name, Some(sid.clone()), "idle", 0, 0);
     clear_activity_snapshot(state_dir);
     adapter.stop();
+    // Drain proofs once more after `adapter.stop()` flushed any trailing stdout frames.
+    steer_pump.drain_final_proofs(adapter.as_ref());
     let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
 
     if let Some(err_msg) = err_override {
@@ -895,7 +935,7 @@ fn execute_turn_foreground(
         }
     }
 
-    let audit_payload = json!({
+    let mut audit_payload = json!({
         "event_type": "turn_complete",
         "turn_id": args.turn_id,
         "agent_id": args.agent_id,
@@ -906,6 +946,14 @@ fn execute_turn_foreground(
         "inflight_children": final_snap.inflight_children,
         "timestamp_ms": now_unix_ms(),
     });
+    if !steer_pump.consumed_steers().is_empty()
+        && let Some(obj) = audit_payload.as_object_mut()
+    {
+        obj.insert(
+            "consumed_steers".to_string(),
+            json!(steer_pump.consumed_steers()),
+        );
+    }
     persist_turn_result_audit(turns_dir, &args.turn_id, &audit_payload);
     let mut callback_payload = audit_payload;
     if !synced_auth.is_empty()

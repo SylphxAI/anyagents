@@ -1,9 +1,12 @@
 //! Guest-side harness auth mirroring (`claude-code`, `codex`, `spiron`),
 //! Codex startup preflight fail-closed check, and stale kubeconfig cleanup.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use anyagents_harness_spiron::SpironLaunch;
+use anyagents_harness::HarnessError;
+use anyagents_harness_spiron::{MAX_SOCKET_PATH, SpironHarness, SpironLaunch};
 use serde_json::{Value, json};
 
 use crate::guest::GuestConfig;
@@ -74,6 +77,41 @@ pub(crate) fn build_spiron_launch(
         session: session.map(str::to_string),
         state_dir: state_dir.to_path_buf(),
     }
+}
+
+/// Launch `spiron` inside the sandbox using `spiron.headless/v2` (`--listen <socket>`)
+/// so native mid-turn steering (`accepted` / `steer_consumed`) works live during turns.
+/// Falls back to stdio mode only when explicitly opted into via `ANYAGENTS_GUEST_SPIRON_STDIO=1`
+/// or `--guest-spiron-stdio`.
+pub(crate) fn launch_guest_spiron(
+    mut launch: SpironLaunch,
+    state_dir: &Path,
+) -> Result<(SpironHarness, Option<PathBuf>), HarnessError> {
+    let force_stdio = launch.args.iter().any(|a| a == "--guest-spiron-stdio")
+        || std::env::var("ANYAGENTS_GUEST_SPIRON_STDIO")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"));
+    launch.args.retain(|a| a != "--guest-spiron-stdio");
+    if force_stdio {
+        return Ok((SpironHarness::launch(launch)?, None));
+    }
+
+    static SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let candidate = state_dir.join(format!("spiron-{}-{seq}.sock", std::process::id()));
+    let socket = if candidate.as_os_str().len() <= MAX_SOCKET_PATH {
+        candidate
+    } else {
+        std::env::temp_dir().join(format!("ag-sp-{}-{seq}.sock", std::process::id()))
+    };
+    let _ = std::fs::remove_file(&socket);
+    let log = state_dir.join("spiron.log");
+    let harness =
+        SpironHarness::launch_listening(launch, &socket, &log, Duration::from_secs(60), |_pid| {
+            Ok(())
+        })
+        .map_err(|anyagents_harness_spiron::ListenError::Failed(err)| HarnessError::Failed(err))?;
+    Ok((harness, Some(socket)))
 }
 
 pub(crate) fn prepare_harness_auth(harness: &str, state_dir: &Path, model: Option<&str>) {
