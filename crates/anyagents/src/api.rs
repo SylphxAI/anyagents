@@ -371,6 +371,10 @@ pub struct CreateAgentRequest {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Optional persistent browser profile grants to delegate to the new agent
+    /// (enforcing exact `child ⊆ parent` capability attenuation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profiles: Option<Vec<String>>,
     /// Optional named deployment secret bundles to grant to this agent upon creation.
     /// Defaults to `[]` when omitted. Non-admin parents may only grant secrets they hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +410,10 @@ pub struct PatchAgentRequest {
     /// Enforces exact parent-delegated capability attenuation (`child ⊆ parent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
+    /// Replace this agent's granted persistent browser profile names.
+    /// Enforces exact parent-delegated capability attenuation (`child ⊆ parent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profiles: Option<Vec<String>>,
 }
 
 /// Body of `PUT /v1/secrets/{name}` (write-only upsert; values are never returned).

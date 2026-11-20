@@ -32,6 +32,7 @@ use crate::server;
 mod agent_list;
 mod agent_secrets;
 mod args;
+mod browser_profiles;
 mod client;
 mod frame_cap;
 mod profile;

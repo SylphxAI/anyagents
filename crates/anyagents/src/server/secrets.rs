@@ -400,6 +400,7 @@ pub(super) async fn patch_agent_route(
             || body.lifecycle.is_some()
             || body.public.is_some();
         let has_secrets = body.secrets.is_some();
+        let has_browser_profiles = body.browser_profiles.is_some();
 
         let is_strict_ancestor = match &principal {
             Principal::Agent { agent_id, .. } => {
@@ -408,7 +409,7 @@ pub(super) async fn patch_agent_route(
             Principal::Operator => true,
         };
 
-        if !has_meta && !has_secrets {
+        if !has_meta && !has_secrets && !has_browser_profiles {
             if !is_strict_ancestor {
                 require_admin_or_operator(&state.store, &principal, "agents.update", &target.name)?;
             }
@@ -424,6 +425,16 @@ pub(super) async fn patch_agent_route(
         }
         let prepared_secrets = if let Some(ref requested) = body.secrets {
             Some(authorize_agent_secret_grants(
+                &state.store,
+                &principal,
+                &target,
+                requested,
+            )?)
+        } else {
+            None
+        };
+        let prepared_browser_profiles = if let Some(ref requested) = body.browser_profiles {
+            Some(super::s3_media_profiles::validate_patch_browser_profiles(
                 &state.store,
                 &principal,
                 &target,
@@ -519,6 +530,14 @@ pub(super) async fn patch_agent_route(
                 .store
                 .set_agent_secrets(&rec.id, &desired_secrets, Some(&secret_actor))
                 .map_err(ApiError::from_store)?;
+        }
+        if let Some(desired_profiles) = prepared_browser_profiles {
+            super::s3_media_profiles::apply_patch_browser_profiles(
+                &state.store,
+                &principal,
+                &rec.id,
+                &desired_profiles,
+            )?;
         }
 
         let mut view = agent_view(&state.store, &state.health, &rec)?;

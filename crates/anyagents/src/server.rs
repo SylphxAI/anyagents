@@ -47,6 +47,7 @@ pub(crate) mod outbound_history;
 mod profiles;
 mod quota_rotation;
 mod reap_queue;
+pub(crate) mod s3_media_profiles;
 mod schedules;
 pub(crate) mod secrets;
 pub(crate) mod serverless;
@@ -159,6 +160,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(messaging::router())
         .merge(channels_groups::router())
         .merge(ops::router())
+        .merge(s3_media_profiles::router())
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {

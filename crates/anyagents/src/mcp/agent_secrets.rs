@@ -24,6 +24,7 @@ pub(super) fn spawn_args_from_agents(args: AgentsArgs) -> SpawnArgs {
         public: args.public,
         group: args.group,
         prompt: args.prompt,
+        browser_profiles: args.browser_profiles,
         secrets: args.secrets,
     }
 }
@@ -46,6 +47,7 @@ pub(super) fn spawn_args_from_subagents(args: SubagentsArgs) -> SpawnArgs {
         public: args.public,
         group: args.group,
         prompt: args.prompt,
+        browser_profiles: args.browser_profiles,
         secrets: args.secrets,
     }
 }
@@ -98,6 +100,7 @@ pub(super) fn create_request_from_agents(
         public: args.public,
         group: args.group,
         prompt: args.prompt,
+        browser_profiles: args.browser_profiles,
         secrets: args.secrets,
     })
 }
@@ -141,6 +144,7 @@ pub(super) fn create_request_from_spawn(
         public: args.public,
         group: args.group,
         prompt: args.prompt,
+        browser_profiles: args.browser_profiles,
         secrets: args.secrets,
     }
 }

@@ -17,6 +17,8 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki"] }
 thiserror = "2"
+ureq = "3"
+url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
