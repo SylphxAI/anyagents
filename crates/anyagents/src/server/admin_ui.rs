@@ -1,7 +1,8 @@
-//! Embedded Admin Console (`/admin`) static SPA and operator overview endpoints.
+//! Embedded AnyAgents Web Control Plane Console (`/`) static SPA, `/admin`
+//! compatibility redirect, OIDC auth route mounting, and operator overview endpoints.
 //!
-//! Serves zero-build HTML/CSS/JS directly from the binary with strict security
-//! headers (`Content-Security-Policy`, `X-Frame-Options: DENY`,
+//! Serves modular zero-build HTML/CSS/JS assets directly from `src/server/console/`
+//! with strict security headers (`Content-Security-Policy`, `X-Frame-Options: DENY`,
 //! `X-Content-Type-Options: nosniff`) on both local (`build_router`) and Pure
 //! Serverless (`build_webhook_router`) listeners.
 
@@ -11,63 +12,85 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::http::header::{CACHE_CONTROL, LOCATION};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 
 use crate::auth::Principal;
 
-use super::{ApiError, AppState, admin_auth, require_operator, serverless, spawn_store};
+use super::{
+    ApiError, AppState, admin_auth, console_html, ops, require_operator, serverless, spawn_store,
+};
 
-const INDEX_HTML: &str = include_str!("../../assets/admin/index.html");
-const APP_JS: &str = include_str!("../../assets/admin/app.js");
-const SECRETS_JS: &str = include_str!("../../assets/admin/secrets.js");
-const STYLES_CSS: &str = include_str!("../../assets/admin/styles.css");
-
-const ADMIN_CSP: &str =
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'";
+const INDEX_HTML: &str = include_str!("console/index.html");
+const CONSOLE_CSS: &str = include_str!("console/console.css");
+const CONSOLE_JS: &str = include_str!("console/console.js");
+const PROFILES_JS: &str = include_str!("console/profiles.js");
+const SECRETS_JS: &str = include_str!("console/secrets.js");
+const SIGNIN_JS: &str = include_str!("console/signin.js");
 
 fn static_asset_response(content_type: &'static str, body: &'static str) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
-        .header(CACHE_CONTROL, "no-store")
-        .header(
-            HeaderName::from_static("content-security-policy"),
-            HeaderValue::from_static(ADMIN_CSP),
-        )
-        .header(
-            HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        )
-        .header(
-            HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        )
-        .header(
-            HeaderName::from_static("referrer-policy"),
-            HeaderValue::from_static("no-referrer"),
-        )
-        .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+    console_html::console_response(StatusCode::OK, content_type, body.to_string())
 }
 
-pub(crate) async fn index_route() -> Response {
+/// `GET /`: serves the Web Control Plane UI.
+///
+/// - When `Accept` explicitly requests JSON only (e.g. automated API probes),
+///   returns the `{"ok": true}` readiness probe.
+/// - When OIDC is configured and the caller does not carry a valid operator
+///   session cookie, serves the standalone AnyAgents Sign-In page (`signin.html`).
+/// - When authenticated or in single-user local mode, serves the Web Control
+///   Plane UI (`index.html`).
+pub(crate) async fn root_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if console_html::accepts_json_only(&headers) {
+        return ops::public_healthz().await.into_response();
+    }
+    if admin_auth::is_oidc_configured() {
+        let authenticated = admin_auth::extract_session_cookie(&headers)
+            .as_deref()
+            .and_then(|raw| admin_auth::verify_session_cookie_from_env(raw).ok())
+            .is_some();
+        if !authenticated {
+            let coordinator_url =
+                serverless::resolve_public_url(state.store.data_dir()).or_else(|| {
+                    console_html::request_host_header(&headers).map(|host| format!("http://{host}"))
+                });
+            return console_html::render_signin_response(coordinator_url.as_deref());
+        }
+    }
     static_asset_response("text/html; charset=utf-8", INDEX_HTML)
 }
 
-pub(crate) async fn app_js_route() -> Response {
-    static_asset_response("application/javascript; charset=utf-8", APP_JS)
+/// `GET /admin` and `GET /admin/`: clean `302 Found` redirect to `/`.
+pub(crate) async fn redirect_to_root_route() -> Response {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, "/")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+pub(crate) async fn console_css_route() -> Response {
+    static_asset_response("text/css; charset=utf-8", CONSOLE_CSS)
+}
+
+pub(crate) async fn console_js_route() -> Response {
+    static_asset_response("application/javascript; charset=utf-8", CONSOLE_JS)
+}
+
+pub(crate) async fn profiles_js_route() -> Response {
+    static_asset_response("application/javascript; charset=utf-8", PROFILES_JS)
 }
 
 pub(crate) async fn secrets_js_route() -> Response {
     static_asset_response("application/javascript; charset=utf-8", SECRETS_JS)
 }
 
-pub(crate) async fn styles_css_route() -> Response {
-    static_asset_response("text/css; charset=utf-8", STYLES_CSS)
+pub(crate) async fn signin_js_route() -> Response {
+    static_asset_response("application/javascript; charset=utf-8", SIGNIN_JS)
 }
 
 /// `GET /admin/api/overview`: operator-only summary supplementing `/v1/agents` with
@@ -171,18 +194,30 @@ pub(crate) async fn trigger_tick_route(
     Ok(Json(summary))
 }
 
-/// Mount all `/admin` SPA, OIDC auth, and operator overview routes on a router.
+/// Mount the root Web Control Plane UI (`/`), `/admin` compatibility redirects,
+/// modular static console assets, OIDC auth routes (`/admin/auth/*` + `/auth/*`),
+/// and operator overview endpoints on a router.
 pub(crate) fn mount_admin_routes(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/admin", get(index_route))
-        .route("/admin/", get(index_route))
-        .route("/admin/assets/app.js", get(app_js_route))
+        .route("/", get(root_route))
+        .route("/admin", get(redirect_to_root_route))
+        .route("/admin/", get(redirect_to_root_route))
+        .route("/assets/console.css", get(console_css_route))
+        .route("/assets/console.js", get(console_js_route))
+        .route("/assets/profiles.js", get(profiles_js_route))
+        .route("/assets/secrets.js", get(secrets_js_route))
+        .route("/assets/signin.js", get(signin_js_route))
+        .route("/admin/assets/styles.css", get(console_css_route))
+        .route("/admin/assets/app.js", get(console_js_route))
         .route("/admin/assets/secrets.js", get(secrets_js_route))
-        .route("/admin/assets/styles.css", get(styles_css_route))
         .route("/admin/auth/login", get(admin_auth::login_route))
         .route("/admin/auth/callback", get(admin_auth::callback_route))
         .route("/admin/auth/logout", post(admin_auth::logout_route))
         .route("/admin/auth/me", get(admin_auth::me_route))
+        .route("/auth/login", get(admin_auth::login_route))
+        .route("/auth/callback", get(admin_auth::callback_route))
+        .route("/auth/logout", post(admin_auth::logout_route))
+        .route("/auth/me", get(admin_auth::me_route))
         .route("/admin/api/overview", get(overview_route))
         .route("/admin/api/tick", post(trigger_tick_route))
 }
@@ -193,6 +228,7 @@ mod tests {
     use anyagents_core::Store;
     use anyagents_supervisor::HealthBoard;
     use axum::http::Request;
+    use axum::http::header::{ACCEPT, COOKIE, HOST, SET_COOKIE};
     use http_body_util::BodyExt as _;
     use std::sync::Mutex;
     use tower::ServiceExt as _;
@@ -228,11 +264,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn admin_console_serves_csp_html_and_fails_closed_on_api_routes() {
-        let _env = crate::server::tests::env_lock();
-        let _restore = EnvRestore::capture(&[
+    fn oidc_env_keys() -> &'static [&'static str] {
+        &[
             "ANYAGENTS_SERVERLESS",
             "ANYAGENTS_OPERATOR_TOKEN",
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
@@ -241,8 +274,10 @@ mod tests {
             "ANYAGENTS_ADMIN_EMAILS",
             "ANYAGENTS_ADMIN_SESSION_SECRET",
             "ANYAGENTS_PUBLIC_URL",
-        ]);
+        ]
+    }
 
+    fn configure_test_oidc_env() {
         unsafe {
             std::env::set_var("ANYAGENTS_SERVERLESS", "true");
             std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN");
@@ -256,6 +291,34 @@ mod tests {
             );
             std::env::set_var("ANYAGENTS_PUBLIC_URL", "https://console.example.com");
         }
+    }
+
+    fn valid_session_cookie_header() -> String {
+        let key = admin_auth::session_signing_key_from_env().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cookie_val = admin_auth::sign_admin_session(
+            &key,
+            &admin_auth::AdminSession {
+                email: "ops@example.com".to_string(),
+                name: Some("Ops".to_string()),
+                sub: "sub-ops".to_string(),
+                iat: now,
+                exp: now + 3600,
+            },
+        )
+        .unwrap();
+        format!("{}={cookie_val}", admin_auth::ADMIN_SESSION_COOKIE)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn admin_console_serves_csp_html_and_fails_closed_on_api_routes() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        configure_test_oidc_env();
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -263,43 +326,89 @@ mod tests {
         assert!(auth.is_confined());
         let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
 
-        // 1. GET /admin returns 200 HTML with strict CSP, X-Frame-Options, nosniff.
-        let html_resp = app
+        // 1. GET /admin and GET /admin/ redirect 302 -> /.
+        for legacy in ["/admin", "/admin/"] {
+            let redir = app
+                .clone()
+                .oneshot(Request::builder().uri(legacy).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(redir.status(), StatusCode::FOUND, "{legacy}");
+            assert_eq!(
+                redir.headers().get(LOCATION).and_then(|v| v.to_str().ok()),
+                Some("/"),
+                "{legacy}"
+            );
+        }
+
+        // 2. GET / when OIDC is enabled & caller is unauthenticated serves the Sign-In page
+        //    with strict CSP, X-Frame-Options, nosniff, 1-click OIDC link, and CLI snippet.
+        let signin_resp = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(html_resp.status(), StatusCode::OK);
+        assert_eq!(signin_resp.status(), StatusCode::OK);
         assert_eq!(
-            html_resp
+            signin_resp
                 .headers()
                 .get("content-security-policy")
                 .and_then(|v| v.to_str().ok()),
-            Some(ADMIN_CSP)
+            Some(console_html::CONSOLE_CSP)
         );
         assert_eq!(
-            html_resp
+            signin_resp
                 .headers()
                 .get("x-frame-options")
                 .and_then(|v| v.to_str().ok()),
             Some("DENY")
         );
         assert_eq!(
-            html_resp
+            signin_resp
                 .headers()
                 .get("x-content-type-options")
                 .and_then(|v| v.to_str().ok()),
             Some("nosniff")
         );
-        let html_body = html_resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&html_body).contains("AnyAgents Admin Console"));
+        let signin_body = signin_resp.into_body().collect().await.unwrap().to_bytes();
+        let signin_html = String::from_utf8_lossy(&signin_body);
+        assert!(signin_html.contains("Sign in with OIDC"));
+        assert!(signin_html.contains(r#"href="/admin/auth/login""#));
+        assert!(signin_html.contains("anyagents auth login --url https://console.example.com"));
+        assert!(!signin_html.contains("<script>"));
 
-        // 2. GET /v1/agents and GET /admin/api/overview fail closed (401) without cookie/token.
+        // 3. Health probes (/healthz, /readyz, /v1/webhooks/healthz) remain strictly JSON,
+        //    and explicit Accept: application/json on / also returns readiness JSON.
+        for path in ["/healthz", "/readyz", "/v1/webhooks/healthz"] {
+            let probe = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(probe.status(), StatusCode::OK, "{path}");
+            let body: Value =
+                serde_json::from_slice(&probe.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body, json!({ "ok": true }), "{path}");
+        }
+        let json_root = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_root.status(), StatusCode::OK);
+        let json_root_body: Value =
+            serde_json::from_slice(&json_root.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(json_root_body, json!({ "ok": true }));
+
+        // 4. GET /v1/agents and GET /admin/api/overview fail closed (401) without cookie/token.
         let unauth_agents = app
             .clone()
             .oneshot(
@@ -324,50 +433,52 @@ mod tests {
             .unwrap();
         assert_eq!(unauth_overview.status(), StatusCode::UNAUTHORIZED);
 
-        // 3. GET /admin/auth/me reports unauthenticated OIDC mode without leaking secrets.
-        let me_unauth = app
+        // 5. GET /admin/auth/me and /auth/me report unauthenticated OIDC mode.
+        for me_path in ["/admin/auth/me", "/auth/me"] {
+            let me_unauth = app
+                .clone()
+                .oneshot(Request::builder().uri(me_path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(me_unauth.status(), StatusCode::OK, "{me_path}");
+            let me_json: Value =
+                serde_json::from_slice(&me_unauth.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(me_json["authenticated"], json!(false));
+            assert_eq!(me_json["mode"], json!("oidc"));
+            assert_eq!(me_json["serverless"], json!(true));
+        }
+
+        // 6. With valid signed session cookie, GET / serves the full Control Plane UI
+        //    and /v1/agents & /admin/api/overview return 200.
+        let cookie_hdr = valid_session_cookie_header();
+
+        let authed_root = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/admin/auth/me")
+                    .uri("/")
+                    .header(COOKIE, &cookie_hdr)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(me_unauth.status(), StatusCode::OK);
-        let me_json: Value =
-            serde_json::from_slice(&me_unauth.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(me_json["authenticated"], json!(false));
-        assert_eq!(me_json["mode"], json!("oidc"));
-        assert_eq!(me_json["serverless"], json!(true));
-
-        // 4. With valid signed session cookie, GET /v1/agents & /admin/api/overview return 200.
-        let key = admin_auth::session_signing_key_from_env().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let cookie_val = admin_auth::sign_admin_session(
-            &key,
-            &admin_auth::AdminSession {
-                email: "ops@example.com".to_string(),
-                name: Some("Ops".to_string()),
-                sub: "sub-ops".to_string(),
-                iat: now,
-                exp: now + 3600,
-            },
-        )
-        .unwrap();
-        let cookie_hdr = format!("{}={cookie_val}", admin_auth::ADMIN_SESSION_COOKIE);
+        assert_eq!(authed_root.status(), StatusCode::OK);
+        let root_html_bytes = authed_root.into_body().collect().await.unwrap().to_bytes();
+        let root_html = String::from_utf8_lossy(&root_html_bytes);
+        assert!(root_html.contains("AnyAgents Console"));
+        assert!(root_html.contains(r#"src="/assets/console.js""#));
+        assert!(root_html.contains(r#"src="/assets/profiles.js""#));
+        assert!(root_html.contains(r#"src="/assets/secrets.js""#));
+        assert!(!root_html.contains("<script>"));
 
         let authed_agents = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/agents")
-                    .header(axum::http::header::COOKIE, &cookie_hdr)
+                    .header(COOKIE, &cookie_hdr)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -380,7 +491,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/api/overview")
-                    .header(axum::http::header::COOKIE, &cookie_hdr)
+                    .header(COOKIE, &cookie_hdr)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -388,14 +499,14 @@ mod tests {
             .unwrap();
         assert_eq!(authed_overview.status(), StatusCode::OK);
 
-        // 5. POST /admin/api/tick rejects missing CSRF header (403), accepts with CSRF header (200).
+        // 7. POST /admin/api/tick rejects missing CSRF header (403), accepts with CSRF header (200).
         let no_csrf_tick = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/api/tick")
-                    .header(axum::http::header::COOKIE, &cookie_hdr)
+                    .header(COOKIE, &cookie_hdr)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -409,7 +520,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/api/tick")
-                    .header(axum::http::header::COOKIE, &cookie_hdr)
+                    .header(COOKIE, &cookie_hdr)
                     .header(admin_auth::ADMIN_CSRF_HEADER, "1")
                     .body(Body::empty())
                     .unwrap(),
@@ -418,7 +529,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok_tick.status(), StatusCode::OK);
 
-        // 6. POST /admin/auth/logout requires CSRF header and clears the session cookie.
+        // 8. POST /admin/auth/logout requires CSRF header and clears the session cookie.
         let logout_no_csrf = app
             .clone()
             .oneshot(
@@ -446,11 +557,267 @@ mod tests {
         assert_eq!(logout_ok.status(), StatusCode::OK);
         let set_cookie = logout_ok
             .headers()
-            .get(axum::http::header::SET_COOKIE)
+            .get(SET_COOKIE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(set_cookie.contains("anyagents_admin_session=;"));
         assert!(set_cookie.contains("Max-Age=0"));
         assert!(set_cookie.contains("Secure"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn local_single_user_mode_serves_console_ui_at_root() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        for key in oidc_env_keys() {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let app = super::super::build_router(make_state(
+            Arc::clone(&store),
+            crate::auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        ));
+
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(body.contains("AnyAgents Console"));
+        assert!(body.contains(r#"data-tab="fleet""#));
+
+        // Modular assets all return 200 with strict CSP.
+        for asset in [
+            "/assets/console.css",
+            "/assets/console.js",
+            "/assets/profiles.js",
+            "/assets/secrets.js",
+            "/assets/signin.js",
+            "/admin/assets/styles.css",
+            "/admin/assets/app.js",
+            "/admin/assets/secrets.js",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(Request::builder().uri(asset).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{asset}");
+            assert!(
+                r.headers().contains_key("content-security-policy"),
+                "{asset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oidc_login_redirects_non_canonical_host_before_minting_cookie() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        configure_test_oidc_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let auth = crate::auth::Mode::from_env(dir.path());
+        let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
+
+        // 1. Alias Host header -> 302 to canonical ANYAGENTS_PUBLIC_URL preserving safe `next`,
+        //    with ZERO Set-Cookie header minted on the non-canonical host.
+        let alias_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login?next=%2F%3Ftab%3Dsecrets")
+                    .header(HOST, "alias.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alias_host.status(), StatusCode::FOUND);
+        assert_eq!(
+            alias_host
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://console.example.com/admin/auth/login?next=%2F%3Ftab%3Dsecrets")
+        );
+        assert!(
+            alias_host.headers().get(SET_COOKIE).is_none(),
+            "must never mint pre-auth cookie on non-canonical host"
+        );
+
+        // 2. Alias X-Forwarded-Host header (even if Host matches or via /auth/login alias) ->
+        //    302 to canonical /admin/auth/login, dropping unsafe open-redirect `next`.
+        let alias_xfh = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login?next=//evil.example/steal")
+                    .header(HOST, "console.example.com")
+                    .header("x-forwarded-host", "custom-alias.example.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alias_xfh.status(), StatusCode::FOUND);
+        assert_eq!(
+            alias_xfh
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://console.example.com/admin/auth/login")
+        );
+        assert!(alias_xfh.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oidc_callback_renders_graceful_html_recovery_or_json_for_missing_and_expired_cookie() {
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        configure_test_oidc_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let auth = crate::auth::Mode::from_env(dir.path());
+        let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
+
+        // 1. Missing pre-auth cookie from a human browser -> 401 HTML recovery page with
+        //    Cache-Control: no-store and 1-click "Sign in again" link to canonical /admin/auth/login.
+        let browser_missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/callback?code=abc123&state=st456")
+                    .header(ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            browser_missing
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(
+            browser_missing
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("text/html")
+        );
+        let html_bytes = browser_missing
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = String::from_utf8_lossy(&html_bytes);
+        assert!(html.contains("AnyAgents"));
+        assert!(html.contains("Sign in again"));
+        assert!(html.contains(r#"href="https://console.example.com/admin/auth/login""#));
+        assert!(!html.contains("<script>"));
+
+        // 2. Missing pre-auth cookie with explicit Accept: application/json -> structured JSON 401.
+        let api_missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/callback?code=abc123&state=st456")
+                    .header(ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_missing.status(), StatusCode::UNAUTHORIZED);
+        let api_json: Value =
+            serde_json::from_slice(&api_missing.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            api_json["error"],
+            json!("missing OIDC pre-auth state cookie")
+        );
+
+        // 3. Expired pre-auth cookie -> 401 HTML recovery page for browsers, JSON for API clients.
+        let key = admin_auth::session_signing_key_from_env().unwrap();
+        let expired_payload = json!({
+            "state": "st456",
+            "nonce": "nn789",
+            "code_verifier": "cv000",
+            "redirect_uri": "https://console.example.com/admin/auth/callback",
+            "iat": 1_600_000_000i64,
+            "exp": 1_600_000_600i64,
+        });
+        let signed_expired = admin_auth::sign_cookie_payload(
+            &key,
+            b"anyagents-admin-oidc-preauth-v1:",
+            &expired_payload,
+        )
+        .unwrap();
+        let expired_cookie_hdr = format!("{}={signed_expired}", admin_auth::ADMIN_OIDC_COOKIE);
+
+        let browser_expired = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/callback?code=abc123&state=st456")
+                    .header(COOKIE, &expired_cookie_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_expired.status(), StatusCode::UNAUTHORIZED);
+        let expired_html = String::from_utf8_lossy(
+            &browser_expired
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .to_string();
+        assert!(expired_html.contains("Sign-in session expired"));
+        assert!(expired_html.contains("Sign in again"));
+        assert!(expired_html.contains(r#"href="https://console.example.com/admin/auth/login""#));
+
+        let api_expired = app
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/callback?code=abc123&state=st456")
+                    .header(COOKIE, &expired_cookie_hdr)
+                    .header(ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_expired.status(), StatusCode::UNAUTHORIZED);
+        let api_expired_json: Value =
+            serde_json::from_slice(&api_expired.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            api_expired_json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("expired")
+        );
     }
 }

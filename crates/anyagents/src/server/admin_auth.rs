@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use super::{ApiError, AppState, serverless};
+use super::{ApiError, AppState, console_html, serverless};
 
 /// Cookie storing the authenticated stateless operator session (`Path=/`, 12 h TTL).
 pub(crate) const ADMIN_SESSION_COOKIE: &str = "anyagents_admin_session";
@@ -229,6 +229,8 @@ struct PreAuthState {
     nonce: String,
     code_verifier: String,
     redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
     iat: i64,
     exp: i64,
 }
@@ -1090,14 +1092,25 @@ pub(crate) async fn fetch_userinfo(
 }
 
 // ============================================================================
-// HTTP Route Handlers (/admin/auth/*)
+// HTTP Route Handlers (/admin/auth/* and /auth/*)
 // ============================================================================
 
-/// `GET /admin/auth/login`: starts an OIDC Authorization Code + PKCE S256 flow
-/// using a stateless signed `anyagents_admin_oidc` cookie.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct LoginQuery {
+    #[serde(default)]
+    pub(crate) next: Option<String>,
+}
+
+/// `GET /admin/auth/login` (and `/auth/login`): starts an OIDC Authorization Code
+/// + PKCE S256 flow using a stateless signed `anyagents_admin_oidc` cookie.
+///
+/// When the request arrives on a non-canonical hostname (`Host` or
+/// `X-Forwarded-Host` differs from `ANYAGENTS_PUBLIC_URL`), redirects to
+/// `{base_url}/admin/auth/login` BEFORE minting the host-only pre-auth cookie.
 pub(crate) async fn login_route(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
 ) -> Result<Response, ApiError> {
     let cfg = OidcConfig::from_env().ok_or_else(|| {
         ApiError::new(
@@ -1114,6 +1127,18 @@ pub(crate) async fn login_route(
 
     let base_url = resolve_admin_base_url(state.store.data_dir(), &headers)
         .map_err(|why| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why))?;
+
+    if let Some(canonical_login_url) =
+        console_html::canonical_login_redirect_url(&base_url, &headers, query.next.as_deref())
+    {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(LOCATION, canonical_login_url)
+            .header(CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+
     let redirect_uri = format!("{}/admin/auth/callback", base_url.trim_end_matches('/'));
     let secure_cookie = redirect_uri.starts_with("https://") || serverless::is_serverless_mode();
 
@@ -1135,6 +1160,7 @@ pub(crate) async fn login_route(
         nonce: nonce.clone(),
         code_verifier,
         redirect_uri: redirect_uri.clone(),
+        next: console_html::sanitize_next_path(query.next.as_deref()),
         iat: now,
         exp: now.saturating_add(PREAUTH_TTL_SECS),
     };
@@ -1178,13 +1204,34 @@ pub(crate) struct CallbackQuery {
     error_description: Option<String>,
 }
 
-/// `GET /admin/auth/callback`: completes PKCE code exchange, verifies ID token
-/// signature + claims + verified allowlisted email, and mints a stateless session cookie.
+/// `GET /admin/auth/callback` (and `/auth/callback`): completes PKCE code exchange,
+/// verifies ID token signature + claims + verified allowlisted email, and mints a
+/// stateless session cookie.
 pub(crate) async fn callback_route(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
+    let json_client = console_html::accepts_json_only(&headers);
+    let base_url = resolve_admin_base_url(state.store.data_dir(), &headers).ok();
+    let clear_preauth_hdr = format_preauth_set_cookie(
+        "",
+        is_https_deployment(state.store.data_dir()) || serverless::is_serverless_mode(),
+        0,
+    );
+    let recover = |api_msg: String, html_reason: &str| -> Result<Response, ApiError> {
+        if json_client {
+            Err(ApiError::new(StatusCode::UNAUTHORIZED, api_msg))
+        } else {
+            Ok(console_html::render_auth_recovery_response(
+                StatusCode::UNAUTHORIZED,
+                html_reason,
+                base_url.as_deref(),
+                Some(&clear_preauth_hdr),
+            ))
+        }
+    };
+
     if let Some(err) = query
         .error
         .as_deref()
@@ -1197,10 +1244,10 @@ pub(crate) async fn callback_route(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("authorization denied");
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
+        return recover(
             format!("OIDC provider error ({err}): {desc}"),
-        ));
+            "The identity provider cancelled or declined the sign-in request. Please try signing in again.",
+        );
     }
 
     let code = query
@@ -1229,33 +1276,40 @@ pub(crate) async fn callback_route(
         )
     })?;
 
-    let raw_preauth = extract_cookie(&headers, ADMIN_OIDC_COOKIE).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "missing OIDC pre-auth state cookie",
-        )
-    })?;
-    let preauth: PreAuthState = verify_cookie_payload(&key, PREAUTH_DOMAIN, &raw_preauth)
-        .map_err(|why| ApiError::new(StatusCode::UNAUTHORIZED, why))?;
+    let Some(raw_preauth) = extract_cookie(&headers, ADMIN_OIDC_COOKIE) else {
+        return recover(
+            "missing OIDC pre-auth state cookie".to_string(),
+            "Your sign-in session cookie was not present. This commonly happens when the login callback opened in a different browser or in-app window.",
+        );
+    };
+    let preauth: PreAuthState = match verify_cookie_payload(&key, PREAUTH_DOMAIN, &raw_preauth) {
+        Ok(parsed) => parsed,
+        Err(why) => {
+            return recover(
+                why,
+                "Your temporary sign-in state could not be verified. Please start a fresh sign-in in this browser.",
+            );
+        }
+    };
 
     let now = unix_now_secs();
     if now >= preauth.exp {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "OIDC pre-auth state expired; please retry sign-in",
-        ));
+        return recover(
+            "OIDC pre-auth state expired; please retry sign-in".to_string(),
+            "Your sign-in session expired before returning from the identity provider. Please sign in again.",
+        );
     }
     if preauth.iat > now.saturating_add(CLOCK_SKEW_SECS) {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "OIDC pre-auth state issued in the future",
-        ));
+        return recover(
+            "OIDC pre-auth state issued in the future".to_string(),
+            "Your temporary sign-in state is no longer valid. Please start a fresh sign-in below.",
+        );
     }
     if !constant_time_eq(state_param.as_bytes(), preauth.state.as_bytes()) {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "OIDC state mismatch",
-        ));
+        return recover(
+            "OIDC state mismatch".to_string(),
+            "This sign-in callback did not match the active sign-in attempt in this browser. Please sign in again.",
+        );
     }
 
     let discovery = fetch_discovery(&cfg.issuer)
@@ -1343,9 +1397,11 @@ pub(crate) async fn callback_route(
         format_session_set_cookie(&signed_session, secure_session, SESSION_TTL_SECS);
     let clear_preauth = format_preauth_set_cookie("", secure_preauth, 0);
 
+    let post_login_location =
+        console_html::sanitize_next_path(preauth.next.as_deref()).unwrap_or_else(|| "/".into());
     let mut resp = Response::builder()
         .status(StatusCode::FOUND)
-        .header(LOCATION, "/admin")
+        .header(LOCATION, post_login_location)
         .header(CACHE_CONTROL, "no-store")
         .body(Body::empty())
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1548,6 +1604,7 @@ mod tests {
             nonce: "nn".into(),
             code_verifier: "cv".into(),
             redirect_uri: "https://console.example.com/admin/auth/callback".into(),
+            next: None,
             iat: now,
             exp: now + 600,
         };

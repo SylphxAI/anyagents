@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign In — AnyAgents</title>
+  <link rel="stylesheet" href="/assets/console.css" />
+</head>
+<body>
+  <div class="signin-shell">
+    <main class="signin-card" aria-labelledby="signin-heading">
+      <div class="signin-brand">
+        <span class="brand-mark" aria-hidden="true">AA</span>
+        <div>
+          <h1 id="signin-heading" class="brand-title">AnyAgents</h1>
+          <span class="brand-subtitle">Control Plane Console</span>
+        </div>
+      </div>
+
+      <p class="signin-lead">
+        Sign in with your configured OpenID Connect identity provider to manage agents, provider profiles, telemetry, and deployment secrets.
+      </p>
+
+      <div class="signin-actions">
+        <a id="oidc-signin-btn" class="btn btn-primary btn-lg" href="/admin/auth/login">Sign in with OIDC</a>
+      </div>
+
+      <div class="signin-divider" role="separator"><span>or authenticate from the CLI</span></div>
+
+      <section class="signin-cli-box" aria-label="CLI Device Flow Sign-In">
+        <div class="signin-cli-head">
+          <span class="signin-cli-label">CLI Device Flow</span>
+          <button id="copy-cli-btn" class="btn btn-secondary btn-sm" type="button">Copy</button>
+        </div>
+        <pre id="cli-login-cmd" class="signin-cli-code mono" data-coordinator-url="{{COORDINATOR_URL}}">anyagents auth login --url {{COORDINATOR_URL}}</pre>
+        <p class="muted text-sm signin-cli-note">
+          Runs an RFC 8628 OIDC device authorization flow and stores a scoped operator session locally.
+        </p>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/signin.js" defer></script>
+</body>
+</html>
