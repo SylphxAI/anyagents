@@ -1026,11 +1026,13 @@ impl SylphxSandboxClient {
         let wd = super::providers::shell_single_quote(workdir);
         let script = format!(
             "{base_script}; \
-             if id user >/dev/null 2>&1; then \
-               for d in {mp} {sd} {wd}; do [ \"$(stat -c %U \"$d\" 2>/dev/null)\" = user ] || chown -R user:user \"$d\" 2>/dev/null || true; done; \
-               chown -h user:user /home/user/agent-state /home/user/workspace 2>/dev/null || true; \
-               for d in {sd} {wd}; do [ \"$(stat -c %U \"$d\" 2>/dev/null || echo user)\" = user ] || {{ echo \"$d is not owned by user\" >&2; exit 1; }}; done; \
-             fi"
+             id user >/dev/null 2>&1 || {{ echo 'persistent layout requires user' >&2; exit 1; }}; \
+             for d in {mp} {sd} {wd}; do \
+               owner=$(stat -Lc %U \"$d\"); [ \"$owner\" != user ] || continue; \
+               chown -R user:user \"$d\"; \
+               owner=$(stat -Lc %U \"$d\") && [ \"$owner\" = user ] || {{ echo \"cannot verify user ownership of $d\" >&2; exit 1; }}; \
+             done; \
+             chown -h user:user /home/user/agent-state /home/user/workspace 2>/dev/null || true"
         );
         let out = self.exec_as_user(
             resource,

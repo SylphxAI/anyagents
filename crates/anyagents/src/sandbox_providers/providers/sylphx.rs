@@ -758,7 +758,7 @@ mod tests {
         assert!(script.contains("mkdir -p"), "{script}");
         assert!(script.contains("/home/user/agent-data/state"), "{script}");
         assert!(script.contains("chown -R user:user"), "{script}");
-        assert!(script.contains("stat -c %U"), "{script}");
+        assert!(script.contains("stat -Lc %U"), "{script}");
         assert!(!script.contains("rm -"), "{script}");
     }
 
@@ -825,6 +825,64 @@ mod tests {
         assert_eq!(execs[0]["command"], execs[1]["command"]);
         assert_idempotent_layout_init(&execs[0]);
         assert_idempotent_layout_init(&execs[1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn layout_script_requires_readable_ownership_and_preserves_warm_state() {
+        let st = LeaseMockState::new((409, json!({ "code": "RESOURCE_IN_USE" })), 0);
+        let (provider, server) = spawn_lease_mock(st.clone()).await;
+        provider
+            .ensure(&EnsureSandboxRequest::for_agent("agt_init"))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // Run the captured shell script against a temporary home. Stub only account and
+        // ownership commands so the cases work without root or platform-specific stat.
+        let script = st.exec_bodies.lock().unwrap()[0]["command"][2]
+            .as_str()
+            .unwrap()
+            .replace("/home/user", home.to_str().unwrap());
+        let run = |ownership: &str| {
+            std::process::Command::new("/bin/sh")
+                .env("LAYOUT_TEST_OWNERSHIP", ownership)
+                .args([
+                    "-c",
+                    &format!(
+                        r#"id() {{ [ "$LAYOUT_TEST_OWNERSHIP" != no-user ]; }}
+                           stat() {{
+                               case "$LAYOUT_TEST_OWNERSHIP" in
+                                   unreadable) echo user; case "$3" in */state) return 1;; esac;;
+                                   wrong-owner) case "$3" in */workspace) echo root;; *) echo user;; esac;;
+                                   repair) echo "${{repaired:-root}}";;
+                                   *) echo user;;
+                               esac
+                           }}
+                           chown() {{ if [ "$1" = -R ]; then repaired=user; echo recursive-chown; fi; }}
+                           {script}"#
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        let fresh = run("repair");
+        assert!(fresh.status.success(), "{fresh:?}");
+        assert_eq!(fresh.stdout, b"recursive-chown\n");
+        let state = home.join("agent-data/state/sentinel");
+        std::fs::write(&state, b"preserved").unwrap();
+        let warm = run("ok");
+        assert!(warm.status.success(), "{warm:?}");
+        assert!(
+            warm.stdout.is_empty(),
+            "warm attach recursively chowned: {warm:?}"
+        );
+        assert_eq!(std::fs::read(state).unwrap(), b"preserved");
+        for ownership in ["unreadable", "wrong-owner", "no-user"] {
+            let refused = run(ownership);
+            assert!(!refused.status.success(), "{ownership}: {refused:?}");
+        }
         server.abort();
     }
 
