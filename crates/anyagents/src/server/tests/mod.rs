@@ -15,6 +15,7 @@ mod mcp;
 mod memory;
 mod messaging;
 mod operator_inbox;
+mod pg_hot_paths;
 mod private_media;
 mod remote_sessions;
 mod roster;

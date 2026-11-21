@@ -83,7 +83,7 @@ pub(super) fn sync_on_postgres(
         }
     }
     loop {
-        let Some(drained_more) = with_pg_sync_lock(pool, wait, |tx| drain_pending_step(tx, state))?
+        let Some(drained_more) = with_pg_sync_lock(pool, wait, |tx| drain_pending_step(tx, tx))?
         else {
             return Ok(None);
         };
@@ -99,7 +99,9 @@ pub(super) fn sync_on_postgres(
                 return reset_step(tx, after, take);
             }
             let (messages, outbound) = marks(tx)?;
-            let (max_messages, max_outbound) = max_rowids(state)?;
+            // Both schemas live in the same database. Use the existing
+            // transaction instead of waiting for a second pool checkout.
+            let (max_messages, max_outbound) = max_rowids(tx)?;
             if messages > max_messages || outbound > max_outbound {
                 return reset_step(tx, 0, take);
             }
@@ -134,7 +136,7 @@ pub(super) fn sync_on_postgres(
                         |r| r.get(0),
                     )?
                     .unwrap_or(0);
-                let max: i64 = state.db_query_one(
+                let max: i64 = tx.db_query_one(
                     &format!(
                         "SELECT COALESCE(MAX(rowid), 0) FROM (SELECT rowid FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2) AS _batch",
                         if direction == "in" {
@@ -150,7 +152,7 @@ pub(super) fn sync_on_postgres(
                     return Ok(Some(0));
                 }
                 let rows = read_source_rows(
-                    state,
+                    tx,
                     direction,
                     &format!("WHERE {rowid} > ?1 AND {rowid} <= ?2 ORDER BY {rowid}"),
                     &db_params![mark, max],

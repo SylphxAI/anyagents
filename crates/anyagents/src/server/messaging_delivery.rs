@@ -605,12 +605,14 @@ pub(super) fn deliver_room_with_media(
 
 /// The refusal of a send to `name` when that agent is archived: it reads
 /// nothing until it is explicitly woken. Names who answers for it instead.
-pub(super) fn archived_refusal(store: &Store, name: &str) -> Option<crate::api::SkippedDelivery> {
-    let recipient = store.agent_by_name(name).ok()?;
-    if !is_explicitly_archived(store.data_dir(), &recipient) {
+pub(super) fn archived_refusal(
+    store: &Store,
+    recipient: &Agent,
+) -> Option<crate::api::SkippedDelivery> {
+    if !is_explicitly_archived(store.data_dir(), recipient) {
         return None;
     }
-    Some(archived_skip(store, &recipient))
+    Some(archived_skip(store, recipient))
 }
 
 fn archived_skip(store: &Store, recipient: &Agent) -> crate::api::SkippedDelivery {
@@ -635,22 +637,21 @@ pub(super) fn archived_conflict(reasons: &str) -> ApiError {
     ))
 }
 
-/// Store one send for `name`. An archived recipient is refused here too,
+/// Store one send for an already authorized recipient ID. An archived recipient is refused here too,
 /// under its lifecycle lock, so a send racing an archive can never store
 /// mail it would not read nor flip it back to `running`.
 pub(super) fn deliver_agent_with_media(
     store: &Store,
     body: &SendRequest,
-    name: &str,
+    agent_id: &anyagents_core::AgentId,
     key: Option<&str>,
     upload: Option<&crate::telegram::MediaUpload>,
     turn_context: Option<(&anyagents_core::AgentId, &str)>,
 ) -> Result<Delivery, ApiError> {
-    let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let _lifecycle = store
-        .lock_agent_lifecycle(&agent.id)
+        .lock_agent_lifecycle(agent_id)
         .map_err(ApiError::from_store)?;
-    let agent = store.agent(&agent.id).map_err(ApiError::from_store)?;
+    let agent = store.agent(agent_id).map_err(ApiError::from_store)?;
     if is_explicitly_archived(store.data_dir(), &agent) {
         return Err(archived_conflict(&archived_skip(store, &agent).reason));
     }

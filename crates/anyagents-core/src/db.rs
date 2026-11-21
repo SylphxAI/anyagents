@@ -13,13 +13,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
-use std::time::Duration;
 
 use rusqlite::{Connection, Row};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
+use sqlx::postgres::PgRow;
 use sqlx::{
     Arguments as _, Column as _, PgPool, Postgres, Row as _, Transaction, TypeInfo as _,
     ValueRef as _,
@@ -34,7 +32,7 @@ pub const DATABASE_URL_ENV: &str = "ANYAGENTS_DATABASE_URL";
 pub const DATABASE_URL_FILE_ENV: &str = "ANYAGENTS_DATABASE_URL_FILE";
 pub const DIRECT_DATABASE_URL_ENV: &str = "ANYAGENTS_DIRECT_DATABASE_URL";
 pub const DIRECT_DATABASE_URL_FILE_ENV: &str = "ANYAGENTS_DIRECT_DATABASE_URL_FILE";
-/// Per-pool connection limit; primary pools default to 16 connections per process and URL.
+/// Per-pool connection limit; primary pools default to 32 (bounded to 2–64) per process and URL.
 pub const PG_MAX_CONNECTIONS_ENV: &str = "ANYAGENTS_PG_MAX_CONNECTIONS";
 /// Pool acquisition timeout in whole seconds (default 3, positive values capped at 30).
 pub const PG_ACQUIRE_TIMEOUT_SECS_ENV: &str = "ANYAGENTS_PG_ACQUIRE_TIMEOUT_SECS";
@@ -42,6 +40,8 @@ pub const PG_STATEMENT_CACHE_ENV: &str = "ANYAGENTS_PG_STATEMENT_CACHE";
 pub const TEST_POSTGRES_URL_ENV: &str = "ANYAGENTS_TEST_POSTGRES_URL";
 
 mod pg_migrations;
+mod pg_pool;
+pub(crate) use pg_pool::{acquire_pg, build_pg_pool};
 pub mod sqlite_to_pg;
 pub use pg_migrations::{
     PG_ACTIVE_TURN_UNIQUE_SQL, PG_AGENT_RUNTIME_SQL, PG_BROWSER_PROFILE_GRANTS_SQL,
@@ -253,48 +253,6 @@ pub(crate) fn block_on_pg<F: std::future::Future>(fut: F) -> F::Output {
     PG_RUNTIME.block_on(fut)
 }
 
-fn pg_connect_options(url: &str) -> Result<PgConnectOptions, Error> {
-    let opts = PgConnectOptions::from_str(url).map_err(|err| {
-        Error::Message(format!(
-            "invalid postgres url {}: {err}",
-            redact_database_url(url)
-        ))
-    })?;
-    // Default to 0 (unnamed extended queries) so transaction-mode PgBouncer
-    // endpoints never fail on prepared statement collisions.
-    let stmt_cache = non_empty_trimmed_env(PG_STATEMENT_CACHE_ENV)
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    Ok(opts
-        .application_name("anyagents")
-        .statement_cache_capacity(stmt_cache))
-}
-
-fn pg_pool_options(explicit: Option<u32>, env_max: &str, env_timeout: &str) -> PgPoolOptions {
-    // Each replica has its own pool. Leave room for other replicas and direct connections.
-    let max_conns = explicit
-        .or_else(|| env_max.trim().parse().ok())
-        .unwrap_or(16)
-        .max(2);
-    // Bound checkout/connection setup, not statement execution.
-    let timeout_secs = match env_timeout.trim().parse::<u64>() {
-        Ok(secs) if secs > 0 => secs.min(30),
-        _ => 3,
-    };
-    PgPoolOptions::new()
-        .max_connections(max_conns)
-        .acquire_timeout(Duration::from_secs(timeout_secs))
-        .idle_timeout(Some(Duration::from_secs(300)))
-}
-
-pub(crate) fn build_pg_pool(url: &str, max_connections: Option<u32>) -> Result<PgPool, Error> {
-    let opts = pg_connect_options(url)?;
-    let env_max = std::env::var(PG_MAX_CONNECTIONS_ENV).unwrap_or_default();
-    let env_timeout = std::env::var(PG_ACQUIRE_TIMEOUT_SECS_ENV).unwrap_or_default();
-    let pool = pg_pool_options(max_connections, &env_max, &env_timeout);
-    block_on_pg(pool.connect_with(opts)).map_err(Error::from)
-}
-
 #[derive(Clone)]
 pub(crate) struct PgHandle {
     #[allow(dead_code)]
@@ -373,7 +331,7 @@ impl PgHandle {
         };
 
         block_on_pg(async move {
-            let mut conn = migration_pool.acquire().await?;
+            let mut conn = acquire_pg(&migration_pool).await?;
             // Serialize schema initialization across concurrent coordinator startups.
             sqlx::query("SELECT pg_advisory_lock($1)")
                 .bind(PG_MIGRATION_LOCK_KEY)
@@ -1254,13 +1212,21 @@ impl DbExec for PgPool {
     fn execute_raw(&self, sql: &str, params: &[DbParam]) -> Result<usize, Error> {
         let pg_sql = to_pg_sql(sql);
         let args = bind_pg_params(params)?;
-        let res = block_on_pg(sqlx::query_with(pg_sql.as_ref(), args).execute(self))?;
+        let res = block_on_pg(async {
+            let mut conn = acquire_pg(self).await?;
+            sqlx::query_with(pg_sql.as_ref(), args)
+                .execute(&mut *conn)
+                .await
+        })?;
         Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
     }
 
     fn execute_batch_raw(&self, sql: &str) -> Result<(), Error> {
         let pg_sql = to_pg_sql(sql);
-        block_on_pg(sqlx::raw_sql(pg_sql.as_ref()).execute(self))?;
+        block_on_pg(async {
+            let mut conn = acquire_pg(self).await?;
+            sqlx::raw_sql(pg_sql.as_ref()).execute(&mut *conn).await
+        })?;
         Ok(())
     }
 
@@ -1272,7 +1238,12 @@ impl DbExec for PgPool {
     ) -> Result<(), Error> {
         let pg_sql = to_pg_sql(sql);
         let args = bind_pg_params(params)?;
-        let rows = block_on_pg(sqlx::query_with(pg_sql.as_ref(), args).fetch_all(self))?;
+        let rows = block_on_pg(async {
+            let mut conn = acquire_pg(self).await?;
+            sqlx::query_with(pg_sql.as_ref(), args)
+                .fetch_all(&mut *conn)
+                .await
+        })?;
         for row in &rows {
             if !f(&DbRow::Postgres(row))? {
                 break;
@@ -1291,7 +1262,7 @@ pub(crate) struct PgTx {
 
 impl PgTx {
     pub(crate) fn begin(pool: &PgPool) -> Result<Self, Error> {
-        let tx = block_on_pg(pool.begin())?;
+        let tx = block_on_pg(async { Transaction::begin(acquire_pg(pool).await?, None).await })?;
         Ok(Self {
             tx: std::sync::Mutex::new(Some(tx)),
             wrote: AtomicBool::new(false),
@@ -1300,11 +1271,11 @@ impl PgTx {
 
     pub(crate) fn begin_read_only(pool: &PgPool) -> Result<Self, Error> {
         let tx = block_on_pg(async {
-            let mut tx = pool.begin().await?;
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *tx)
-                .await?;
-            Ok::<_, sqlx::Error>(tx)
+            Transaction::begin(
+                acquire_pg(pool).await?,
+                Some("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY".into()),
+            )
+            .await
         })?;
         Ok(Self {
             tx: std::sync::Mutex::new(Some(tx)),
@@ -1557,83 +1528,6 @@ pub(crate) fn build_pg_tsquery(queries: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pg_pool_defaults_leave_headroom_and_bound_waiting() {
-        let options = pg_pool_options(None, "", "");
-        assert_eq!(options.get_max_connections(), 16);
-        assert_eq!(options.get_min_connections(), 0);
-        assert_eq!(options.get_acquire_timeout(), Duration::from_secs(3));
-        assert_eq!(options.get_idle_timeout(), Some(Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn pg_pool_connection_limit_preserves_override_precedence_and_floor() {
-        for (explicit, env, expected) in [
-            (None, "  24\n", 24),
-            (Some(2), "24", 2),
-            (Some(4), "24", 4),
-            (Some(0), "24", 2),
-            (None, "0", 2),
-            (None, "1", 2),
-            (None, "1024", 1024),
-            (None, "4294967296", 16),
-            (None, "-5", 16),
-            (None, "invalid", 16),
-        ] {
-            assert_eq!(
-                pg_pool_options(explicit, env, "").get_max_connections(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn pg_pool_acquire_timeout_accepts_only_bounded_positive_seconds() {
-        for (env, expected) in [
-            ("  1\n", 1),
-            ("12", 12),
-            ("30", 30),
-            ("120", 30),
-            (" ", 3),
-            ("0", 3),
-            ("-1", 3),
-            ("1.5", 3),
-            ("18446744073709551616", 3),
-        ] {
-            let options = pg_pool_options(Some(2), "", env);
-            assert_eq!(options.get_acquire_timeout(), Duration::from_secs(expected));
-        }
-    }
-
-    #[test]
-    fn saturated_pg_pool_times_out_and_recovers() {
-        let Some(url) = non_empty_trimmed_env(TEST_POSTGRES_URL_ENV) else {
-            eprintln!("skipping pool saturation test: {TEST_POSTGRES_URL_ENV} not set");
-            return;
-        };
-        block_on_pg(async {
-            let pool = pg_pool_options(Some(2), "", "1")
-                .connect_with(pg_connect_options(&url).unwrap())
-                .await
-                .unwrap();
-            let first = pool.acquire().await.unwrap();
-            let _second = pool.acquire().await.unwrap();
-            let err = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
-                .await
-                .expect("the pool must time out before the test deadline")
-                .unwrap_err();
-            assert!(matches!(err, sqlx::Error::PoolTimedOut));
-            assert!(Error::from(err).is_transient_lock_error());
-
-            drop(first);
-            let result: i32 = sqlx::query_scalar("SELECT 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(result, 1);
-        });
-    }
 
     #[test]
     fn placeholder_translator_handles_numbered_and_anonymous_safely() {

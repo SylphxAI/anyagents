@@ -168,36 +168,29 @@ pub(super) fn list_agents_sync_for_principal(
             sharing: Some(&sharing),
         })
         .map_err(ApiError::from_store)?;
-    let mut ids: Vec<_> = roster.iter().map(|a| &a.id).collect();
-    ids.extend(caller_agent.iter().map(|a| &a.id));
-    let ancestry = if caller_agent.is_some() || !serverless::is_serverless_mode() {
-        state
-            .store
-            .roster_ancestors(&ids)
-            .map_err(ApiError::from_store)?
-    } else {
-        HashMap::new()
-    };
+    let selected: Vec<_> = roster.iter().collect();
+    let context = state
+        .store
+        .roster_page_context(
+            &selected,
+            caller_agent.as_ref(),
+            caller_agent.is_some() || !serverless::is_serverless_mode(),
+        )
+        .map_err(ApiError::from_store)?;
     let caller = caller_agent.as_ref().map(|caller| RosterCaller {
         caller,
-        ancestry: &ancestry,
+        ancestry: &context.ancestry,
         sharing: &sharing,
-        replies: if caller.is_isolated() {
-            HashSet::new()
-        } else {
-            state
-                .store
-                .roster_reply_senders(caller, &ids[..roster.len()])
-        },
+        replies: context.replies,
     });
-    let selected: Vec<_> = roster.iter().collect();
     Ok(Json(assemble_roster(
         &state.store,
         &state.health,
         &selected,
         archived_count,
-        &ancestry,
+        &context.ancestry,
         caller.as_ref(),
+        context.metadata,
     )?))
 }
 
@@ -345,6 +338,9 @@ pub(crate) fn roster_views(
         archived_count,
         &ancestry,
         None,
+        store
+            .agent_page_metadata(&selected_agents)
+            .map_err(ApiError::from_store)?,
     )
 }
 
@@ -370,11 +366,9 @@ fn assemble_roster(
     archived_count: usize,
     ancestry: &HashMap<AgentId, RosterAncestor>,
     caller: Option<&RosterCaller<'_>>,
+    mut metadata: anyagents_core::AgentQueryMetadata,
 ) -> Result<AgentsResponse, ApiError> {
     let all_archived = selected_agents.iter().all(|a| a.state == "archived");
-    let mut metadata = store
-        .agent_page_metadata(selected_agents)
-        .map_err(ApiError::from_store)?;
     let live = selected_agents.iter().filter(|a| a.state != "archived");
     let need_retry: Vec<_> = live
         .clone()

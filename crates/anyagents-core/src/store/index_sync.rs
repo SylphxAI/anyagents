@@ -15,6 +15,12 @@ impl Store {
     /// next search) projects them. Never call it with the state writer held.
     pub(crate) fn project_mailbox(&self) {
         debug_assert!(!registry::holds_store_writer());
+        // PostgreSQL serves mailbox conversation/search from the committed
+        // source rows. Its standalone tool summaries are written separately;
+        // do not synchronously re-project canonical mail on the send path.
+        if self.is_postgres() {
+            return;
+        }
         let Some(state) = self.index_state_reader() else {
             return;
         };
