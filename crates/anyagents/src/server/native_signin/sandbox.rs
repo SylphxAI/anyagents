@@ -588,12 +588,12 @@ impl Transcript {
                 continue;
             }
             // Current Claude Code prints a base64url request handle instead of
-            // OAuth parameters. Only accept it at the two Claude authorize routes.
+            // OAuth parameters. Allow length variation, but only on Claude's authorize routes.
             let short_link = spec.harness == "claude-code"
                 && matches!(host, "claude.ai" | "claude.com")
                 && matches!(link.path(), "/oauth/authorize" | "/cai/oauth/authorize")
                 && candidate.split_once('?').is_some_and(|(_, query)| {
-                    query.len() == 43
+                    (24..=256).contains(&query.len())
                         && query
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
