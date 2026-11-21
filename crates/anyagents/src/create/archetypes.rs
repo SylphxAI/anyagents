@@ -824,6 +824,7 @@ pub(crate) fn hydrate_roles_from_store_if_postgres(store: &Store, data_dir: &Pat
     };
     let roles_root = data_dir.join("roles");
     let mut remote_paths = std::collections::BTreeSet::new();
+    let mut stale = std::collections::HashMap::new();
     for meta in metas {
         if anyagents_core::stateless::validate_blob_path(&meta.path).is_err() {
             continue;
@@ -838,19 +839,26 @@ pub(crate) fn hydrate_roles_from_store_if_postgres(store: &Store, data_dir: &Pat
         if local_mtime_ms.is_some_and(|local_ms| local_ms >= meta.updated_at_ms) {
             continue;
         }
-        let Ok(Some(entry)) = blobs.get_deployment_blob("roles", &meta.path) else {
-            continue;
-        };
-        if std::fs::read(&dest)
-            .ok()
-            .is_some_and(|existing| existing == entry.content)
-        {
-            continue;
+        stale.insert(meta.path, dest);
+    }
+    if !stale.is_empty()
+        && let Ok(entries) = blobs.get_deployment_blobs_all("roles")
+    {
+        for entry in entries {
+            let Some(dest) = stale.remove(&entry.path) else {
+                continue;
+            };
+            if std::fs::read(&dest)
+                .ok()
+                .is_some_and(|existing| existing == entry.content)
+            {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = anyagents_harness::atomic_write_file(&dest, &entry.content, 0o644);
         }
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = anyagents_harness::atomic_write_file(&dest, &entry.content, 0o644);
     }
     if let Ok(entries) = std::fs::read_dir(&roles_root) {
         for entry in entries.flatten() {
@@ -884,11 +892,61 @@ pub(crate) fn resolve_role_template_for_agent(
     let parent = store.and_then(|s| agent.parent_id.as_ref().and_then(|pid| s.agent(pid).ok()));
     let ancestor_wds =
         ancestor_archetype_workdirs(store, data_dir, parent.as_ref()).unwrap_or_default();
+    resolve_agent_role(data_dir, agent, raw_role, &ancestor_wds)
+}
+
+fn resolve_agent_role(
+    data_dir: &Path,
+    agent: &Agent,
+    raw_role: &str,
+    ancestor_wds: &[PathBuf],
+) -> Option<(String, ArchetypeTemplate)> {
     let agent_wd = agent.workdir.as_deref().map(Path::new);
-    resolve_role_template_with_ancestors(raw_role, agent_wd, &ancestor_wds, data_dir)
+    resolve_role_template_with_ancestors(raw_role, agent_wd, ancestor_wds, data_dir)
         .ok()
         .flatten()
         .map(|(slug, tpl, _)| (canonical_template_role(&slug, &tpl), tpl))
+}
+
+pub(crate) fn effective_roster_instructions(
+    data_dir: &Path,
+    agent: &Agent,
+    ancestry: Option<
+        &std::collections::HashMap<anyagents_core::AgentId, anyagents_core::RosterAncestor>,
+    >,
+) -> Option<String> {
+    let resolved = agent
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|role| {
+            let mut workdirs = Vec::new();
+            if let Some(ancestry) = ancestry {
+                let mut visited = std::collections::HashSet::new();
+                let mut parent = agent.parent_id.as_ref();
+                while let Some(id) = parent {
+                    if visited.len() >= 64 || !visited.insert(id) {
+                        break;
+                    }
+                    let Some(row) = ancestry.get(id) else {
+                        break;
+                    };
+                    let wd = row
+                        .workdir
+                        .as_deref()
+                        .map(Path::new)
+                        .filter(|p| !is_archetype_workdir_keyword(p));
+                    workdirs.push(
+                        wd.map(Path::to_path_buf)
+                            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, id)),
+                    );
+                    parent = row.parent_id.as_ref();
+                }
+            }
+            resolve_agent_role(data_dir, agent, role, &workdirs)
+        });
+    compose_agent_instructions(agent, resolved.as_ref())
 }
 
 fn strip_role_prefix_match(instructions: &str, prefix: &str) -> Option<Option<String>> {
@@ -931,8 +989,14 @@ pub(crate) fn effective_agent_instructions(
     agent: &Agent,
 ) -> Option<String> {
     let resolved = resolve_role_template_for_agent(store, data_dir, agent);
+    compose_agent_instructions(agent, resolved.as_ref())
+}
+
+fn compose_agent_instructions(
+    agent: &Agent,
+    resolved: Option<&(String, ArchetypeTemplate)>,
+) -> Option<String> {
     let role_body = resolved
-        .as_ref()
         .map(|(_, tpl)| tpl.body.trim())
         .filter(|s| !s.is_empty());
     let mut custom = agent.instructions.clone();

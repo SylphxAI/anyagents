@@ -754,6 +754,35 @@ pub(super) fn can_sender_message_agent(
     )
 }
 
+/// The same decision for a single send or a roster snapshot. Explanation
+/// formatting is kept on the single-send path; it can read parent names.
+pub(super) fn sender_may_message(
+    sender: &Agent,
+    recipient: &Agent,
+    shares: impl FnOnce() -> bool,
+    owns: impl FnOnce() -> bool,
+    has_reply: impl FnOnce() -> bool,
+) -> bool {
+    if sender.id == recipient.id
+        || recipient.parent_id.as_ref() == Some(&sender.id)
+        || sender.parent_id.as_ref() == Some(&recipient.id)
+    {
+        return true;
+    }
+    if sender.is_isolated() || recipient.is_isolated() {
+        return false;
+    }
+    (sender.parent_id.is_some()
+        && sender.parent_id == recipient.parent_id
+        && sender.allows_sibling_messages()
+        && recipient.allows_sibling_messages())
+        || recipient.is_public_subagent()
+        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
+        || owns()
+        || shares()
+        || has_reply()
+}
+
 /// [`can_sender_message_agent`] with the group-or-chat share and the
 /// ancestry answered by the caller, so a roster can answer them from its rows.
 pub(super) fn can_sender_message_agent_with(
@@ -763,10 +792,13 @@ pub(super) fn can_sender_message_agent_with(
     share_group_or_chat: impl FnOnce() -> bool,
     sender_is_ancestor: impl FnOnce() -> bool,
 ) -> Result<(), ApiError> {
-    if sender.id == recipient.id
-        || recipient.parent_id.as_ref() == Some(&sender.id)
-        || sender.parent_id.as_ref() == Some(&recipient.id)
-    {
+    if sender_may_message(
+        sender,
+        recipient,
+        share_group_or_chat,
+        sender_is_ancestor,
+        || store.has_messaged(recipient, sender),
+    ) {
         return Ok(());
     }
     if sender.is_isolated() || recipient.is_isolated() {
@@ -779,19 +811,6 @@ pub(super) fn can_sender_message_agent_with(
             "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
             sender.name, recipient.name
         )));
-    }
-    if sender_is_ancestor() || share_group_or_chat() || store.has_messaged(recipient, sender) {
-        return Ok(());
-    }
-    let same_parent_siblings = sender.parent_id.is_some()
-        && sender.parent_id == recipient.parent_id
-        && sender.allows_sibling_messages()
-        && recipient.allows_sibling_messages();
-    if same_parent_siblings
-        || recipient.is_public_subagent()
-        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
-    {
-        return Ok(());
     }
     if recipient.parent_id.is_none() {
         let sender_parent = sender

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyagents_core::{Agent, Store, now_ms};
+use anyagents_core::{Agent, AgentId, RosterAncestor, RosterSelection, Store, now_ms};
 use anyagents_supervisor::HealthBoard;
 use axum::Json;
 use axum::http::StatusCode;
@@ -13,7 +13,7 @@ use crate::api::{AgentView, AgentsResponse};
 use crate::auth::Principal;
 use crate::create;
 
-use super::messaging::{can_sender_message_agent_with, unsettled_view};
+use super::messaging::{sender_may_message, unsettled_view};
 use super::types::{ApiError, AppState, is_self_or_ancestor};
 use super::{file_cache, outbound_history, quota_rotation, serverless};
 
@@ -24,6 +24,10 @@ pub(crate) struct ListAgentsQuery {
     pub name: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub children_of: Option<AgentId>,
+    #[serde(default)]
+    pub flat_parent: Option<String>,
     #[serde(default, alias = "subtree")]
     pub include_descendants: Option<bool>,
 }
@@ -62,25 +66,13 @@ fn relationship_with(
 /// once per listed agent. Every check is the predicate the single-agent routes
 /// use; only where the rows come from differs.
 struct RosterCaller<'a> {
-    store: &'a Store,
     caller: &'a Agent,
-    /// The roster rows, so an ancestor walk reads the store only for a parent
-    /// outside the roster.
-    rows: HashMap<&'a str, &'a Agent>,
-    /// Agents that share a group or Telegram chat with the caller.
-    sharing: HashSet<anyagents_core::AgentId>,
+    ancestry: &'a HashMap<AgentId, RosterAncestor>,
+    sharing: &'a HashSet<AgentId>,
+    replies: HashSet<AgentId>,
 }
 
-impl<'a> RosterCaller<'a> {
-    fn new(store: &'a Store, caller: &'a Agent, roster: &'a [Agent]) -> Self {
-        Self {
-            store,
-            caller,
-            rows: roster.iter().map(|a| (a.id.as_str(), a)).collect(),
-            sharing: store.agents_sharing_group_or_chat(&caller.id),
-        }
-    }
-
+impl RosterCaller<'_> {
     /// [`is_self_or_ancestor`] over the roster rows.
     fn is_self_or_ancestor(&self, ancestor: &anyagents_core::AgentId, target: &Agent) -> bool {
         if ancestor == &target.id {
@@ -92,10 +84,10 @@ impl<'a> RosterCaller<'a> {
             if &pid == ancestor {
                 return true;
             }
-            cursor = match self.rows.get(pid.as_str()) {
-                Some(parent) => parent.parent_id.clone(),
-                None => self.store.agent(&pid).ok().and_then(|a| a.parent_id),
-            };
+            cursor = self
+                .ancestry
+                .get(&pid)
+                .and_then(|row| row.parent_id.clone());
             depth += 1;
             if depth > 16 {
                 break;
@@ -104,28 +96,17 @@ impl<'a> RosterCaller<'a> {
         false
     }
 
-    /// The isolated-scope rule of [`super::agents::get_agent`].
-    fn sees(&self, agent: &Agent) -> bool {
-        !(self.caller.is_isolated()
-            && !self.is_self_or_ancestor(&self.caller.id, agent)
-            && self.caller.parent_id.as_ref() != Some(&agent.id)
-            && !self.sharing.contains(&agent.id))
-    }
-
     fn annotate(&self, view: &mut AgentView, agent: &Agent) {
         view.relationship = Some(relationship_with(self.caller, agent, |ancestor, target| {
             self.is_self_or_ancestor(ancestor, target)
         }));
-        view.can_message = Some(
-            can_sender_message_agent_with(
-                self.store,
-                self.caller,
-                agent,
-                || self.sharing.contains(&agent.id),
-                || self.is_self_or_ancestor(&self.caller.id, agent),
-            )
-            .is_ok(),
-        );
+        view.can_message = Some(sender_may_message(
+            self.caller,
+            agent,
+            || self.sharing.contains(&agent.id),
+            || self.is_self_or_ancestor(&self.caller.id, agent),
+            || self.replies.contains(&agent.id),
+        ));
         // [`can_actor_read_agent_private`] for this caller.
         let reads_private = self.is_self_or_ancestor(&self.caller.id, agent);
         if !reads_private {
@@ -149,80 +130,75 @@ pub(super) fn list_agents_sync_for_principal(
                 .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?,
         ),
     };
-    // For unbounded `"all"` / `"archived"` queries by non-isolated callers without
-    // an explicit `name` filter, push LIMIT/OFFSET, non-archived-first ordering,
-    // NULL archived `instructions`, and recursive descendant traversal into SQL
-    // so 10K-agent archives never deserialize megabytes of unused rows.
-    let caller_is_isolated = caller_agent.as_ref().is_some_and(Agent::is_isolated);
-    let can_sql_page = !caller_is_isolated
-        && query.name.is_none()
-        && matches!(query.state.as_deref(), Some("all" | "archived"));
-    let (roster, archived_count, sql_paged) = if can_sql_page {
-        let root_only = matches!(query.parent.as_deref(), Some("root" | "none"));
-        let parent_agent = query
-            .parent
-            .as_deref()
-            .filter(|p| !matches!(*p, "root" | "none" | "all" | "subagents"))
-            .map(|p| state.store.agent_by_name(p))
-            .transpose()
-            .map_err(ApiError::from_store)?;
-        let (rows, archived) = state
-            .store
-            .roster_agents_paged(anyagents_core::RosterPageQuery {
-                state: query.state.as_deref(),
-                parent_id: parent_agent.as_ref().map(|a| &a.id),
-                root_only,
-                include_descendants: query.include_descendants.unwrap_or(false),
-                limit: query.limit,
-                offset: query.offset.unwrap_or(0),
-            })
-            .map_err(ApiError::from_store)?;
-        (rows, archived, true)
-    } else {
-        let (rows, archived) = state
-            .store
-            .roster_agents(query.state.as_deref())
-            .map_err(ApiError::from_store)?;
-        (rows, archived, false)
-    };
-    let caller = caller_agent
+    validate_roster_state(query)?;
+    let sharing = caller_agent
         .as_ref()
-        .map(|caller| RosterCaller::new(&state.store, caller, &roster));
-    let visible: Vec<&Agent> = roster
-        .iter()
-        .filter(|agent| caller.as_ref().is_none_or(|caller| caller.sees(agent)))
-        .collect();
-    let effective_query = if sql_paged {
-        ListAgentsQuery {
-            offset: None,
-            parent: if query.include_descendants.unwrap_or(false) {
-                None
-            } else {
-                query.parent.clone()
-            },
-            ..query.clone()
-        }
+        .map(|caller| state.store.agents_sharing_group_or_chat(&caller.id))
+        .unwrap_or_default();
+    let flat = query.children_of.is_some() || query.flat_parent.is_some();
+    let parent_filter = query.flat_parent.as_deref().or(query.parent.as_deref());
+    let parent = if let Some(id) = &query.children_of {
+        Some(id.clone())
     } else {
-        query.clone()
+        parent_filter
+            .filter(|p| !matches!(*p, "root" | "none" | "all" | "subagents"))
+            .map(|p| state.store.roster_agent_id(p))
+            .transpose()
+            .map_err(ApiError::from_store)?
     };
-    let mut listed = roster_views(
+    let name = query
+        .name
+        .as_deref()
+        .map(|name| state.store.roster_agent_id(name))
+        .transpose()
+        .map_err(ApiError::from_store)?;
+    let (roster, archived_count) = state
+        .store
+        .select_roster(RosterSelection {
+            state: query.state.as_deref(),
+            parent: parent.as_ref(),
+            roots_only: matches!(parent_filter, Some("root" | "none")),
+            subagents_only: flat && parent_filter == Some("subagents"),
+            name: name.as_ref(),
+            descendants: query.include_descendants.unwrap_or(false),
+            tree_context: !flat,
+            limit: query.limit,
+            offset: query.offset.unwrap_or(0),
+            isolated_caller: caller_agent.as_ref().filter(|a| a.is_isolated()),
+            sharing: Some(&sharing),
+        })
+        .map_err(ApiError::from_store)?;
+    let mut ids: Vec<_> = roster.iter().map(|a| &a.id).collect();
+    ids.extend(caller_agent.iter().map(|a| &a.id));
+    let ancestry = if caller_agent.is_some() || !serverless::is_serverless_mode() {
+        state
+            .store
+            .roster_ancestors(&ids)
+            .map_err(ApiError::from_store)?
+    } else {
+        HashMap::new()
+    };
+    let caller = caller_agent.as_ref().map(|caller| RosterCaller {
+        caller,
+        ancestry: &ancestry,
+        sharing: &sharing,
+        replies: if caller.is_isolated() {
+            HashSet::new()
+        } else {
+            state
+                .store
+                .roster_reply_senders(caller, &ids[..roster.len()])
+        },
+    });
+    let selected: Vec<_> = roster.iter().collect();
+    Ok(Json(assemble_roster(
         &state.store,
         &state.health,
-        &visible,
+        &selected,
         archived_count,
-        &effective_query,
-    )?;
-    if let Some(caller) = &caller {
-        let by_id: HashMap<&str, &Agent> = visible.iter().map(|a| (a.id.as_str(), *a)).collect();
-        for view in &mut listed.agents {
-            let agent = by_id
-                .get(view.id.as_str())
-                .copied()
-                .expect("every view comes from a visible row");
-            caller.annotate(view, agent);
-        }
-    }
-    Ok(Json(listed))
+        &ancestry,
+        caller.as_ref(),
+    )?))
 }
 
 /// Shared by the daemon and offline operator CLI. Filter before runtime reads.
@@ -233,17 +209,7 @@ pub(crate) fn roster_views(
     archived_count: usize,
     query: &ListAgentsQuery,
 ) -> Result<AgentsResponse, ApiError> {
-    if let Some(state) = query.state.as_deref()
-        && !matches!(
-            state,
-            "all" | "archived" | "running" | "idle" | "paused" | "created"
-        )
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid agent state",
-        ));
-    }
+    validate_roster_state(query)?;
     let by_id: HashMap<_, _> = all_agents.iter().map(|a| (a.id.as_str(), *a)).collect();
     let selected_name = query
         .name
@@ -366,15 +332,67 @@ pub(crate) fn roster_views(
     {
         selected_agents.truncate(lim);
     }
-    let all_archived = selected_agents.iter().all(|a| a.state == "archived");
-    let mut metadata = if all_archived {
-        anyagents_core::AgentQueryMetadata {
-            aliases: store.agent_aliases_map().map_err(ApiError::from_store)?,
-            ..Default::default()
-        }
+    let ids: Vec<_> = selected_agents.iter().map(|a| &a.id).collect();
+    let ancestry = if serverless::is_serverless_mode() {
+        HashMap::new()
     } else {
-        store.agent_query_metadata().map_err(ApiError::from_store)?
+        store.roster_ancestors(&ids).map_err(ApiError::from_store)?
     };
+    assemble_roster(
+        store,
+        health,
+        &selected_agents,
+        archived_count,
+        &ancestry,
+        None,
+    )
+}
+
+fn validate_roster_state(query: &ListAgentsQuery) -> Result<(), ApiError> {
+    if let Some(state) = query.state.as_deref()
+        && !matches!(
+            state,
+            "all" | "archived" | "running" | "idle" | "paused" | "created"
+        )
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid agent state",
+        ));
+    }
+    Ok(())
+}
+
+fn assemble_roster(
+    store: &Store,
+    health: &HealthBoard,
+    selected_agents: &[&Agent],
+    archived_count: usize,
+    ancestry: &HashMap<AgentId, RosterAncestor>,
+    caller: Option<&RosterCaller<'_>>,
+) -> Result<AgentsResponse, ApiError> {
+    let all_archived = selected_agents.iter().all(|a| a.state == "archived");
+    let mut metadata = store
+        .agent_page_metadata(selected_agents)
+        .map_err(ApiError::from_store)?;
+    let live = selected_agents.iter().filter(|a| a.state != "archived");
+    let need_retry: Vec<_> = live
+        .clone()
+        .filter(|a| {
+            metadata.oldest_undelivered.contains_key(a.id.as_str())
+                && !metadata.active_remote_turns.contains_key(a.id.as_str())
+        })
+        .map(|a| &a.id)
+        .collect();
+    let dispatch_retries =
+        super::serverless_maintenance::read_dispatch_retry_states(store, &need_retry);
+    if !serverless::is_serverless_mode()
+        && live
+            .clone()
+            .any(|a| caller.is_none_or(|c| c.is_self_or_ancestor(&c.caller.id, a)))
+    {
+        create::hydrate_roles_from_store_if_postgres(store, store.data_dir());
+    }
     let files = file_cache::cache();
     files.catch_up();
     let seats = if all_archived {
@@ -392,13 +410,9 @@ pub(crate) fn roster_views(
                 .push(unsettled_view(&held));
         }
     }
-    let mut secrets_by_agent = if all_archived {
-        HashMap::new()
-    } else {
-        store.all_agent_secret_grants().unwrap_or_default()
-    };
     let mut agents = Vec::with_capacity(selected_agents.len());
-    for agent in selected_agents {
+    for &agent in selected_agents {
+        let reads_private = caller.is_none_or(|c| c.is_self_or_ancestor(&c.caller.id, agent));
         let mut view = agent_view_preloaded(
             store,
             health,
@@ -406,10 +420,19 @@ pub(crate) fn roster_views(
             Some(&mut metadata),
             &seats,
             Some(&unsettled_by_agent),
+            Some(RosterViewContext {
+                ancestry,
+                dispatch_retries: &dispatch_retries,
+                reads_private,
+            }),
         )?;
-        view.secrets = secrets_by_agent
+        view.secrets = metadata
+            .secrets
             .remove(agent.id.as_str())
             .unwrap_or_default();
+        if let Some(caller) = caller {
+            caller.annotate(&mut view, agent);
+        }
         agents.push(view);
     }
     Ok(AgentsResponse {
@@ -643,7 +666,7 @@ pub(crate) fn agent_view(
 ) -> Result<AgentView, ApiError> {
     let files = file_cache::cache();
     files.catch_up();
-    agent_view_preloaded(store, health, agent, None, &view_seats(files), None)
+    agent_view_preloaded(store, health, agent, None, &view_seats(files), None, None)
 }
 
 type RosterSeats = HashMap<String, (String, u32, u32, u32)>;
@@ -663,6 +686,12 @@ fn view_seats(files: &file_cache::FileCache) -> std::sync::Arc<RosterSeats> {
     }
 }
 
+struct RosterViewContext<'a> {
+    ancestry: &'a HashMap<AgentId, RosterAncestor>,
+    dispatch_retries: &'a HashMap<AgentId, super::serverless_maintenance::DispatchRetryState>,
+    reads_private: bool,
+}
+
 fn agent_view_preloaded(
     store: &Store,
     health: &HealthBoard,
@@ -670,6 +699,7 @@ fn agent_view_preloaded(
     mut metadata: Option<&mut anyagents_core::AgentQueryMetadata>,
     seats: &RosterSeats,
     unsettled_by_agent: Option<&HashMap<String, Vec<crate::api::UnsettledOutboundView>>>,
+    roster: Option<RosterViewContext<'_>>,
 ) -> Result<AgentView, ApiError> {
     if agent.state == "archived" {
         let mut view = archived_agent_view_fast(agent);
@@ -754,7 +784,11 @@ fn agent_view_preloaded(
     let dispatch_retry = if active_remote_started_ms.is_none()
         && (metadata.is_none() || lag.oldest_undelivered_age_ms.is_some())
     {
-        super::serverless_maintenance::read_dispatch_retry_state(store, &agent.id)
+        if let Some(roster) = &roster {
+            roster.dispatch_retries.get(&agent.id).cloned()
+        } else {
+            super::serverless_maintenance::read_dispatch_retry_state(store, &agent.id)
+        }
     } else {
         None
     };
@@ -1032,11 +1066,24 @@ fn agent_view_preloaded(
         oldest_undelivered_age_ms,
         install: install_state(store, files, agent),
         description: agent.public_description(),
-        instructions: create::effective_agent_instructions(
-            (!serverless::is_serverless_mode()).then_some(store),
-            store.data_dir(),
-            agent,
-        ),
+        instructions: if let Some(roster) = roster {
+            roster
+                .reads_private
+                .then(|| {
+                    create::effective_roster_instructions(
+                        store.data_dir(),
+                        agent,
+                        (!serverless::is_serverless_mode()).then_some(roster.ancestry),
+                    )
+                })
+                .flatten()
+        } else {
+            create::effective_agent_instructions(
+                (!serverless::is_serverless_mode()).then_some(store),
+                store.data_dir(),
+                agent,
+            )
+        },
         seat_user: seat_info.as_ref().map(|(u, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid)| *gid),

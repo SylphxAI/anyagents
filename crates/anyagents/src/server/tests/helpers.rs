@@ -119,7 +119,12 @@ pub(super) fn try_authored_send(
 }
 
 pub(super) fn archetype_validation_state(data: &Path) -> AppState {
-    let store = Arc::new(Store::open(data.join("state.db")).unwrap());
+    state_for_store(Store::open(data.join("state.db")).unwrap())
+}
+
+pub(super) fn state_for_store(store: Store) -> AppState {
+    let data = store.data_dir().to_path_buf();
+    let store = Arc::new(store);
     store
         .hold_capability_key("test-capability-key-0123456789abcdef")
         .unwrap();
@@ -130,9 +135,7 @@ pub(super) fn archetype_validation_state(data: &Path) -> AppState {
         identity: Arc::new(ServingIdentity::capture()),
         profiles: Default::default(),
         timer_backend: Arc::new(crate::timer::NoopTimerBackend),
-        auth: auth::Mode::Trusted {
-            data_dir: data.into(),
-        },
+        auth: auth::Mode::Trusted { data_dir: data },
     }
 }
 

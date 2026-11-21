@@ -110,6 +110,7 @@ pub use store::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
     is_remote_session_token,
 };
+pub use store::{RosterAncestor, RosterSelection};
 pub use store::{
     RuntimeComponent, RuntimeIssue, RuntimeIssueReport, RuntimeIssueSource, RuntimeIssueStatus,
 };

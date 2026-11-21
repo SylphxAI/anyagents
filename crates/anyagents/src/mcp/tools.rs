@@ -345,16 +345,55 @@ impl AgentMcp {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let mut response = self.client.get_agents_for_state(state_trimmed).await?;
-                if let Some(parent_filter) = args
+                let parent = args
                     .parent
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                {
-                    let cleaned = parent_filter
-                        .strip_prefix("agent:")
-                        .unwrap_or(parent_filter);
+                    .map(|s| s.strip_prefix("agent:").unwrap_or(s));
+                // Explicit archive states keep their historical daemon population
+                // (ordered and capped before MCP filters). Lifecycle/turn-state
+                // filters, ranking and summary need the coordinator's live view.
+                let live_parent = parent
+                    .filter(|_| {
+                        !state_trimmed.is_some_and(|s| {
+                            s.eq_ignore_ascii_case("all")
+                                || s.eq_ignore_ascii_case("archived")
+                                // Archived ancestors have turn_state=idle.
+                                || s.eq_ignore_ascii_case("idle")
+                        })
+                    })
+                    .and_then(|p| {
+                        if p.eq_ignore_ascii_case("root") || p.eq_ignore_ascii_case("none") {
+                            Some("root")
+                        } else if p.eq_ignore_ascii_case("subagents")
+                            || p.eq_ignore_ascii_case("all_subagents")
+                        {
+                            Some("subagents")
+                        } else if !matches!(
+                            p.to_ascii_lowercase().as_str(),
+                            "all" | "parent" | "sibling" | "siblings" | "peer" | "peers"
+                        ) && (p.eq_ignore_ascii_case("self")
+                            || p.eq_ignore_ascii_case("children")
+                            || p.eq_ignore_ascii_case(&self.agent.name)
+                            || p == self.agent.id.as_str())
+                        {
+                            Some(self.agent.id.as_str())
+                        } else {
+                            None
+                        }
+                    });
+                let mut response = if let Some(parent) = live_parent {
+                    self.client
+                        .get_live_agents_for_parent(
+                            parent,
+                            args.include_descendants.unwrap_or(false),
+                        )
+                        .await?
+                } else {
+                    self.client.get_agents_for_state(state_trimmed).await?
+                };
+                if let Some(cleaned) = parent.filter(|_| live_parent.is_none()) {
                     if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none")
                     {
                         response.agents.retain(|a| a.parent.is_none());

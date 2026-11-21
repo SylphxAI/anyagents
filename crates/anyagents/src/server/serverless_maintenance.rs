@@ -269,6 +269,23 @@ pub(crate) fn read_dispatch_retry_state(
         .and_then(|entry| serde_json::from_slice::<DispatchRetryState>(&entry.content).ok())
 }
 
+pub(crate) fn read_dispatch_retry_states(
+    store: &Store,
+    ids: &[&AgentId],
+) -> std::collections::HashMap<AgentId, DispatchRetryState> {
+    store
+        .blob_store()
+        .get_agent_file_batch(ids, SYS_TIMERS_BLOB_NS, DISPATCH_RETRY_BLOB_PATH)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, entry)| {
+            serde_json::from_slice(&entry.content)
+                .ok()
+                .map(|state| (id, state))
+        })
+        .collect()
+}
+
 fn write_dispatch_retry_state(store: &Store, agent_id: &AgentId, state: &DispatchRetryState) {
     if let Ok(bytes) = serde_json::to_vec(state) {
         let _ = store.blob_store().put_agent_file(

@@ -33,7 +33,7 @@ pub(crate) use archetypes::{
     SubagentDefaultsConfig, ancestor_archetype_workdirs, apply_archetype_defaults,
     backfill_historical_agent_roles, discover_available_archetype_slugs,
     discover_available_archetype_templates, effective_agent_instructions,
-    hydrate_roles_from_store_if_postgres, load_subagent_defaults,
+    effective_roster_instructions, hydrate_roles_from_store_if_postgres, load_subagent_defaults,
     mark_instructions_rotated_if_changed, normalize_or_validate_agent_role,
     parse_archetype_markdown, resolve_archetype_template_with_source, resolve_subagent_defaults,
     save_subagent_defaults, valid_template_stem,

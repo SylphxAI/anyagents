@@ -347,6 +347,22 @@ impl Client {
         self.get_agents_for_state(None).await
     }
 
+    pub(super) async fn get_live_agents_for_parent(
+        &self,
+        parent: &str,
+        descendants: bool,
+    ) -> Result<AgentsResponse, String> {
+        let filter = match parent {
+            "root" | "subagents" => format!("flat_parent={parent}"),
+            id => format!("children_of={}", urlencoding_simple(id)),
+        };
+        self.get(
+            &format!("/v1/agents?{filter}&include_descendants={descendants}"),
+            None,
+        )
+        .await
+    }
+
     pub(super) async fn get_agents_for_state(
         &self,
         state: Option<&str>,

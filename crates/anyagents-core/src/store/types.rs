@@ -20,6 +20,7 @@ pub struct Origin {
 /// Batched roster metadata. Archived agents never need runtime diagnostics.
 #[derive(Default)]
 pub struct AgentQueryMetadata {
+    pub secrets: HashMap<String, Vec<String>>,
     pub aliases: HashMap<String, Vec<String>>,
     pub oldest_undelivered: HashMap<String, i64>,
     pub open_turns: HashMap<String, i64>,

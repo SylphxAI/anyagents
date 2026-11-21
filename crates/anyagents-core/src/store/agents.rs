@@ -18,8 +18,8 @@ use crate::db_params;
 use crate::error::Error;
 use crate::id::AgentId;
 
-const AGENT_COLS: &str = agent_cols!();
-const AGENT_LIST_COLS: &str = "id, name, harness, model, workdir, \
+pub(super) const AGENT_COLS: &str = agent_cols!();
+pub(super) const AGENT_LIST_COLS: &str = "id, name, harness, model, workdir, \
      CASE WHEN state = 'archived' THEN NULL ELSE instructions END AS instructions, \
      state, created_at_ms, launch_env, parent_id, role, description, \
      runtime, remote_budget_micros";
@@ -522,6 +522,25 @@ impl Store {
             agent_from_row_db,
         )?;
         aliased.ok_or_else(|| Error::AgentNotFound(name.to_string()))
+    }
+
+    /// Resolve a roster selector without loading instructions or launch environment.
+    pub fn roster_agent_id(&self, name: &str) -> Result<AgentId, Error> {
+        let lookup = name.strip_prefix("agent:").unwrap_or(name);
+        let conn = self.read_conn();
+        if let Some(id) = conn.db_query_opt(
+            "SELECT id FROM agents WHERE name = ?1 OR id = ?1",
+            &db_params![lookup],
+            |r| r.get(0),
+        )? {
+            return Ok(id);
+        }
+        conn.db_query_opt(
+            "SELECT agent_id FROM agent_aliases WHERE alias = ?1",
+            &db_params![lookup],
+            |r| r.get(0),
+        )?
+        .ok_or_else(|| Error::AgentNotFound(name.to_string()))
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
