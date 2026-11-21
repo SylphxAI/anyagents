@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod postgres;
+
 use super::agents::{AGENT_COLS, AGENT_LIST_COLS, DEFAULT_ARCHIVE_ROSTER_LIMIT};
 use super::helpers::agent_from_row_db;
 use super::schedules::schedule_from_row_db;
@@ -41,13 +43,44 @@ pub struct RosterSelection<'a> {
 }
 
 impl Store {
+    /// Load the page's display data and caller relationships. If a batched
+    /// read fails, keep the serial path's distinction between required data
+    /// and optional diagnostics or grants (which fail closed).
+    pub fn roster_page_context(
+        &self,
+        page: &[&Agent],
+        caller: Option<&Agent>,
+        include_ancestry: bool,
+    ) -> Result<RosterPageContext, Error> {
+        if self.is_postgres()
+            && let Ok(context) = postgres::load(self, page, caller, include_ancestry)
+        {
+            return Ok(context);
+        }
+        let ids: Vec<_> = page.iter().map(|a| &a.id).collect();
+        let ancestry = if include_ancestry {
+            let seeds = ids
+                .iter()
+                .copied()
+                .chain(caller.map(|a| &a.id))
+                .collect::<Vec<_>>();
+            self.roster_ancestors(&seeds)?
+        } else {
+            HashMap::new()
+        };
+        let replies = caller
+            .filter(|a| !a.is_isolated())
+            .map(|a| self.roster_reply_senders(a, &ids))
+            .unwrap_or_default();
+        Ok(RosterPageContext {
+            ancestry,
+            replies,
+            metadata: self.agent_page_metadata(page)?,
+        })
+    }
+
     pub fn select_roster(&self, q: RosterSelection<'_>) -> Result<(Vec<Agent>, usize), Error> {
         let conn = self.read_conn();
-        let archived: i64 = conn.db_query_one(
-            "SELECT count(*) FROM agents WHERE state = 'archived'",
-            &[],
-            |r| r.get(0),
-        )?;
         let archive_page = matches!(q.state, Some("all" | "archived"));
         let limit = q
             .limit
@@ -150,11 +183,6 @@ impl Store {
         } else {
             where_clause
         };
-        let with = if ctes.is_empty() {
-            String::new()
-        } else {
-            format!("WITH RECURSIVE {}", ctes.join(", "))
-        };
         let order = if archive_page {
             "(CASE WHEN state = 'archived' THEN 1 ELSE 0 END), created_at_ms DESC, name"
         } else {
@@ -168,15 +196,31 @@ impl Store {
         } else {
             AGENT_COLS
         };
-        let agents = conn.db_query_vec(
+        ctes.push(format!(
+            "page AS (SELECT {cols} FROM agents WHERE {selected}
+            ORDER BY {order} LIMIT ?1 OFFSET ?2)"
+        ));
+        // The global count still returns on empty and out-of-range pages.
+        let rows = conn.db_query_vec(
             &format!(
-                "{with} SELECT {cols} FROM agents WHERE {selected}
-                      ORDER BY {order} LIMIT ?1 OFFSET ?2"
+                "WITH RECURSIVE {}
+                SELECT page.*, totals.n FROM
+                    (SELECT count(*) AS n FROM agents WHERE state = 'archived') totals
+                LEFT JOIN page ON TRUE ORDER BY {order}",
+                ctes.join(", ")
             ),
             &params,
-            agent_from_row_db,
+            |r| {
+                let agent = if r.get::<Option<String>>(0)?.is_some() {
+                    Some(agent_from_row_db(r)?)
+                } else {
+                    None
+                };
+                Ok((agent, r.get::<i64>(14)?))
+            },
         )?;
-        Ok((agents, archived as usize))
+        let archived = rows.first().map_or(0, |(_, n)| *n as usize);
+        Ok((rows.into_iter().filter_map(|(a, _)| a).collect(), archived))
     }
 
     /// Lightweight ancestry for authorization and role resolution; never fetches
@@ -369,6 +413,12 @@ impl Store {
         }
         Ok(meta)
     }
+}
+
+pub struct RosterPageContext {
+    pub ancestry: HashMap<AgentId, RosterAncestor>,
+    pub replies: HashSet<AgentId>,
+    pub metadata: AgentQueryMetadata,
 }
 
 pub struct RosterAncestor {

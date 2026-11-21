@@ -1,8 +1,8 @@
 use super::super::agents_lifecycle::wake_agent_route;
 use super::super::agents_roster::list_agents_sync_for_principal;
 use super::super::messaging::{
-    SendPlan, can_actor_message_agent, can_sender_message_agent, check_targets, media_upload,
-    plan_send, send_key, send_sync,
+    SendPlan, can_actor_message_agent, can_sender_message_agent, media_upload, plan_send, send_key,
+    send_sync,
 };
 use super::super::*;
 use super::helpers::{
@@ -359,7 +359,7 @@ fn missing_sender_cannot_bypass_private_room_checks() {
     store
         .create_agent(anyagents_core::NewAgent::new(&sender.name, "opencode"))
         .unwrap();
-    let denied = check_targets(&store, &actor, &body, &plan)
+    let denied = send_sync(&store, &actor, body, plan, None)
         .expect_err("missing actor must not pass room authorization");
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
     assert!(store.inbox(&recipient.id, None).unwrap().is_empty());

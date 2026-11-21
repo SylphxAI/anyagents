@@ -33,7 +33,7 @@ pub(super) fn cancel_archived_schedules(
 // `kind` is an unconstrained trigger discriminator in both stores. A standing
 // webhook is a distinct trigger, not an annotation on the topic or baseline.
 // Expose it as kind=watch, persistent=true at the Store boundary.
-const WEBHOOK_SUBSCRIPTION: &str = "webhook_subscription";
+pub(super) const WEBHOOK_SUBSCRIPTION: &str = "webhook_subscription";
 
 const RECURRING_JITTER_MIN_INTERVAL_MS: i64 = 15 * 60_000;
 const RECURRING_JITTER_MAX_MS: i64 = 180_000;

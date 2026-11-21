@@ -843,38 +843,29 @@ pub(super) fn can_sender_message_agent_with(
 
 /// Every destination is checked before any write, so a refused address never
 /// leaves half a send behind.
-pub(super) fn check_targets(
+fn check_targets_for_sender(
     store: &Store,
     actor: &Actor,
     body: &SendRequest,
     plan: &SendPlan,
-) -> Result<(), ApiError> {
-    // Authorization uses the immutable identity retained during planning, not
-    // a mutable name that might have been assigned to a replacement agent.
-    let sender =
-        match actor {
-            Actor::Agent(_) => Some(
-                store
-                    .agent(plan.sender_id.as_ref().ok_or_else(|| {
-                        ApiError::forbidden("agent send has no admitted identity")
-                    })?)
-                    .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?,
-            ),
-            Actor::Operator(_) => None,
-        };
+    sender: Option<&Agent>,
+) -> Result<Vec<Option<Agent>>, ApiError> {
+    let mut direct = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
+        let mut admitted = None;
         match target {
             Target::Agent(name) => {
                 let recipient = store.agent_by_name(name).map_err(ApiError::from_store)?;
-                if let Some(sender) = &sender {
+                if let Some(sender) = sender {
                     can_sender_message_agent(store, sender, &recipient)?;
                 }
+                admitted = Some(recipient);
             }
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
             Target::Room(room) => {
                 let clean_room = room.strip_prefix("group:").unwrap_or(room);
-                if let Some(sender) = &sender {
+                if let Some(sender) = sender {
                     if clean_room != "all"
                         && clean_room != "peers"
                         && !clean_room.starts_with("telegram:")
@@ -949,8 +940,9 @@ pub(super) fn check_targets(
                 }
             }
         }
+        direct.push(admitted);
     }
-    Ok(())
+    Ok(direct)
 }
 
 pub(super) fn send_sync(
@@ -961,20 +953,30 @@ pub(super) fn send_sync(
     key: Option<String>,
 ) -> Result<Json<SendResponse>, ApiError> {
     // Reauthorize the immutable identities before replay, target checks or effects.
-    if let Some(id) = &plan.principal_id {
-        store
-            .agent(id)
-            .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))?;
-    }
-    let resolved_actor = match &plan.sender_id {
-        Some(id) => Actor::Agent(
+    let principal = plan
+        .principal_id
+        .as_ref()
+        .map(|id| {
             store
                 .agent(id)
-                .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?
-                .name,
+                .map_err(|_| ApiError::forbidden("authenticated agent no longer exists"))
+        })
+        .transpose()?;
+    let sender = match &plan.sender_id {
+        Some(id) if principal.as_ref().is_some_and(|a| &a.id == id) => principal,
+        Some(id) => Some(
+            store
+                .agent(id)
+                .map_err(|_| ApiError::forbidden("sender agent no longer exists"))?,
         ),
-        None => actor.clone(),
+        None if matches!(actor, Actor::Agent(_)) => {
+            return Err(ApiError::forbidden("agent send has no admitted identity"));
+        }
+        None => None,
     };
+    let resolved_actor = sender
+        .as_ref()
+        .map_or_else(|| actor.clone(), |a| Actor::Agent(a.name.clone()));
     let actor = &resolved_actor;
     let body = SendRequest {
         // A display name may be reassigned while a journal lock is held. Carry
@@ -1023,7 +1025,7 @@ pub(super) fn send_sync(
         text: authored_text,
         ..body.clone()
     };
-    check_targets(store, actor, &body, &plan)?;
+    let direct = check_targets_for_sender(store, actor, &body, &plan, sender.as_ref())?;
     let upload = media_upload(store, &body, &plan)?;
     let sender_agent_id = plan.sender_id.clone();
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
@@ -1052,7 +1054,10 @@ pub(super) fn send_sync(
                 // only an explicit `agents(action="wake")` does. An archived
                 // recipient would never read it, so it is refused with the
                 // reason and never stored unread.
-                if let Some(refusal) = archived_refusal(store, name) {
+                let recipient = direct[target_index]
+                    .as_ref()
+                    .expect("direct target was authorized");
+                if let Some(refusal) = archived_refusal(store, recipient) {
                     refused_archived.push(refusal.reason.clone());
                     skipped.push(refusal);
                     continue;
@@ -1071,7 +1076,7 @@ pub(super) fn send_sync(
                             Ok(vec![deliver_agent_with_media(
                                 store,
                                 &internal_body,
-                                name,
+                                &recipient.id,
                                 key.as_deref(),
                                 upload.as_ref(),
                                 plan.turn_context.as_deref().map(|token| (sid, token)),
@@ -1082,7 +1087,7 @@ pub(super) fn send_sync(
                     vec![deliver_agent_with_media(
                         store,
                         &internal_body,
-                        name,
+                        &recipient.id,
                         key.as_deref(),
                         upload.as_ref(),
                         None,

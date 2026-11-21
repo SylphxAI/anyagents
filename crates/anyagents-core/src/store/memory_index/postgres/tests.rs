@@ -84,6 +84,27 @@ fn exercise(url: &str) {
     else {
         panic!("expected data message");
     };
+    let search = store
+        .search_history(&HistorySearchQuery {
+            query: Some("marker".into()),
+            agent: Some(agent.name.clone()),
+            include_tools: false,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(search.iter().any(|hit| hit.id == data_msg.id.as_str()));
+    let projected: bool = pool
+        .db_query_one(
+            "SELECT EXISTS(SELECT 1 FROM memory_index.rag_chunks WHERE chunk_id = ?1)",
+            &db_params![data_msg.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !projected,
+        "mailbox search must not depend on eager projection"
+    );
+    store.sync_memory_index().unwrap();
     let projected_tokens: String = pool
         .db_query_one(
             "SELECT search_tokens FROM memory_index.rag_chunks WHERE chunk_id = ?1",

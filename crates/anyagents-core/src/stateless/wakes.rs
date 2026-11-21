@@ -14,7 +14,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 
-use crate::db::{block_on_pg, pg_runtime};
+use crate::db::{acquire_pg, block_on_pg, pg_runtime};
 use crate::error::Error;
 use crate::id::AgentId;
 use crate::store::Wake;
@@ -88,10 +88,11 @@ pub fn publish_pg_wake(
     let payload = encode_wake_payload(origin_replica_id, wake);
     let pool = pool.clone();
     block_on_pg(async move {
+        let mut conn = acquire_pg(&pool).await?;
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(PG_WAKE_CHANNEL)
             .bind(&payload)
-            .execute(&pool)
+            .execute(&mut *conn)
             .await
             .map_err(Error::from)?;
         Ok(())

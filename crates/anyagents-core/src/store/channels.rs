@@ -58,6 +58,22 @@ impl Store {
     /// Every channel, with the agents attached to it. No secret is in the rows.
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
         let conn = self.read_conn();
+        if conn.backend() == crate::db::DbBackend::Postgres {
+            return conn.db_query_vec(
+                "SELECT c.id, c.kind, c.identity, c.config, c.credential_ref, c.created_at_ms, c.state,
+                        (SELECT COALESCE(jsonb_agg(a.agent_id ORDER BY a.agent_id), '[]'::jsonb)::text
+                         FROM channel_agents a WHERE a.channel_id = c.id)
+                 FROM channels c ORDER BY c.created_at_ms",
+                &[],
+                |row| {
+                    let mut channel = channel_from_row_db(row)?;
+                    let ids: Vec<String> = serde_json::from_str(&row.get::<String>(7)?)
+                        .map_err(|err| Error::Message(format!("invalid channel agents: {err}")))?;
+                    channel.agents = ids.iter().map(|id| AgentId::parse(id)).collect::<Result<_, _>>()?;
+                    Ok(channel)
+                },
+            );
+        }
         let mut channels = conn.db_query_vec(
             "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",

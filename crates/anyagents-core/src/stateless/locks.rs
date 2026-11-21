@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 
-use crate::db::{block_on_pg, pg_runtime};
+use crate::db::{acquire_pg, block_on_pg, pg_runtime};
 use crate::error::Error;
 use crate::migrate::now_ms;
 
@@ -133,6 +133,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
         let owner = self.replica_id.clone();
 
         let row: Option<(String, String, i64, i64, i64, i64)> = block_on_pg(async move {
+            let mut conn = acquire_pg(&pool).await?;
             sqlx::query_as(
                 "INSERT INTO public.coordinator_leases
                     (lease_key, owner_replica_id, fencing_token, acquired_at_ms, heartbeat_at_ms, expires_at_ms)
@@ -150,7 +151,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
             .bind(&owner)
             .bind(now)
             .bind(expires_at)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(Error::from)
         })?;
@@ -171,6 +172,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
         let token = lease.fencing_token;
 
         let row: Option<(String, String, i64, i64, i64, i64)> = block_on_pg(async move {
+            let mut conn = acquire_pg(&pool).await?;
             sqlx::query_as(
                 "UPDATE public.coordinator_leases
                  SET heartbeat_at_ms = $4,
@@ -186,7 +188,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
             .bind(token)
             .bind(now)
             .bind(expires_at)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(Error::from)
         })?;
@@ -203,6 +205,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
         // `fencing_token` advances strictly monotonically across clean releases
         // as well as crash/expiry handovers.
         let affected = block_on_pg(async move {
+            let mut conn = acquire_pg(&pool).await?;
             sqlx::query(
                 "UPDATE public.coordinator_leases
                  SET expires_at_ms = 0,
@@ -215,7 +218,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
             .bind(&owner)
             .bind(token)
             .bind(now)
-            .execute(&pool)
+            .execute(&mut *conn)
             .await
             .map(|r| r.rows_affected())
             .map_err(Error::from)
@@ -228,6 +231,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
         let pool = self.pool.clone();
         let key = lease_key.to_string();
         let row: Option<(String, String, i64, i64, i64, i64)> = block_on_pg(async move {
+            let mut conn = acquire_pg(&pool).await?;
             sqlx::query_as(
                 "SELECT lease_key, owner_replica_id, fencing_token, acquired_at_ms, heartbeat_at_ms, expires_at_ms
                  FROM public.coordinator_leases
@@ -236,7 +240,7 @@ impl CoordinatorLockBackend for PgCoordinatorLockBackend {
             )
             .bind(&key)
             .bind(now)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(Error::from)
         })?;
@@ -307,6 +311,9 @@ impl CoordinatorLeaseGuard {
                 }
                 let now = now_ms();
                 let expires_at = now.saturating_add(ttl_ms);
+                let Ok(mut conn) = acquire_pg(&pool).await else {
+                    continue;
+                };
                 let updated = sqlx::query(
                     "UPDATE public.coordinator_leases
                      SET heartbeat_at_ms = $4,
@@ -321,7 +328,7 @@ impl CoordinatorLeaseGuard {
                 .bind(token)
                 .bind(now)
                 .bind(expires_at)
-                .execute(&pool)
+                .execute(&mut *conn)
                 .await;
                 if matches!(updated, Ok(res) if res.rows_affected() == 0) {
                     // Lease was released or fenced out; stop renewing.
