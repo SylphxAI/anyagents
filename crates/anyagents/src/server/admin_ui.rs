@@ -364,9 +364,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn versions_serves_the_postgres_fleet_in_one_inventory_read() {
+    #[test]
+    fn versions_serves_the_postgres_fleet_in_one_inventory_read() {
         let Ok(url) = std::env::var(anyagents_core::db::TEST_POSTGRES_URL_ENV) else {
             eprintln!("skipping PostgreSQL versions regression: test URL is unset");
             return;
@@ -391,23 +390,31 @@ mod tests {
         let auth = crate::auth::Mode::from_env(dir.path());
         let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
         let cookie = valid_session_cookie_header();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let mut timings = Vec::new();
         let mut result = None;
         for _ in 0..5 {
             let start = std::time::Instant::now();
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/admin/api/versions")
-                        .header(COOKIE, &cookie)
-                        .body(Body::empty())
-                        .unwrap(),
+            let (status, body) = runtime.block_on(async {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/admin/api/versions")
+                            .header(COOKIE, &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                (
+                    response.status(),
+                    response.into_body().collect().await.unwrap().to_bytes(),
                 )
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = response.into_body().collect().await.unwrap().to_bytes();
+            });
             timings.push(start.elapsed());
             result = Some((status, body));
         }
