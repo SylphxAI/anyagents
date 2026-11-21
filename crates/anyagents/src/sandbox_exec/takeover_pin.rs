@@ -86,6 +86,45 @@ fn check_pin(pin: &Pin, binding: Option<&SandboxBinding>, now: i64) -> Result<i6
     Ok(pin.expires_ms)
 }
 
+/// Indexed, read-only lookup for a viewer missing the process-local registry.
+/// Link history locates the owner; the current pin and live lease authorize waiting.
+pub(crate) fn viewer_deadline(store: &Store, session: &str, token: &str) -> Result<i64, Rejection> {
+    let token_hash = sha256_hex(token.as_bytes());
+    let link = store
+        .takeover_link(session, &token_hash)
+        .map_err(|_| Rejection::Store)?
+        .ok_or(Rejection::Unauthorized)?;
+    let pin = read(store, &link.agent_id)
+        .map_err(|_| Rejection::Store)?
+        .filter(|pin| pin.session == session)
+        .ok_or_else(|| {
+            if link.expires_ms.is_some_and(|deadline| now_ms() >= deadline) {
+                Rejection::Expired
+            } else {
+                Rejection::Ended
+            }
+        })?;
+    if !anyagents_core::constant_time_eq(pin.token_hash.as_bytes(), token_hash.as_bytes()) {
+        return Err(Rejection::Unauthorized);
+    }
+    if link
+        .ended_ms
+        .is_some_and(|ended| link.expires_ms.is_none_or(|expiry| ended < expiry))
+    {
+        return Err(Rejection::Ended);
+    }
+    check_agent(store, &link.agent_id)?;
+    let binding = store
+        .sandbox_binding(&link.agent_id)
+        .map_err(|_| Rejection::Store)?;
+    let deadline = check_pin(&pin, binding.as_ref(), now_ms())?;
+    Ok(deadline.min(
+        binding
+            .and_then(|b| b.lease_expires_at_ms)
+            .unwrap_or(i64::MAX),
+    ))
+}
+
 /// Returns the fixed deadline, or None for standalone agents without a remote binding.
 pub(crate) fn register(
     store: &Store,
@@ -146,6 +185,11 @@ fn register_locked(
         expires_ms,
         ended: false,
     };
+    // Persist the indexed locator before publishing a new pin. A locator alone
+    // never authorizes a wait; it can safely outlive an unsuccessful pin write.
+    store
+        .remember_takeover_link(session, &pin.token_hash, agent, Some(expires_ms))
+        .map_err(|_| Rejection::Store)?;
     write(store, agent, &pin).map_err(|_| Rejection::Store)?;
     Ok(Some(expires_ms))
 }

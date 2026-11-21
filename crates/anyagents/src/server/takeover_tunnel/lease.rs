@@ -24,7 +24,6 @@ pub(super) struct LeasePin {
     agent: anyagents_core::AgentId,
     session: String,
     deadline: Instant,
-    expires_ms: i64,
 }
 
 impl LeasePin {
@@ -53,7 +52,6 @@ impl LeasePin {
                 store,
                 agent,
                 session,
-                expires_ms: deadline,
                 deadline: Instant::now() + Duration::from_millis(remaining as u64),
             }))
         })
@@ -63,10 +61,6 @@ impl LeasePin {
 
     pub(super) fn deadline(&self) -> Instant {
         self.deadline
-    }
-
-    pub(super) fn expires_ms(&self) -> i64 {
-        self.expires_ms
     }
 
     pub(super) fn remaining_ms(&self) -> u64 {
