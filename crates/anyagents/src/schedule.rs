@@ -3,7 +3,7 @@
 //! Every agent on any harness can schedule its own one-off wake (`at`), recurring
 //! wake (`every`), or event watch (`watch`: generic webhook/event trigger
 //! `webhook:<topic>`, GitHub PR/check terminal state `github:pr:*`/`github:check:*`,
-//! an AnyAgents agent going idle, a local process exiting, or a local file changing).
+//! an AnyAgents agent going idle, a local process exiting, or a file changing).
 //!
 //! A due tick or a triggered watch is written to the owner's mailbox at once, like
 //! any other message. Mailbox delivery alone decides when the owner sees it: it is
@@ -599,24 +599,14 @@ pub fn create_agent_schedule_with_mode(
             watch_baseline: None,
         }
     } else if let Some(watch_str) = watch_opt {
-        let mut parsed = parse_watch_spec(watch_str)?;
-        let mut resolved_spec = watch_str.to_string();
-        if let WatchTarget::PathChanged { path } = &mut parsed {
-            let p = std::path::PathBuf::from(&*path);
-            let abs = if p.is_absolute() {
-                p
-            } else {
-                agent
-                    .workdir
-                    .as_ref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| anyagents_core::agent_work_dir(store.data_dir(), &agent.id))
-                    .join(p)
-            };
-            *path = abs.to_string_lossy().into_owned();
-            resolved_spec = format!("file:{path}");
-        }
-        let baseline = initial_watch_baseline(store, health, &parsed, agent.id.as_str(), now);
+        let parsed = parse_watch_spec(watch_str)?;
+        let (resolved_spec, baseline) = match parsed {
+            WatchTarget::PathChanged { path } => file::prepare(store, &agent.id, &path, now)?,
+            _ => (
+                watch_str.to_string(),
+                initial_watch_baseline(store, health, &parsed, now),
+            ),
+        };
         if let Some(ref b) = baseline
             && b.starts_with("probe_error:")
         {
@@ -674,7 +664,6 @@ fn initial_watch_baseline(
     store: &Store,
     health: &HealthBoard,
     target: &WatchTarget,
-    _agent_id: &str,
     now: i64,
 ) -> Option<String> {
     match target {
@@ -697,7 +686,7 @@ fn initial_watch_baseline(
             }
             .to_string(),
         ),
-        WatchTarget::PathChanged { path } => Some(probe_path_fingerprint(path)),
+        WatchTarget::PathChanged { .. } => unreachable!("file watches prepare their own baseline"),
     }
 }
 
@@ -1175,7 +1164,7 @@ impl Timer {
 
     fn set_local_fallback(&mut self, fallback: HashSet<WatchTarget>, now: i64) {
         for entry in &mut self.plan.entries {
-            if let Some(ref target) = entry.watch
+            if let Some(target) = entry.local_kernel_target()
                 && fallback.contains(target)
             {
                 entry.check_at = entry.check_at.min(now.saturating_add(LOCAL_WATCH_PROBE_MS));
@@ -1191,7 +1180,7 @@ impl Timer {
         now: i64,
     ) {
         for entry in &mut self.plan.entries {
-            let Some(ref target) = entry.watch else {
+            let Some(target) = entry.local_kernel_target() else {
                 continue;
             };
             if ready.contains(target) {
@@ -1310,6 +1299,7 @@ pub(crate) fn evaluate_single_watch_schedule(
         watch: parse_watch_spec(&sched.spec).ok(),
         check_at: i64::MAX,
         idle_target: None,
+        local_file: false,
     };
     let out = evaluate_watch_entry(store, health, &mut entry, false, &HashSet::new(), now);
     (
@@ -1772,6 +1762,17 @@ struct Entry {
     /// The watched agent of an `agent:idle` watch as last resolved, so its
     /// published live turn answers without the store.
     idle_target: Option<AgentId>,
+    local_file: bool,
+}
+
+impl Entry {
+    fn local_kernel_target(&self) -> Option<&WatchTarget> {
+        match self.watch.as_ref()? {
+            target @ WatchTarget::PathChanged { .. } if self.local_file => Some(target),
+            target @ WatchTarget::ProcessExit { .. } => Some(target),
+            _ => None,
+        }
+    }
 }
 
 /// The active schedules managed by the schedule timer loop.
@@ -1825,11 +1826,7 @@ impl Plan {
     fn local_kernel_targets(&self) -> Vec<WatchTarget> {
         let mut out = Vec::new();
         for entry in &self.entries {
-            if let Some(ref target) = entry.watch
-                && matches!(
-                    target,
-                    WatchTarget::PathChanged { .. } | WatchTarget::ProcessExit { .. }
-                )
+            if let Some(target) = entry.local_kernel_target()
                 && !out.contains(target)
             {
                 out.push(target.clone());
@@ -1866,7 +1863,7 @@ impl Plan {
             .iter()
             .map(|entry| (entry.sched.id.as_str(), entry))
             .collect();
-        let mut live: Option<HashSet<AgentId>> = None;
+        let mut live: Option<HashMap<AgentId, anyagents_core::ExecutionRuntime>> = None;
         let mut entries = Vec::new();
         for sched in schedules {
             if self.watches_only && sched.kind != "watch" {
@@ -1883,13 +1880,13 @@ impl Plan {
                         store
                             .list_live_agents()?
                             .into_iter()
-                            .map(|agent| agent.id)
+                            .map(|agent| (agent.id, agent.runtime))
                             .collect(),
                     );
                 }
                 if live
                     .as_ref()
-                    .is_some_and(|live| !live.contains(&sched.agent_id))
+                    .is_some_and(|live| !live.contains_key(&sched.agent_id))
                 {
                     if let Err(err) = store.cancel_schedule(None, &sched.id) {
                         eprintln!("Schedule cancellation failed: {err}");
@@ -1897,12 +1894,18 @@ impl Plan {
                     continue;
                 }
             }
+            let local_file = matches!(watch, Some(WatchTarget::PathChanged { .. }))
+                && live.as_ref().and_then(|live| live.get(&sched.agent_id))
+                    == Some(&anyagents_core::ExecutionRuntime::Local)
+                && !file::sandbox_baseline(&sched);
             let prior = previous.get(sched.id.as_str()).copied();
             let check_at = if sched.kind == "watch" {
                 match watch.as_ref() {
                     // Webhook watches are push-triggered via `fire_webhook_event`.
                     Some(WatchTarget::Webhook { .. }) => i64::MAX,
-                    _ => prior.map_or(i64::MIN, |p| p.check_at),
+                    _ => prior
+                        .filter(|p| p.local_file == local_file)
+                        .map_or(i64::MIN, |p| p.check_at),
                 }
             } else {
                 let due = sched.next_fire_at_ms.unwrap_or(i64::MAX);
@@ -1917,6 +1920,7 @@ impl Plan {
                 watch,
                 check_at,
                 idle_target,
+                local_file,
             });
         }
         Ok(entries)
@@ -2084,15 +2088,28 @@ fn evaluate_watch_entry(
     local_fallback: &HashSet<WatchTarget>,
     now: i64,
 ) -> EntryOutcome {
-    let eval = evaluate_watch(
-        store,
-        health,
-        &entry.sched,
-        entry.watch.as_ref(),
-        &mut entry.idle_target,
-        now,
-    );
-    entry.check_at = watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now);
+    let (eval, next_probe) = if let Some(WatchTarget::PathChanged { path }) = &entry.watch {
+        let (eval, local) = file::evaluate(store, &entry.sched, path, now);
+        let next = if local {
+            watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now)
+        } else {
+            now.saturating_add(file::PROBE_INTERVAL_MS)
+        };
+        (eval, next)
+    } else {
+        (
+            evaluate_watch(
+                store,
+                health,
+                &entry.sched,
+                entry.watch.as_ref(),
+                &mut entry.idle_target,
+                now,
+            ),
+            watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now),
+        )
+    };
+    entry.check_at = next_probe;
     let recheck_at = now.saturating_add(LOCAL_WATCH_PROBE_MS);
     let sched = &entry.sched;
     let changed = eval
@@ -2332,28 +2349,7 @@ fn evaluate_watch(
                 WatchEval::fired(sched.watch_baseline.clone(), Some("exited".to_string()))
             }
         }
-        WatchTarget::PathChanged { path } => {
-            let current = probe_path_fingerprint(path);
-            if current.starts_with("probe_error:") {
-                return WatchEval::pending(sched.watch_baseline.clone(), Some(current));
-            }
-            match &sched.watch_baseline {
-                Some(base) => {
-                    if &current != base {
-                        WatchEval::fired(Some(base.clone()), Some(format!("{base}->{current}")))
-                    } else {
-                        WatchEval::pending(Some(base.clone()), Some(current))
-                    }
-                }
-                None => {
-                    if current != "missing" {
-                        WatchEval::fired(Some(current.clone()), Some(current))
-                    } else {
-                        WatchEval::pending(Some(current.clone()), Some(current))
-                    }
-                }
-            }
-        }
+        WatchTarget::PathChanged { .. } => unreachable!("file watches use a runtime-aware probe"),
     }
 }
 
@@ -2382,22 +2378,6 @@ fn probe_process_alive(pid: u32) -> bool {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
-fn probe_path_fingerprint(path: &str) -> String {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mtime_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            format!("exists:{mtime_ms}:{}", meta.len())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
-        Err(e) => format!("probe_error:stat:{:?}", e.kind()),
     }
 }
 
@@ -2495,6 +2475,7 @@ fn evaluate_agent_idle_watch(
     }
 }
 
+mod file;
 mod github;
 mod local;
 mod webhook;

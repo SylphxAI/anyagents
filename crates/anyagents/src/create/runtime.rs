@@ -1279,6 +1279,9 @@ pub(crate) fn configure_agent_runtime_with_options(
             &target_runtime,
             resolved_model.as_deref(),
         )?;
+        if existing.runtime != target_runtime {
+            crate::schedule::schedules_changed(store.data_dir());
+        }
     } else if let Some(ref m) = resolved_model
         && existing.model.as_deref() != Some(m.as_str())
     {

@@ -336,3 +336,34 @@ async fn persistent_webhook_schedules_through_http_and_mcp() {
     assert_eq!(state.store.inbox(&watcher.id, None).unwrap().len(), 6);
     server.abort();
 }
+
+#[tokio::test]
+async fn cloud_file_watch_is_rejected_without_creating_a_schedule() {
+    let dir = crate::test_tempdir();
+    let state = archetype_validation_state(dir.path());
+    let agent = state
+        .store
+        .create_agent(anyagents_core::NewAgent::new("cloud-watch", "claude-cloud"))
+        .unwrap();
+    let principal = Principal::Agent {
+        agent_id: agent.id.clone(),
+        name: agent.name,
+    };
+    let request = serde_json::from_value(serde_json::json!({
+        "action": "create", "watch": "file:signal", "prompt": "report the change"
+    }))
+    .unwrap();
+    let error = handle_schedule_action(principal, state.clone(), request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("no persistent filesystem"));
+    assert!(error.message.contains("event/webhook"));
+    assert!(
+        state
+            .store
+            .list_schedules(Some(&agent.id), false)
+            .unwrap()
+            .is_empty()
+    );
+}
