@@ -272,7 +272,60 @@ fn load_legacy_media(store: &Store, name: &str) -> Result<Option<Vec<u8>>, Strin
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::sandbox_providers::providers::{EnsureSandboxRequest, LocalHostProvider};
+    use crate::sandbox_providers::providers::{
+        EnsureSandboxRequest, ExecOutput, LocalHostProvider, ProviderHealth, ProviderKind,
+        SandboxCapabilities,
+    };
+
+    // The Coordinator supplies a guest workdir. This fixture executes on the
+    // test host, so keep that workdir inside the disposable provider volume.
+    struct FixtureVolume(LocalHostProvider);
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for FixtureVolume {
+        fn kind(&self) -> ProviderKind {
+            self.0.kind()
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            self.0.capabilities()
+        }
+
+        async fn ensure(&self, req: &EnsureSandboxRequest) -> Result<SandboxHandle, String> {
+            let mut req = req.clone();
+            req.workdir = None;
+            self.0.ensure(&req).await
+        }
+
+        async fn exec(
+            &self,
+            handle: &SandboxHandle,
+            req: &ExecRequest,
+        ) -> Result<ExecOutput, String> {
+            self.0.exec(handle, req).await
+        }
+
+        async fn sync_bundle_tar(
+            &self,
+            handle: &SandboxHandle,
+            dest_dir: &str,
+            tar_gz: &[u8],
+        ) -> Result<(), String> {
+            self.0.sync_bundle_tar(handle, dest_dir, tar_gz).await
+        }
+
+        async fn release(&self, handle: &SandboxHandle) -> Result<(), String> {
+            self.0.release(handle).await
+        }
+
+        async fn destroy(&self, handle: &SandboxHandle) -> Result<(), String> {
+            self.0.destroy(handle).await
+        }
+
+        async fn health(&self) -> Result<ProviderHealth, String> {
+            self.0.health().await
+        }
+    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -285,7 +338,7 @@ mod tests {
             .create_agent(anyagents_core::NewAgent::new("worker", "claude-code"))
             .unwrap();
         let provider: Arc<dyn SandboxProvider> =
-            Arc::new(LocalHostProvider::with_root(volume.path()));
+            Arc::new(FixtureVolume(LocalHostProvider::with_root(volume.path())));
         let warm = provider
             .ensure(&EnsureSandboxRequest::for_agent(agent.id.as_str()))
             .await
@@ -316,6 +369,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ensured.handle.state_dir, warm.state_dir);
+        assert_eq!(ensured.handle.workdir, warm.workdir);
+        assert!(std::path::Path::new(&ensured.handle.workdir).starts_with(volume.path()));
         assert_eq!(std::fs::read(cached.join("photo.jpg")).unwrap(), b"photo");
         let local = cached.join("photo.jpg");
         assert_eq!(
