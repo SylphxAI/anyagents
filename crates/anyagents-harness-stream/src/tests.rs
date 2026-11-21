@@ -3577,6 +3577,57 @@ time.sleep(30)
     }
 }
 
+// The result can arrive while the successful pipe write is returning to its
+// owner. The result and full write together prove delivery, not either alone.
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_result_before_write_bookkeeping_still_proves_delivery() {
+    let mut harness = pipe_harness(
+        r#"
+import sys
+sys.stdin.readline()
+print('{"type":"result","response":"ok"}', flush=True)
+sys.stdin.read()
+"#,
+    );
+    await_receipt_before_post_write(&mut harness, |state| state.finished.contains("early"));
+    let message = plain_message("early");
+    let line = super::message_line(&harness.spec, &message);
+    assert_eq!(
+        harness.deliver(&message, &line).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: true
+        }
+    );
+    assert_eq!(harness.written_ids(), ["early"]);
+}
+
+#[test]
+fn one_result_finishes_only_one_queued_followup() {
+    let mut state = super::State::new(None);
+    state.open.push("first".into());
+    state.followups.extend(["second".into(), "third".into()]);
+    state
+        .seen
+        .extend(["first".into(), "second".into(), "third".into()]);
+
+    for (finished, next) in [
+        ("first", Some("second")),
+        ("second", Some("third")),
+        ("third", None),
+    ] {
+        if let Some(next) = next {
+            assert!(!state.finished.contains(next));
+        }
+        super::finish_open(&mut state, |_| anyagents_harness::TurnUsage::default());
+        assert!(state.finished.contains(finished));
+        assert_eq!(state.open, next.into_iter().collect::<Vec<_>>());
+        if let Some(next) = next {
+            assert!(!state.finished.contains(next));
+        }
+    }
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn agy_write_without_progress_is_in_flight_not_taken() {

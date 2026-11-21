@@ -9,12 +9,14 @@
 //! written again.
 
 mod rpc;
+mod turn;
 mod usage;
+use turn::finish_open;
 use usage::{CumulativeUsage, reported_usage, turn_usage};
 
 pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -386,7 +388,7 @@ struct State {
     rejected: HashMap<String, String>,
     written: Vec<String>,
     open: Vec<String>,
-    followups: Vec<String>,
+    followups: VecDeque<String>,
     finished: HashSet<String>,
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
@@ -1133,7 +1135,7 @@ impl StreamHarness {
                             state.open.push(id.to_string());
                         }
                     } else {
-                        state.followups.push(id.to_string());
+                        state.followups.push_back(id.to_string());
                     }
                     self.pending = Some(PendingWrite {
                         id: id.to_string(),
@@ -1928,7 +1930,13 @@ impl State {
                 }),
                 _ => None,
             },
-            _ if agy => self.agy_taken.contains(id).then(taken),
+            // A result can beat the writer's `seen` update. Their join is
+            // evidence either way; a quiet timeout is not a result.
+            _ if agy => (self.agy_taken.contains(id)
+                || (self.seen.contains(id)
+                    && self.finished.contains(id)
+                    && !self.finished_quiet.contains(id)))
+            .then(taken),
             _ => self.seen.contains(id).then(taken),
         }
     }
@@ -2017,7 +2025,7 @@ impl State {
             rejected: HashMap::new(),
             written: Vec::new(),
             open: Vec::new(),
-            followups: Vec::new(),
+            followups: VecDeque::new(),
             turn_user_inputs: 0,
             last_turn_step_type: None,
             idle_since: None,
@@ -2403,7 +2411,7 @@ fn read_stdout(
                 }
             } else if let Some(ref synth_err) = synthetic_401 {
                 let mut rejected_ids = std::mem::take(&mut state.open);
-                rejected_ids.append(&mut state.followups);
+                rejected_ids.extend(state.followups.drain(..));
                 for id in rejected_ids {
                     state.seen.remove(&id);
                     state.acknowledged.remove(&id);
@@ -2718,41 +2726,6 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.agy_turn_has_work = false;
     state.finished.insert(id.to_string());
     state.text = text;
-}
-
-/// The turn ended: its inputs are finished, the first carrying its usage. An
-/// Antigravity turn that closed took the line that opened it; a message its
-/// cascade's mailbox still holds was not taken by it and finishes nothing.
-fn finish_open(state: &mut State, usage: impl FnOnce(&mut State) -> TurnUsage) {
-    state.turn_user_inputs = 0;
-    state.last_turn_step_type = None;
-    state.idle_since = None;
-    state.agy_turn_has_work = false;
-    if state.open.is_empty() {
-        return;
-    }
-    let mut usage = Some(usage);
-    for id in std::mem::take(&mut state.open) {
-        if state.agy_queued.iter().any(|queued| queued.id == id)
-            || (state
-                .agy_steer
-                .as_ref()
-                .is_some_and(|steer| steer.id == id && steer.outcome.is_none())
-                && !state.agy_taken.contains(&id))
-        {
-            continue;
-        }
-        if state.seen.contains(&id) {
-            state.agy_taken.insert(id.clone());
-        }
-        state.finished.insert(id.clone());
-        let item_usage = usage.take().map(|usage| usage(state)).unwrap_or_default();
-        state.usages.push((id, item_usage));
-    }
-    if !state.followups.is_empty() {
-        state.turns_started += 1;
-        state.open.append(&mut state.followups);
-    }
 }
 
 /// What a `ready` frame says about the peer: its protocol and capabilities.
