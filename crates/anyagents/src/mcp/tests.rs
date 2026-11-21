@@ -1357,7 +1357,7 @@ mod tool_server_runtime_tests {
     }
 
     #[tokio::test]
-    async fn agents_list_include_descendants_traverses_three_generations_and_respects_limit() {
+    async fn agents_list_requests_the_server_filtered_tree_without_an_early_row_cap() {
         use serde_json::json;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
@@ -1368,7 +1368,6 @@ mod tool_server_runtime_tests {
         let grandchild_id = AgentId::generate();
 
         let mut population = vec![
-            agent_view_with_parent(root_id.as_str(), "root", "running", "idle", None),
             agent_view_with_parent(
                 child_id.as_str(),
                 "child-lead",
@@ -1390,7 +1389,6 @@ mod tool_server_runtime_tests {
                 "idle",
                 Some(grandchild_id.as_str()),
             ),
-            agent_view_with_parent("agt_unrelated", "other-root", "running", "idle", None),
         ];
         // Add 35 more direct children so total descendants = 38 (> old 18-row budget cap).
         for idx in 0..35 {
@@ -1402,14 +1400,9 @@ mod tool_server_runtime_tests {
                 Some(root_id.as_str()),
             ));
         }
-        let body = serde_json::to_vec(&AgentsResponse {
-            archived_count: 0,
-            agents: population,
-            gateway: None,
-        })
-        .unwrap();
+        let requested_root = root_id.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for descendants in [true, false] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut req = Vec::new();
                 loop {
@@ -1418,6 +1411,27 @@ mod tool_server_runtime_tests {
                         break;
                     }
                 }
+                let req = std::str::from_utf8(&req).unwrap();
+                assert_eq!(
+                    req.lines().next().unwrap(),
+                    format!(
+                        "GET /v1/agents?children_of={requested_root}&include_descendants={descendants} HTTP/1.1"
+                    )
+                );
+                // The coordinator supplies the already filtered live population.
+                let agents = population
+                    .iter()
+                    .filter(|row| {
+                        descendants || row.parent.as_deref() == Some(requested_root.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                let body = serde_json::to_vec(&AgentsResponse {
+                    archived_count: 0,
+                    agents,
+                    gateway: None,
+                })
+                .unwrap();
                 let hdr = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1454,7 +1468,6 @@ mod tool_server_runtime_tests {
         assert!(rows.iter().any(|r| r["name"] == "child-lead"));
         assert!(rows.iter().any(|r| r["name"] == "grandchild-worker"));
         assert!(rows.iter().any(|r| r["name"] == "great-grandchild"));
-        assert!(!rows.iter().any(|r| r["name"] == "other-root"));
 
         // Without `include_descendants`, only the 36 direct children appear.
         let direct_only = mcp
