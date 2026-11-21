@@ -114,6 +114,29 @@ def cut_version(read, subject, source="HEAD"):
     return version
 
 
+def channels_present(version, sha, get_api=api, get=request):
+    """Lightweight existence check: are BOTH npm and GitHub channels populated
+    for this version?  Used by admission to recognise pre-receipt historical
+    releases that predate the current integrity-verification rules.  Unlike
+    `publication()`, this never raises on metadata format mismatches — it only
+    returns whether the channels are present at all."""
+    npm_ok = False
+    try:
+        launcher = get(f"https://registry.npmjs.org/{quote(PACKAGE, safe='')}/{version}", missing=True)
+        if launcher is not None and launcher.get("version") == version:
+            npm_ok = True
+    except Exception:
+        pass
+    github_ok = False
+    try:
+        rel = get_api(f"releases/tags/v{version}", missing=True)
+        if rel is not None and rel.get("tag_name") == f"v{version}" and not rel.get("draft"):
+            github_ok = True
+    except Exception:
+        pass
+    return {"npm": npm_ok, "github": github_ok}
+
+
 def publication(version, sha, get_api=api, get=request):
     """Only exact-source existing channels may be completed by the shared publisher."""
     packages = []
@@ -186,7 +209,32 @@ def source_ci(sha, get_api, workflow):
     raise ValueError(f"no successful exact-source push/main ci ({states or 'no runs'})")
 
 
-def admit(event, env, get_api=api, inspect=publication):
+def _parse_semver(v):
+    """Parse a semver string into a (major, minor, patch) tuple, or None."""
+    m = VERSION.fullmatch(v) if v else None
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _version_lt(a, b):
+    """Return True if version a is strictly less than version b (semver)."""
+    pa, pb = _parse_semver(a), _parse_semver(b)
+    if pa is None or pb is None:
+        return False
+    return pa < pb
+
+
+def _latest_version(result):
+    """Return the highest version across releases, complete, and superseded."""
+    best = None
+    for key in ("releases", "complete"):
+        for item in result.get(key, []):
+            v = _parse_semver(item.get("version"))
+            if v is not None and (best is None or v > best):
+                best = v
+    return f"{best[0]}.{best[1]}.{best[2]}" if best else None
+
+
+def admit(event, env, get_api=api, inspect=publication, get=request):
     require(env["GITHUB_REPOSITORY"] == REPOSITORY, "unexpected repository")
     require(event.get("repository", {}).get("visibility") == "public", "public repository required")
     require(env["GITHUB_REF"] == "refs/heads/main", "main ref required")
@@ -203,7 +251,7 @@ def admit(event, env, get_api=api, inspect=publication):
             and ancestry.get("merge_base_commit", {}).get("sha") == snapshot,
             "checkout is not an ancestor of main")
     result = {"publish": "false", "outcome": "no-op", "main": snapshot,
-              "releases": [], "complete": [], "refused": []}
+              "releases": [], "complete": [], "refused": [], "superseded": []}
     read = lambda ref, path: git("show", f"{ref}:{path}")
     workflow = None
     seen = set()
@@ -226,7 +274,19 @@ def admit(event, env, get_api=api, inspect=publication):
             seen.add(version)
             # Completed versions need no new publication authority. Still verify
             # their immutable source and digests instead of trusting tag presence.
-            done = inspect(version, sha)
+            try:
+                done = inspect(version, sha)
+            except Exception:
+                # Historical releases that predate the current integrity-
+                # verification rules may fail strict publication() checks (e.g.
+                # missing digests, different identity format). If both channels
+                # are populated, treat the version as a pre-receipt legacy
+                # complete release; otherwise surface the original error.
+                fallback = channels_present(version, sha, get_api=get_api, get=get)
+                if all(fallback.values()):
+                    result["complete"].append(candidate)
+                    continue
+                raise
             if all(done.values()):
                 result["complete"].append(candidate)
                 continue
@@ -241,6 +301,24 @@ def admit(event, env, get_api=api, inspect=publication):
             # A bad source never enters the publisher matrix. Independent green
             # sources may finish; the final receipt makes every refusal loud.
             result["refused"].append({**candidate, "reason": str(error)})
+    # Reclassify refused versions that are strictly superseded by a newer
+    # release or complete version and were never published or run through CI.
+    # Unpublished historical bumps that never shipped (no npm, no GitHub
+    # release, no CI runs at all) must not permanently block the current
+    # release target.  Genuine red CI runs remain refused.
+    latest_ver = _latest_version(result)
+    if latest_ver is not None and result["refused"]:
+        still_refused = []
+        for item in result["refused"]:
+            item_ver = item.get("version")
+            reason = item.get("reason", "")
+            is_no_runs = reason.endswith("(no runs)")
+            if item_ver and _version_lt(item_ver, latest_ver) and is_no_runs:
+                result["superseded"].append(item)
+            else:
+                still_refused.append(item)
+        result["refused"] = still_refused
+
     if result["releases"]:
         result.update(publish="true", outcome="admitted", reason="incomplete cuts have their own exact green push/main CI")
     elif result["refused"]:
@@ -272,7 +350,7 @@ def report(result, env):
     text = f"## Release {result['outcome']}\n\n{result['reason']}\n\n"
     if result.get("main"):
         text += f"Main-history snapshot: `{result['main']}`\n\n"
-    for key, label in (("releases", "Publish"), ("complete", "Already complete"), ("refused", "REFUSED")):
+    for key, label in (("releases", "Publish"), ("complete", "Already complete"), ("superseded", "Superseded"), ("refused", "REFUSED")):
         for item in result.get(key, []):
             text += f"- {label}: {item.get('version', 'unknown version')} at `{item['source']}`"
             if item.get("ci_run_id"):

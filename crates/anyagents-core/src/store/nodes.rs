@@ -19,11 +19,18 @@ use crate::stateless::constant_time_eq;
 pub const NODE_TOKEN_PREFIX: &str = "ndt_";
 const NODE_TOKEN_BYTES: usize = 32;
 
-/// Slice 1A runtime capability implemented end-to-end.
+/// Runtime capability implemented end-to-end since Slice 1A.
 pub const NODE_CAPABILITY_EXEC: &str = "exec";
+/// Egress-proxy capability (Slice 1B).
+pub const NODE_CAPABILITY_EXIT: &str = "exit";
+/// Scoped files capability (Slice 1B).
+pub const NODE_CAPABILITY_FILES: &str = "files";
+
+/// Capabilities with full end-to-end runtime dispatch.
+pub const RUNTIME_CAPABILITIES: &[&str] = &["exec", "exit", "files"];
 
 /// Extensible capability names accepted by `nodes.capabilities_json` and
-/// `node_grants.capability`. Slice 1A runtime executes strictly `exec`.
+/// `node_grants.capability`.
 pub const KNOWN_NODE_CAPABILITIES: &[&str] = &["exec", "exit", "files", "browser", "screen", "gpu"];
 
 /// Lifecycle state of an enrolled edge node.
@@ -741,9 +748,10 @@ impl Store {
         capability: &str,
     ) -> Result<NodeRecord, Error> {
         let cap = validate_node_capability(capability)?;
-        if cap != NODE_CAPABILITY_EXEC {
+        if !RUNTIME_CAPABILITIES.contains(&cap.as_str()) {
             return Err(Error::PermissionDenied(format!(
-                "capability `{cap}` is not enabled on node runtime (Slice 1A supports `exec` only)"
+                "capability `{cap}` is not enabled in node runtime (supported: {})",
+                RUNTIME_CAPABILITIES.join(", ")
             )));
         }
         let conn = self.read_conn();
@@ -892,10 +900,15 @@ mod tests {
             .check_node_capability_authorized(&exit_only.node.id, Some(&alpha.id), "exec")
             .unwrap_err();
         assert!(err.to_string().contains("does not advertise capability"));
+        // `exit` is now a runtime capability (Slice 1B), but the node has no
+        // grant for alpha → still denied on grant check.
         let err = store
             .check_node_capability_authorized(&exit_only.node.id, Some(&alpha.id), "exit")
             .unwrap_err();
-        assert!(err.to_string().contains("Slice 1A supports `exec` only"));
+        assert!(
+            err.to_string().contains("no active `exit` grant"),
+            "exit should be denied for lack of grant, got: {err}"
+        );
 
         // Offline node rejects exec even with grant; granting + online admits.
         let grant = store

@@ -170,8 +170,41 @@ class AdmissionTests(unittest.TestCase):
         done = (version, sha) in self.published
         return {"npm": done, "github": done}
 
+    def npm_get(self, url, **kwargs):
+        """Simulated npm registry + asset fetch for channels_present / publication."""
+        if url.startswith("https://registry.npmjs.org/"):
+            # Lightweight presence check: return a matching package if published.
+            for (ver, sha) in self.published:
+                if f"/{ver}" in url:
+                    name = url.split("/")[-2].replace("%40", "@").replace("%2F", "/")
+                    return {"name": name, "version": ver, "gitHead": sha,
+                            "dist": {"integrity": "sha512-ok", "tarball": "https://registry.npmjs.org/file"}}
+            return None
+        return None
+
+    def api_with_releases(self, path, **kwargs):
+        """Extended API mock that also handles releases/tags and git/ref/tags queries."""
+        if path.startswith("releases/tags/v"):
+            version = path.removeprefix("releases/tags/v")
+            for (ver, sha) in self.published:
+                if ver == version:
+                    return {"tag_name": f"v{version}", "draft": False,
+                            "target_commitish": sha, "assets": []}
+            if kwargs.get("missing"):
+                return None
+            return None
+        if path.startswith("git/ref/tags/v"):
+            version = path.removeprefix("git/ref/tags/v")
+            for (ver, sha) in self.published:
+                if ver == version:
+                    return {"object": {"type": "commit", "sha": sha}}
+            if kwargs.get("missing"):
+                return None
+            return None
+        return self.api(path)
+
     def admit(self):
-        return release.admit(self.event, self.env, self.api, self.inspect)
+        return release.admit(self.event, self.env, self.api, self.inspect, get=self.npm_get)
 
     def test_new_cut_admits_and_complete_release_is_explicit_noop(self):
         result = self.admit()
@@ -282,14 +315,85 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn(feature, [item["source"] for item in result["releases"]])
 
     def test_existing_provenance_or_digest_mismatch_is_a_loud_refusal(self):
+        """When inspect raises and channels are NOT present, the version is refused."""
         def mismatch(*args):
             raise ValueError("GitHub identity digest mismatch")
-        result = release.admit(self.event, self.env, self.api, mismatch)
+        # channels_present will check releases/tags and npm, but nothing is published
+        # so it returns False for both, and the version is refused as before.
+        result = release.admit(self.event, self.env, self.api_with_releases, mismatch, get=self.npm_get)
         self.assertEqual(result["releases"], [])
         self.assertIn("digest mismatch", result["refused"][0]["reason"])
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "skipped",
                              "ADMISSION": json.dumps(result)}, self.inspect)
+
+    def test_pre_receipt_historical_release_does_not_block_new_cut(self):
+        """Historical releases that predate exact-source receipts have published
+        channels but may fail strict publication() integrity checks. They must
+        not block admission of a newer release version."""
+        # Mark v0.1.2 as published (channels exist) but make inspect raise.
+        self.published.add(("0.1.2", self.sha))
+        def strict_mismatch(version, sha):
+            if version == "0.1.2":
+                raise ValueError("GitHub asset digest missing")
+            return self.inspect(version, sha)
+        # Cut a new v0.1.3 that has proper CI.
+        second = self.advance("0.1.3", "release: v0.1.3")
+        result = release.admit(self.event, self.env, self.api_with_releases, strict_mismatch, get=self.npm_get)
+        # v0.1.2 should be treated as a legacy complete (channels present),
+        # NOT as refused.
+        self.assertEqual(result["publish"], "true")
+        self.assertEqual([item["source"] for item in result["releases"]], [second])
+        self.assertEqual(result["complete"], [{"version": "0.1.2", "source": self.sha}])
+        self.assertEqual(result["refused"], [])
+
+    def test_superseded_unpublished_versions_without_ci_do_not_block_new_cut(self):
+        """Reproduce run 44927747660: v0.1.7, v0.1.8, v0.1.9 were version bumps
+        on main that were never published (npm=False, github=False) and have no
+        CI runs at all. v0.1.10 has a green push/main CI run. The older three
+        must be superseded (not refused) so v0.1.10 can proceed."""
+        # Mark v0.1.2 as already published so it doesn't clutter releases.
+        self.published.add(("0.1.2", self.sha))
+        # Create v0.1.7, v0.1.8, v0.1.9 bumps with NO CI runs and NO publications.
+        sha_7 = self.advance("0.1.7", "release: v0.1.7")
+        sha_8 = self.advance("0.1.8", "release: v0.1.8")
+        sha_9 = self.advance("0.1.9", "release: v0.1.9")
+        sha_10 = self.advance("0.1.10", "release: v0.1.10")
+        # v0.1.7/8/9 have no CI runs at all.
+        for s in (sha_7, sha_8, sha_9):
+            self.runs[s] = []
+        result = self.admit()
+        # v0.1.10 should be admitted (green CI).
+        self.assertEqual(result["publish"], "true")
+        self.assertEqual([item["source"] for item in result["releases"]], [sha_10])
+        # v0.1.7/8/9 should be superseded, NOT refused.
+        superseded_versions = sorted(item["version"] for item in result.get("superseded", []))
+        self.assertEqual(superseded_versions, ["0.1.7", "0.1.8", "0.1.9"])
+        self.assertEqual(result["refused"], [])
+
+    def test_superseded_does_not_rescue_red_ci_runs(self):
+        """A version with a genuinely FAILED CI run should remain refused
+        even when a newer version exists."""
+        sha_3 = self.advance("0.1.3", "release: v0.1.3")
+        # v0.1.2 has a failed (not absent) CI run.
+        self.runs[self.sha][0]["conclusion"] = "failure"
+        result = self.admit()
+        # v0.1.3 is admitted.
+        self.assertEqual([item["source"] for item in result["releases"]], [sha_3])
+        # v0.1.2 is refused (failed CI), NOT superseded.
+        self.assertEqual([item["source"] for item in result["refused"]], [self.sha])
+        self.assertEqual(result.get("superseded", []), [])
+
+    def test_current_target_without_ci_still_fails_closed(self):
+        """The latest version on main (the actual release target) must still
+        fail closed if it has no CI, even if older versions were superseded."""
+        sha_7 = self.advance("0.1.7", "release: v0.1.7")
+        # v0.1.7 is the latest with no CI — should fail.
+        self.runs[sha_7] = []
+        result = self.admit()
+        # v0.1.7 is NOT superseded because it's the latest.
+        self.assertEqual([item["version"] for item in result["refused"]], ["0.1.7"])
+        self.assertEqual(result.get("superseded", []), [])
 
     def test_complete_legacy_cut_is_noop_but_cannot_authorize_new_publication(self):
         release.git("commit", "--amend", "-qm", "chore: release AnyAgents 0.1.2")

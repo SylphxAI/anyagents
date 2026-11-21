@@ -1,12 +1,13 @@
 //! Coordinator REST API and outbound WebSocket reverse-tunnel for native
 //! Remote User-Device / Edge Nodes (`anyagents node`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyagents_core::masking::mask_known_secrets;
 use anyagents_core::{
-    AgentId, Error, NODE_CAPABILITY_EXEC, NewNodeAuditEvent, NewNodePair, NodeId, NodeRecord,
-    is_node_token, now_ms,
+    AgentId, Error, NODE_CAPABILITY_EXEC, NODE_CAPABILITY_EXIT, NODE_CAPABILITY_FILES,
+    NewNodeAuditEvent, NewNodePair, NodeId, NodeRecord, is_node_token, now_ms,
 };
 use axum::extract::{FromRequestParts, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, request::Parts};
@@ -55,6 +56,10 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/v1/nodes/{id}/audit", get(list_audit_route))
         .route("/v1/nodes/{id}/exec", post(exec_node_route))
+        .route("/v1/nodes/{id}/files/list", post(files_list_route))
+        .route("/v1/nodes/{id}/files/read", post(files_read_route))
+        .route("/v1/nodes/{id}/files/write", post(files_write_route))
+        .route("/v1/nodes/{id}/egress", get(egress_stream_ws_route))
 }
 
 struct PairActor {
@@ -675,6 +680,423 @@ async fn exec_node_route(
             Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why))
         }
     }
+}
+
+// ── Scoped files capability routes ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FilesPathRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct FilesWriteRequest {
+    path: String,
+    data_b64: String,
+}
+
+async fn files_list_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesPathRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry.dispatch_files_list(&node_id, req.path).await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_list".into(),
+                summary: mask_known_secrets(&format!("files_list: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(entries) => Ok(Json(json!({ "entries": entries }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
+    }
+}
+
+async fn files_read_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesPathRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry.dispatch_files_read(&node_id, req.path).await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_read".into(),
+                summary: mask_known_secrets(&format!("files_read: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(data_b64) => Ok(Json(json!({ "data_b64": data_b64 }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
+    }
+}
+
+async fn files_write_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesWriteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry
+        .dispatch_files_write(&node_id, req.path, req.data_b64)
+        .await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_write".into(),
+                summary: mask_known_secrets(&format!("files_write: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(()) => Ok(Json(json!({ "ok": true }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
+    }
+}
+
+/// WebSocket endpoint for multiplexed egress streams through exit-capable nodes.
+///
+/// The client sends JSON frames:
+///   `{"type":"open","stream_id":"...","host":"...","port":443}`
+///   `{"type":"data","stream_id":"...","data_b64":"..."}`
+///   `{"type":"close","stream_id":"..."}`
+/// and receives:
+///   `{"type":"opened","stream_id":"..."}`
+///   `{"type":"data","stream_id":"...","data_b64":"..."}`
+///   `{"type":"error","stream_id":"...","error":"..."}`
+///   `{"type":"closed","stream_id":"...","bytes_tx":0,"bytes_rx":0}`
+async fn egress_stream_ws_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_EXIT)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = tunnel::registry_for_store(&state.store);
+    if !registry.is_connected(&node_id).await {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is not connected".to_string(),
+        ));
+    }
+
+    let store = Arc::clone(&state.store);
+    Ok(ws
+        .max_frame_size(MAX_TUNNEL_FRAME_BYTES)
+        .on_upgrade(move |ws| run_egress_ws(ws, node_id, actor_agent_id, registry, store)))
+}
+
+async fn run_egress_ws(
+    ws: axum::extract::ws::WebSocket,
+    node_id: NodeId,
+    actor_agent_id: Option<AgentId>,
+    registry: Arc<tunnel::NodeRegistry>,
+    store: Arc<anyagents_core::Store>,
+) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt};
+
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut stream_receivers: HashMap<
+        String,
+        tokio::sync::mpsc::Receiver<tunnel::StreamTunnelEvent>,
+    > = HashMap::new();
+    let mut active_streams: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    loop {
+        // Poll both: client messages and stream events from the node.
+        let next_client = ws_rx.next();
+        // Fan-out check for all active stream receivers.
+        let stream_event = poll_any_stream(&mut stream_receivers);
+
+        tokio::select! {
+            msg = next_client => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                            let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
+                            match frame_type {
+                                "open" => {
+                                    let stream_id = frame.get("stream_id").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let host = frame.get("host").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let port = frame.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                                    if stream_id.is_empty() || host.is_empty() || port == 0 {
+                                        let _ = ws_tx.send(Message::Text(
+                                            serde_json::to_string(&json!({
+                                                "type": "error", "stream_id": stream_id,
+                                                "error": "missing stream_id, host, or port"
+                                            })).unwrap_or_default().into()
+                                        )).await;
+                                        continue;
+                                    }
+                                    // Audit: stream open
+                                    let started_at_ms = now_ms();
+                                    let audit_store = Arc::clone(&store);
+                                    let nid_a = node_id.clone();
+                                    let agent_a = actor_agent_id.as_ref().map(|id| id.to_string());
+                                    let summary = format!("egress open: {host}:{port}");
+                                    drop(tokio::task::spawn_blocking(move || {
+                                        let _ = audit_store.record_node_audit_event(NewNodeAuditEvent {
+                                            node_id: nid_a,
+                                            agent_id: agent_a,
+                                            capability: NODE_CAPABILITY_EXIT.into(),
+                                            action: "stream_open".into(),
+                                            summary,
+                                            exit_code: None,
+                                            outcome: "dispatched".into(),
+                                            started_at_ms,
+                                            finished_at_ms: None,
+                                        });
+                                    }));
+                                    match registry.dispatch_stream_open(&node_id, stream_id.clone(), host, port).await {
+                                        Ok(rx) => {
+                                            stream_receivers.insert(stream_id.clone(), rx);
+                                            active_streams.insert(stream_id);
+                                        }
+                                        Err(err) => {
+                                            let _ = ws_tx.send(Message::Text(
+                                                serde_json::to_string(&json!({
+                                                    "type": "error", "stream_id": stream_id, "error": err
+                                                })).unwrap_or_default().into()
+                                            )).await;
+                                        }
+                                    }
+                                }
+                                "data" => {
+                                    let stream_id = frame.get("stream_id").and_then(Value::as_str).unwrap_or("");
+                                    let data_b64 = frame.get("data_b64").and_then(Value::as_str).unwrap_or("").to_string();
+                                    if active_streams.contains(stream_id) {
+                                        let _ = registry.dispatch_stream_data(&node_id, stream_id, data_b64).await;
+                                    }
+                                }
+                                "close" => {
+                                    let stream_id = frame.get("stream_id").and_then(Value::as_str).unwrap_or("").to_string();
+                                    active_streams.remove(&stream_id);
+                                    stream_receivers.remove(&stream_id);
+                                    let _ = registry.dispatch_stream_close(&node_id, &stream_id).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            event = stream_event => {
+                if let Some((stream_id, event)) = event {
+                    let msg = match event {
+                        tunnel::StreamTunnelEvent::Opened => {
+                            json!({"type": "opened", "stream_id": stream_id})
+                        }
+                        tunnel::StreamTunnelEvent::Data { data_b64 } => {
+                            json!({"type": "data", "stream_id": stream_id, "data_b64": data_b64})
+                        }
+                        tunnel::StreamTunnelEvent::Error { error } => {
+                            active_streams.remove(&stream_id);
+                            stream_receivers.remove(&stream_id);
+                            // Audit: stream denied/error
+                            let audit_store = Arc::clone(&store);
+                            let nid_a = node_id.clone();
+                            let agent_a = actor_agent_id.as_ref().map(|id| id.to_string());
+                            let err_summary = format!("egress denied: {error}");
+                            let ts = now_ms();
+                            drop(tokio::task::spawn_blocking(move || {
+                                let _ = audit_store.record_node_audit_event(NewNodeAuditEvent {
+                                    node_id: nid_a,
+                                    agent_id: agent_a,
+                                    capability: NODE_CAPABILITY_EXIT.into(),
+                                    action: "stream_denied".into(),
+                                    summary: err_summary,
+                                    exit_code: None,
+                                    outcome: "denied".into(),
+                                    started_at_ms: ts,
+                                    finished_at_ms: Some(ts),
+                                });
+                            }));
+                            json!({"type": "error", "stream_id": stream_id, "error": error})
+                        }
+                        tunnel::StreamTunnelEvent::Closed { bytes_tx, bytes_rx } => {
+                            active_streams.remove(&stream_id);
+                            stream_receivers.remove(&stream_id);
+                            // Audit: stream closed
+                            let audit_store = Arc::clone(&store);
+                            let nid_a = node_id.clone();
+                            let agent_a = actor_agent_id.as_ref().map(|id| id.to_string());
+                            let close_summary = format!("egress closed: tx={bytes_tx} rx={bytes_rx}");
+                            let ts = now_ms();
+                            drop(tokio::task::spawn_blocking(move || {
+                                let _ = audit_store.record_node_audit_event(NewNodeAuditEvent {
+                                    node_id: nid_a,
+                                    agent_id: agent_a,
+                                    capability: NODE_CAPABILITY_EXIT.into(),
+                                    action: "stream_close".into(),
+                                    summary: close_summary,
+                                    exit_code: None,
+                                    outcome: "ok".into(),
+                                    started_at_ms: ts,
+                                    finished_at_ms: Some(ts),
+                                });
+                            }));
+                            json!({"type": "closed", "stream_id": stream_id, "bytes_tx": bytes_tx, "bytes_rx": bytes_rx})
+                        }
+                    };
+                    if ws_tx.send(Message::Text(serde_json::to_string(&msg).unwrap_or_default().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up remaining streams.
+    for stream_id in active_streams {
+        let _ = registry.dispatch_stream_close(&node_id, &stream_id).await;
+    }
+}
+
+async fn poll_any_stream(
+    receivers: &mut HashMap<String, tokio::sync::mpsc::Receiver<tunnel::StreamTunnelEvent>>,
+) -> Option<(String, tunnel::StreamTunnelEvent)> {
+    if receivers.is_empty() {
+        std::future::pending::<()>().await;
+        return None;
+    }
+    // Simple poll: try each receiver.
+    for (id, rx) in receivers.iter_mut() {
+        if let Ok(event) = rx.try_recv() {
+            return Some((id.clone(), event));
+        }
+    }
+    // If none ready, yield and retry.
+    tokio::task::yield_now().await;
+    for (id, rx) in receivers.iter_mut() {
+        if let Ok(event) = rx.try_recv() {
+            return Some((id.clone(), event));
+        }
+    }
+    std::future::pending::<()>().await;
+    None
 }
 
 fn format_command_summary(command: &str, args: &[String], cwd: Option<&str>) -> String {

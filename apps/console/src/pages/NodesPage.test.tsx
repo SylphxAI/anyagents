@@ -19,7 +19,7 @@ const sampleNode: NodeRecord = {
   hostname: 'laptop.local',
   os: 'darwin',
   arch: 'aarch64',
-  capabilities: ['exec'],
+  capabilities: ['exec', 'exit', 'files'],
   status: 'online',
   last_heartbeat_at_ms: Date.now() - 5000,
   created_at_ms: Date.now() - 60000,
@@ -69,7 +69,7 @@ afterEach(() => {
 });
 
 describe('NodesPage', () => {
-  it('renders nodes, manages capability grants, and triggers pause/resume kill-switch', async () => {
+  it('renders nodes with capabilities, manages grants, and triggers pause/resume', async () => {
     let currentStatus: NodeRecord['status'] = 'online';
     let grants: NodeGrant[] = [sampleGrant];
 
@@ -117,6 +117,10 @@ describe('NodesPage', () => {
     open(fetchMock);
     await expectText('dev-laptop');
     await expectText('darwin/aarch64');
+    // Capabilities are shown as pills.
+    await expectText('exec');
+    await expectText('exit');
+    await expectText('files');
     await expectText('Alpha');
 
     // Trigger 1-click Pause kill-switch.

@@ -20,6 +20,9 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use url::Url;
 
+use crate::node_cli::egress::EgressManager;
+use crate::node_cli::files::FilesJail;
+use crate::node_cli::ssrf_guard::EgressPolicy;
 use crate::node_cli::{StoredNodeConfig, control_socket_path, load_node_config_at};
 use crate::node_protocol::{
     KEEPALIVE_INTERVAL, MAX_EXEC_OUTPUT_BYTES, MAX_TUNNEL_FRAME_BYTES, NodeClientFrame,
@@ -61,6 +64,8 @@ pub(crate) struct RunnerState {
     pub(crate) shutdown_tx: watch::Sender<bool>,
     active_children: Mutex<HashMap<String, ActiveChild>>,
     system_info: SystemInfo,
+    pub(crate) egress: Option<EgressManager>,
+    pub(crate) files_jail: FilesJail,
 }
 
 #[derive(Clone)]
@@ -72,8 +77,14 @@ struct SystemInfo {
 }
 
 impl RunnerState {
-    fn new(node_id: String, capabilities: Vec<String>) -> (Arc<Self>, watch::Receiver<bool>) {
+    fn new(
+        node_id: String,
+        capabilities: Vec<String>,
+        egress_policy: Option<EgressPolicy>,
+        files_jail: FilesJail,
+    ) -> (Arc<Self>, watch::Receiver<bool>) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let egress = egress_policy.map(|p| EgressManager::new(&p));
         let state = Arc::new(Self {
             node_id,
             connected: AtomicBool::new(false),
@@ -88,6 +99,8 @@ impl RunnerState {
                 arch: std::env::consts::ARCH.to_string(),
                 capabilities,
             },
+            egress,
+            files_jail,
         });
         (state, shutdown_rx)
     }
@@ -98,9 +111,13 @@ impl RunnerState {
 
     /// Instant kill-switch: marks node paused and sends SIGKILL to every active
     /// spawned child process group so no background/grandchild process survives.
+    /// Also tears down all active egress streams.
     pub(crate) async fn trigger_pause_kill_switch(&self, reason: &str) {
         self.paused.store(true, Ordering::SeqCst);
         self.kill_all_active(reason).await;
+        if let Some(ref egress) = self.egress {
+            egress.close_all().await;
+        }
     }
 
     pub(crate) async fn trigger_revoke_kill_switch(&self, reason: &str) {
@@ -108,6 +125,9 @@ impl RunnerState {
         self.revoked.store(true, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
         self.kill_all_active(reason).await;
+        if let Some(ref egress) = self.egress {
+            egress.close_all().await;
+        }
         let _ = self.shutdown_tx.send(true);
     }
 
@@ -197,7 +217,28 @@ pub(crate) async fn run_daemon_async(
     } else {
         cfg.capabilities.clone()
     };
-    let (state, shutdown_rx) = RunnerState::new(cfg.node_id.clone(), caps);
+    let egress_policy = if caps.iter().any(|c| c == "exit") {
+        Some(EgressPolicy {
+            allow_private_cidrs: cfg.allow_private_cidrs.clone(),
+            allow_domains: cfg.allow_domains.clone(),
+            deny_domains: cfg.deny_domains.clone(),
+        })
+    } else {
+        None
+    };
+    let files_jail = if caps.iter().any(|c| c == "files") {
+        FilesJail::new(
+            cfg.allow_dirs
+                .iter()
+                .map(|d| std::path::PathBuf::from(d.trim()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect(),
+        )
+    } else {
+        FilesJail::default()
+    };
+    let (state, shutdown_rx) =
+        RunnerState::new(cfg.node_id.clone(), caps, egress_policy, files_jail);
     let sock_path = control_socket_path(&config_path);
     let _sock_guard = bind_control_socket(&sock_path, Arc::clone(&state)).await?;
 
@@ -585,7 +626,12 @@ async fn run_ws_session(
             }
             _ = heartbeat_tick.tick() => {
                 let active_execs = state.active_count().await;
-                send_client_frame(&mut ws_tx, &NodeClientFrame::Heartbeat { active_execs }).await?;
+                let active_streams = if let Some(ref egress) = state.egress {
+                    egress.active_count().await
+                } else {
+                    0
+                };
+                send_client_frame(&mut ws_tx, &NodeClientFrame::Heartbeat { active_execs, active_streams }).await?;
                 ws_tx.send(WsMsg::Ping(Vec::new().into())).await.map_err(|e| e.to_string())?;
             }
             Some(frame) = out_rx.recv() => {
@@ -642,6 +688,123 @@ async fn run_ws_session(
                             }
                             NodeServerFrame::ExecCancel { exec_id, reason } => {
                                 state.cancel_one(&exec_id, &reason).await;
+                            }
+                            // ── Multiplexed TCP egress streams (exit capability) ──
+                            NodeServerFrame::StreamOpen { stream_id, host, port } => {
+                                if state.paused.load(Ordering::SeqCst) || state.revoked.load(Ordering::SeqCst) {
+                                    let _ = out_tx.send(NodeClientFrame::StreamError {
+                                        stream_id, error: "node is paused".into(),
+                                    }).await;
+                                    continue;
+                                }
+                                if let Some(ref egress) = state.egress {
+                                    egress.open_stream(stream_id, host, port, out_tx.clone()).await;
+                                } else {
+                                    let _ = out_tx.send(NodeClientFrame::StreamError {
+                                        stream_id, error: "exit capability not enabled on this node".into(),
+                                    }).await;
+                                }
+                            }
+                            NodeServerFrame::StreamData { stream_id, data_b64 } => {
+                                if let Some(ref egress) = state.egress {
+                                    egress.write_to_stream(&stream_id, &data_b64).await;
+                                }
+                            }
+                            NodeServerFrame::StreamClose { stream_id } => {
+                                if let Some(ref egress) = state.egress {
+                                    egress.close_stream(&stream_id).await;
+                                }
+                            }
+                            // ── Scoped files capability ──
+                            NodeServerFrame::FilesList { req_id, path } => {
+                                if !state.files_jail.is_enabled() {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("files capability not enabled on this node".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                if state.paused.load(Ordering::SeqCst) || state.revoked.load(Ordering::SeqCst) {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("node is paused".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                let jail = state.files_jail.clone();
+                                let tx = out_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = jail.list(&path);
+                                    let frame = match result {
+                                        Ok(entries) => NodeClientFrame::FilesResult {
+                                            req_id, entries: Some(entries), data_b64: None, error: None,
+                                        },
+                                        Err(err) => NodeClientFrame::FilesResult {
+                                            req_id, entries: None, data_b64: None, error: Some(err),
+                                        },
+                                    };
+                                    let _ = tx.blocking_send(frame);
+                                });
+                            }
+                            NodeServerFrame::FilesRead { req_id, path } => {
+                                if !state.files_jail.is_enabled() {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("files capability not enabled on this node".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                if state.paused.load(Ordering::SeqCst) || state.revoked.load(Ordering::SeqCst) {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("node is paused".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                let jail = state.files_jail.clone();
+                                let tx = out_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = jail.read(&path);
+                                    let frame = match result {
+                                        Ok(data_b64) => NodeClientFrame::FilesResult {
+                                            req_id, entries: None, data_b64: Some(data_b64), error: None,
+                                        },
+                                        Err(err) => NodeClientFrame::FilesResult {
+                                            req_id, entries: None, data_b64: None, error: Some(err),
+                                        },
+                                    };
+                                    let _ = tx.blocking_send(frame);
+                                });
+                            }
+                            NodeServerFrame::FilesWrite { req_id, path, data_b64 } => {
+                                if !state.files_jail.is_enabled() {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("files capability not enabled on this node".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                if state.paused.load(Ordering::SeqCst) || state.revoked.load(Ordering::SeqCst) {
+                                    let _ = out_tx.send(NodeClientFrame::FilesResult {
+                                        req_id, entries: None, data_b64: None,
+                                        error: Some("node is paused".into()),
+                                    }).await;
+                                    continue;
+                                }
+                                let jail = state.files_jail.clone();
+                                let tx = out_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = jail.write(&path, &data_b64);
+                                    let frame = match result {
+                                        Ok(()) => NodeClientFrame::FilesResult {
+                                            req_id, entries: None, data_b64: None, error: None,
+                                        },
+                                        Err(err) => NodeClientFrame::FilesResult {
+                                            req_id, entries: None, data_b64: None, error: Some(err),
+                                        },
+                                    };
+                                    let _ = tx.blocking_send(frame);
+                                });
                             }
                         }
                     }
