@@ -1412,10 +1412,13 @@ mod tool_server_runtime_tests {
                     }
                 }
                 let req = std::str::from_utf8(&req).unwrap();
+                let mut request_line = req.lines().next().unwrap().split_ascii_whitespace();
+                assert_eq!(request_line.next(), Some("GET"));
+                let uri: axum::http::Uri = request_line.next().unwrap().parse().unwrap();
                 assert_eq!(
-                    req.lines().next().unwrap(),
+                    uri.path_and_query().unwrap().as_str(),
                     format!(
-                        "GET /v1/agents?children_of={requested_root}&include_descendants={descendants} HTTP/1.1"
+                        "/v1/agents?children_of={requested_root}&include_descendants={descendants}"
                     )
                 );
                 // The coordinator supplies the already filtered live population.
