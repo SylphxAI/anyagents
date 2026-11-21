@@ -311,6 +311,9 @@ impl CoordinatorLeaseGuard {
                 }
                 let now = now_ms();
                 let expires_at = now.saturating_add(ttl_ms);
+                let Ok(mut conn) = acquire_pg(&pool).await else {
+                    continue;
+                };
                 let updated = sqlx::query(
                     "UPDATE public.coordinator_leases
                      SET heartbeat_at_ms = $4,
