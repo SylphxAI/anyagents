@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyagents_core::masking::mask_known_secrets;
 use anyagents_core::{
-    AgentId, Error, NODE_CAPABILITY_EXEC, NewNodeAuditEvent, NewNodePair, NodeId, NodeRecord,
-    is_node_token, now_ms,
+    AgentId, Error, NODE_CAPABILITY_EXEC, NODE_CAPABILITY_FILES, NewNodeAuditEvent, NewNodePair,
+    NodeId, NodeRecord, is_node_token, now_ms,
 };
 use axum::extract::{FromRequestParts, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, request::Parts};
@@ -55,6 +55,9 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/v1/nodes/{id}/audit", get(list_audit_route))
         .route("/v1/nodes/{id}/exec", post(exec_node_route))
+        .route("/v1/nodes/{id}/files/list", post(files_list_route))
+        .route("/v1/nodes/{id}/files/read", post(files_read_route))
+        .route("/v1/nodes/{id}/files/write", post(files_write_route))
 }
 
 struct PairActor {
@@ -674,6 +677,183 @@ async fn exec_node_route(
             .await;
             Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why))
         }
+    }
+}
+
+// ── Scoped files capability routes ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FilesPathRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct FilesWriteRequest {
+    path: String,
+    data_b64: String,
+}
+
+async fn files_list_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesPathRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry.dispatch_files_list(&node_id, req.path).await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_list".into(),
+                summary: mask_known_secrets(&format!("files_list: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(entries) => Ok(Json(json!({ "entries": entries }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
+    }
+}
+
+async fn files_read_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesPathRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry.dispatch_files_read(&node_id, req.path).await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_read".into(),
+                summary: mask_known_secrets(&format!("files_read: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(data_b64) => Ok(Json(json!({ "data_b64": data_b64 }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
+    }
+}
+
+async fn files_write_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(raw_id): AxumPath<String>,
+    Json(req): Json<FilesWriteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let node_id = parse_node_id(&raw_id)?;
+    let actor_agent_id = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => Some(agent_id.clone()),
+    };
+    let started_at_ms = now_ms();
+    let store_auth = Arc::clone(&state.store);
+    let nid = node_id.clone();
+    let agent_auth = actor_agent_id.clone();
+    spawn_store(move || {
+        store_auth
+            .check_node_capability_authorized(&nid, agent_auth.as_ref(), NODE_CAPABILITY_FILES)
+            .map_err(map_node_store_err)?;
+        Ok(())
+    })
+    .await?;
+
+    let registry = registry_for_store(&state.store);
+    let path_summary = req.path.clone();
+    let result = registry
+        .dispatch_files_write(&node_id, req.path, req.data_b64)
+        .await;
+    let finished_at_ms = now_ms();
+    let succeeded = result.is_ok();
+    let store_audit = Arc::clone(&state.store);
+    let nid_audit = node_id.clone();
+    let agent_audit = actor_agent_id.map(|id| id.to_string());
+    let _ = spawn_store(move || {
+        store_audit
+            .record_node_audit_event(NewNodeAuditEvent {
+                node_id: nid_audit,
+                agent_id: agent_audit,
+                capability: NODE_CAPABILITY_FILES.into(),
+                action: "files_write".into(),
+                summary: mask_known_secrets(&format!("files_write: {path_summary}")).into_owned(),
+                exit_code: None,
+                outcome: if succeeded { "ok" } else { "failed" }.into(),
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+            })
+            .map_err(map_node_store_err)
+    })
+    .await;
+
+    match result {
+        Ok(()) => Ok(Json(json!({ "ok": true }))),
+        Err(why) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, why)),
     }
 }
 

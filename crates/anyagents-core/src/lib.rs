@@ -33,9 +33,9 @@ pub mod stateless;
 pub mod storage;
 mod store;
 pub use store::nodes::{
-    KNOWN_NODE_CAPABILITIES, NODE_CAPABILITY_EXEC, NODE_TOKEN_PREFIX, NewNodeAuditEvent,
-    NewNodePair, NodeAuditEvent, NodeGrant, NodeRecord, NodeStatus, PairedNode, is_node_token,
-    validate_node_capability,
+    KNOWN_NODE_CAPABILITIES, NODE_CAPABILITY_EXEC, NODE_CAPABILITY_EXIT, NODE_CAPABILITY_FILES,
+    NODE_TOKEN_PREFIX, NewNodeAuditEvent, NewNodePair, NodeAuditEvent, NodeGrant, NodeRecord,
+    NodeStatus, PairedNode, RUNTIME_CAPABILITIES, is_node_token, validate_node_capability,
 };
 pub use store::{TakeoverLink, knowledge, nodes};
 

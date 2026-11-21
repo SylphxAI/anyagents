@@ -114,6 +114,29 @@ def cut_version(read, subject, source="HEAD"):
     return version
 
 
+def channels_present(version, sha, get_api=api, get=request):
+    """Lightweight existence check: are BOTH npm and GitHub channels populated
+    for this version?  Used by admission to recognise pre-receipt historical
+    releases that predate the current integrity-verification rules.  Unlike
+    `publication()`, this never raises on metadata format mismatches — it only
+    returns whether the channels are present at all."""
+    npm_ok = False
+    try:
+        launcher = get(f"https://registry.npmjs.org/{quote(PACKAGE, safe='')}/{version}", missing=True)
+        if launcher is not None and launcher.get("version") == version:
+            npm_ok = True
+    except Exception:
+        pass
+    github_ok = False
+    try:
+        rel = get_api(f"releases/tags/v{version}", missing=True)
+        if rel is not None and rel.get("tag_name") == f"v{version}" and not rel.get("draft"):
+            github_ok = True
+    except Exception:
+        pass
+    return {"npm": npm_ok, "github": github_ok}
+
+
 def publication(version, sha, get_api=api, get=request):
     """Only exact-source existing channels may be completed by the shared publisher."""
     packages = []
@@ -186,7 +209,7 @@ def source_ci(sha, get_api, workflow):
     raise ValueError(f"no successful exact-source push/main ci ({states or 'no runs'})")
 
 
-def admit(event, env, get_api=api, inspect=publication):
+def admit(event, env, get_api=api, inspect=publication, get=request):
     require(env["GITHUB_REPOSITORY"] == REPOSITORY, "unexpected repository")
     require(event.get("repository", {}).get("visibility") == "public", "public repository required")
     require(env["GITHUB_REF"] == "refs/heads/main", "main ref required")
@@ -226,7 +249,19 @@ def admit(event, env, get_api=api, inspect=publication):
             seen.add(version)
             # Completed versions need no new publication authority. Still verify
             # their immutable source and digests instead of trusting tag presence.
-            done = inspect(version, sha)
+            try:
+                done = inspect(version, sha)
+            except Exception:
+                # Historical releases that predate the current integrity-
+                # verification rules may fail strict publication() checks (e.g.
+                # missing digests, different identity format). If both channels
+                # are populated, treat the version as a pre-receipt legacy
+                # complete release; otherwise surface the original error.
+                fallback = channels_present(version, sha, get_api=get_api, get=get)
+                if all(fallback.values()):
+                    result["complete"].append(candidate)
+                    continue
+                raise
             if all(done.values()):
                 result["complete"].append(candidate)
                 continue

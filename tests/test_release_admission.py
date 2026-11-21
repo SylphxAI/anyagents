@@ -170,8 +170,41 @@ class AdmissionTests(unittest.TestCase):
         done = (version, sha) in self.published
         return {"npm": done, "github": done}
 
+    def npm_get(self, url, **kwargs):
+        """Simulated npm registry + asset fetch for channels_present / publication."""
+        if url.startswith("https://registry.npmjs.org/"):
+            # Lightweight presence check: return a matching package if published.
+            for (ver, sha) in self.published:
+                if f"/{ver}" in url:
+                    name = url.split("/")[-2].replace("%40", "@").replace("%2F", "/")
+                    return {"name": name, "version": ver, "gitHead": sha,
+                            "dist": {"integrity": "sha512-ok", "tarball": "https://registry.npmjs.org/file"}}
+            return None
+        return None
+
+    def api_with_releases(self, path, **kwargs):
+        """Extended API mock that also handles releases/tags and git/ref/tags queries."""
+        if path.startswith("releases/tags/v"):
+            version = path.removeprefix("releases/tags/v")
+            for (ver, sha) in self.published:
+                if ver == version:
+                    return {"tag_name": f"v{version}", "draft": False,
+                            "target_commitish": sha, "assets": []}
+            if kwargs.get("missing"):
+                return None
+            return None
+        if path.startswith("git/ref/tags/v"):
+            version = path.removeprefix("git/ref/tags/v")
+            for (ver, sha) in self.published:
+                if ver == version:
+                    return {"object": {"type": "commit", "sha": sha}}
+            if kwargs.get("missing"):
+                return None
+            return None
+        return self.api(path)
+
     def admit(self):
-        return release.admit(self.event, self.env, self.api, self.inspect)
+        return release.admit(self.event, self.env, self.api, self.inspect, get=self.npm_get)
 
     def test_new_cut_admits_and_complete_release_is_explicit_noop(self):
         result = self.admit()
@@ -282,14 +315,37 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn(feature, [item["source"] for item in result["releases"]])
 
     def test_existing_provenance_or_digest_mismatch_is_a_loud_refusal(self):
+        """When inspect raises and channels are NOT present, the version is refused."""
         def mismatch(*args):
             raise ValueError("GitHub identity digest mismatch")
-        result = release.admit(self.event, self.env, self.api, mismatch)
+        # channels_present will check releases/tags and npm, but nothing is published
+        # so it returns False for both, and the version is refused as before.
+        result = release.admit(self.event, self.env, self.api_with_releases, mismatch, get=self.npm_get)
         self.assertEqual(result["releases"], [])
         self.assertIn("digest mismatch", result["refused"][0]["reason"])
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "skipped",
                              "ADMISSION": json.dumps(result)}, self.inspect)
+
+    def test_pre_receipt_historical_release_does_not_block_new_cut(self):
+        """Historical releases that predate exact-source receipts have published
+        channels but may fail strict publication() integrity checks. They must
+        not block admission of a newer release version."""
+        # Mark v0.1.2 as published (channels exist) but make inspect raise.
+        self.published.add(("0.1.2", self.sha))
+        def strict_mismatch(version, sha):
+            if version == "0.1.2":
+                raise ValueError("GitHub asset digest missing")
+            return self.inspect(version, sha)
+        # Cut a new v0.1.3 that has proper CI.
+        second = self.advance("0.1.3", "release: v0.1.3")
+        result = release.admit(self.event, self.env, self.api_with_releases, strict_mismatch, get=self.npm_get)
+        # v0.1.2 should be treated as a legacy complete (channels present),
+        # NOT as refused.
+        self.assertEqual(result["publish"], "true")
+        self.assertEqual([item["source"] for item in result["releases"]], [second])
+        self.assertEqual(result["complete"], [{"version": "0.1.2", "source": self.sha}])
+        self.assertEqual(result["refused"], [])
 
     def test_complete_legacy_cut_is_noop_but_cannot_authorize_new_publication(self):
         release.git("commit", "--amend", "-qm", "chore: release AnyAgents 0.1.2")

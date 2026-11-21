@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 use crate::auth_device::{self, DeviceLoginOptions};
 use crate::{client, operator, server, ui};
 
+pub(crate) mod egress;
+pub(crate) mod files;
+pub(crate) mod install;
 pub(crate) mod runner;
+pub(crate) mod ssrf_guard;
 
 const NODE_CONFIG_ENV: &str = "ANYAGENTS_NODE_CONFIG";
 const HTTP_TIMEOUT_SECS: u64 = 30;
@@ -103,6 +107,23 @@ pub(crate) enum NodeCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Install a user-level background daemon service (launchd on macOS, systemd on Linux).
+    Install {
+        /// Dry-run: print the generated service file without installing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Uninstall a previously installed daemon service.
+    Uninstall,
+    /// Start a local HTTP CONNECT / SOCKS5 proxy for egress through an `exit`-capable node.
+    Proxy {
+        /// Target node ID or name.
+        #[arg(long)]
+        node: String,
+        /// Local address to bind the proxy listener.
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: String,
+    },
 }
 
 /// Device-bound credential stored strictly at `0600` in `~/.config/anyagents/node.json`.
@@ -114,6 +135,18 @@ pub(crate) struct StoredNodeConfig {
     pub(crate) name: String,
     #[serde(default = "default_capabilities")]
     pub(crate) capabilities: Vec<String>,
+    /// Allowed private CIDRs for egress-proxy SSRF guard override.
+    #[serde(default)]
+    pub(crate) allow_private_cidrs: Vec<String>,
+    /// Allowed domains for egress-proxy.
+    #[serde(default)]
+    pub(crate) allow_domains: Vec<String>,
+    /// Denied domains for egress-proxy.
+    #[serde(default)]
+    pub(crate) deny_domains: Vec<String>,
+    /// Allowed directory roots for `files` capability.
+    #[serde(default)]
+    pub(crate) allow_dirs: Vec<String>,
 }
 
 fn default_capabilities() -> Vec<String> {
@@ -332,6 +365,47 @@ pub(crate) fn run(data: &Path, args: NodeCliArgs) -> Result<(), Error> {
             "revoke",
             json_out,
         ),
+        NodeCommand::Install { dry_run } => {
+            let cfg = load_node_config_at(&config_path)?.ok_or_else(|| {
+                Error::Message(format!(
+                    "no node config at {}; pair first",
+                    config_path.display()
+                ))
+            })?;
+            let path = install::install_daemon(&cfg.name, &config_path, dry_run)?;
+            if dry_run {
+                Ok(())
+            } else {
+                if ui::is_pretty() {
+                    ui::success(&format!("Installed daemon service at {}", path.display()));
+                } else {
+                    println!("installed\t{}", path.display());
+                }
+                Ok(())
+            }
+        }
+        NodeCommand::Uninstall => {
+            let cfg = load_node_config_at(&config_path)?.ok_or_else(|| {
+                Error::Message(format!(
+                    "no node config at {}; pair first",
+                    config_path.display()
+                ))
+            })?;
+            install::uninstall_daemon(&cfg.name)?;
+            if ui::is_pretty() {
+                ui::success("Uninstalled daemon service");
+            } else {
+                println!("uninstalled");
+            }
+            Ok(())
+        }
+        NodeCommand::Proxy { node, listen } => {
+            // Placeholder: proxy command requires coordinator integration.
+            Err(Error::Message(format!(
+                "proxy command for node `{node}` listening on `{listen}` is not yet \
+                 integrated with coordinator proxy dispatch"
+            )))
+        }
     }
 }
 
@@ -528,6 +602,10 @@ fn pair_cmd(data: &Path, config_path: &Path, opts: PairCmdOpts) -> Result<(), Er
         node_token,
         name: name.clone(),
         capabilities: capabilities.clone(),
+        allow_private_cidrs: Vec::new(),
+        allow_domains: Vec::new(),
+        deny_domains: Vec::new(),
+        allow_dirs: Vec::new(),
     };
     save_node_config_at(config_path, &stored)?;
 
