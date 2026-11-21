@@ -1,6 +1,6 @@
 import type { Route, SettingsTab } from './types';
 
-const settingsTabs: SettingsTab[] = ['channels', 'secrets', 'automations', 'usage'];
+const settingsTabs: SettingsTab[] = ['channels', 'ingress', 'secrets', 'automations', 'usage'];
 
 export function parseRoute(hash = window.location.hash): Route {
   const [section = '', raw] = hash.replace(/^#\/?/, '').split('/');

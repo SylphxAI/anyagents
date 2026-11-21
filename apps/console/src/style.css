@@ -677,3 +677,34 @@ body.auth { display: flex; flex-direction: column; min-height: 100vh; background
 }
 .notice-line { margin-bottom: 12px; }
 .recipients { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+
+/* ---------- Ingress guard ---------- */
+.ingress-recipient { display: flex; flex-wrap: wrap; align-items: end; gap: 8px 16px; }
+.ingress-recipient .field { flex: 0 1 280px; }
+.ingress-recipient > p { padding-bottom: 6px; }
+.ingress-recipient + .empty { margin-top: 20px; border: 1px dashed var(--line-2); border-radius: var(--radius-lg); }
+.ingress-feedback:empty { display: none; }
+.ingress-notice { margin-bottom: 12px; overflow-wrap: anywhere; }
+.ingress-notice svg { color: var(--ok); }
+.ingress-notice strong { color: var(--text); }
+.ingress-toolbar { margin-bottom: 10px; }
+.ingress-row { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(115px, 1.45fr) minmax(95px, .72fr) minmax(95px, .72fr) auto; gap: 12px; align-items: center; padding: 12px 14px; overflow-wrap: anywhere; }
+.ingress-list li { border-top: 1px solid var(--line); }
+.ingress-list-head { padding-block: 9px; }
+.ingress-list-head > :last-child { width: 66px; }
+.ingress-target { display: grid; justify-items: start; gap: 4px; }
+.ingress-label { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.ingress-row-action { justify-self: end; }
+.ingress-recipient + .section .section-head { flex-wrap: wrap; }
+@media (max-width: 760px) {
+.settings-page > .tabs { flex-wrap: wrap; gap: 0 16px; }
+  .ingress-list-head { display: none; }
+  .ingress-list li:first-child { border-top: 0; }
+  .ingress-row { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .ingress-target { grid-column: 1; grid-row: 1; }
+  .ingress-row-action { grid-column: 2; grid-row: 1; }
+  .ingress-reason { grid-column: 1 / -1; }
+  .ingress-label { display: block; position: static; width: auto; height: auto; clip-path: none; }
+  .ingress-row-action .btn { min-height: 36px; }
+  .ingress-recipient > p { padding-bottom: 0; }
+}

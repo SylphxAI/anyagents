@@ -12,7 +12,7 @@ import { pageHref, parseRoute } from './route';
 import { ConsoleContext } from './state';
 import type { AgentAction, ConnectRequest, ConsoleState, Fleet } from './state';
 import { runtimeIssues } from './lib/issues';
-import type { Agent, Overview, Page, Profile, Session, VersionsReport } from './types';
+import type { Agent, Overview, Page, Profile, Route, Session, VersionsReport } from './types';
 import { Palette } from './ui/Palette';
 import { Dot, Kbd, Mark, Problem, ThemeToggle } from './ui/primitives';
 import { OverviewPage } from './pages/OverviewPage';
@@ -165,7 +165,7 @@ export function App() {
             <Match when={route().page === 'knowledge'}><KnowledgePage /></Match>
             <Match when={route().page === 'versions'}><VersionsPage /></Match>
             <Match when={route().page === 'issues'}><SystemIssuesPage /></Match>
-            <Match when={route().page === 'settings'}><SettingsPage tab={(route() as { tab: 'channels' }).tab} /></Match>
+            <Match when={route().page === 'settings'}><SettingsPage tab={(route() as Extract<Route, { page: 'settings' }>).tab} /></Match>
           </Switch>
         </main>
       </div>
