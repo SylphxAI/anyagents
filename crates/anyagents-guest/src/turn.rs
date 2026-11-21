@@ -18,6 +18,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+#[path = "turn_custody.rs"]
+mod custody;
+
 #[path = "turn_watchdog.rs"]
 mod watchdog;
 pub(crate) use watchdog::TurnWatchdog;
@@ -71,6 +75,10 @@ pub struct TurnArgs {
     /// Daemonize into a detached background child, print accepted JSON, and exit immediately.
     #[arg(long)]
     pub detached: bool,
+    /// Internal: wait for the detached launcher to register this worker.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, conflicts_with = "detached")]
+    pub detached_worker: bool,
     /// Stable turn identifier assigned by the coordinator (`pending_remote_turns.turn_id`).
     #[arg(long)]
     pub turn_id: String,
@@ -129,6 +137,10 @@ pub struct TurnArgs {
 
 /// Entry point for `anyagents-guest turn`.
 pub fn run_turn(args: TurnArgs) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if args.detached_worker {
+        custody::wait_for_dispatch().map_err(|e| format!("cannot admit detached turn: {e}"))?;
+    }
     validate_turn_id(&args.turn_id)?;
     let callback_url = args.callback_url.trim().to_string();
     if callback_url.is_empty()
@@ -183,6 +195,15 @@ fn spawn_detached_turn(
     turns_dir: &Path,
     token: &str,
 ) -> Result<(), String> {
+    // Fence the previous worker before sharing any per-turn files with a new one.
+    #[cfg(target_os = "linux")]
+    let (dispatch, launch_token) = (|| -> std::io::Result<_> {
+        let dispatch = custody::Dispatch::acquire(turns_dir)?;
+        dispatch.retire_prior()?;
+        Ok((dispatch, custody::launch_token()?))
+    })()
+    .map_err(|e| format!("cannot fence prior detached turn: {e}"))?;
+
     // Materialize prompt to a file before detaching because child stdin is `/dev/null`.
     let prompt_file = if let Some(ref existing) = args.prompt_file {
         existing.clone()
@@ -265,14 +286,18 @@ fn spawn_detached_turn(
     if let Some(ref git) = args.git_program {
         cmd.arg("--git-program").arg(git);
     }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err));
+
+    #[cfg(target_os = "linux")]
+    cmd.arg("--detached-worker")
+        .env(custody::OWNER_ENV, &launch_token)
+        .stdin(Stdio::piped());
     if !args.extra_args.is_empty() {
         cmd.arg("--");
         cmd.args(&args.extra_args);
     }
-
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::from(log_out))
-        .stderr(Stdio::from(log_err));
 
     #[cfg(unix)]
     {
@@ -293,6 +318,20 @@ fn spawn_detached_turn(
         .spawn()
         .map_err(|e| format!("failed to spawn detached turn worker: {e}"))?;
     let pid = child.id();
+    #[cfg(target_os = "linux")]
+    {
+        let mut child = child;
+        let mut gate = child.stdin.take().expect("piped detached worker stdin");
+        let admit = dispatch
+            .record(pid, launch_token)
+            .and_then(|()| gate.write_all(&[1]));
+        drop(gate);
+        if let Err(e) = admit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("cannot admit detached turn worker: {e}"));
+        }
+    }
 
     let accepted = json!({
         "status": "accepted",
@@ -1594,6 +1633,8 @@ mod tests {
 
         let args = TurnArgs {
             detached: false,
+            #[cfg(target_os = "linux")]
+            detached_worker: false,
             turn_id: "turn_abc".into(),
             agent_id: "agt_test".into(),
             harness: None,

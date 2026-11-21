@@ -313,3 +313,183 @@ echo '{"type":"result","status":"success","session_id":"gem-sess-9","result":"he
     assert_eq!(completed["usage"]["input_tokens"], 14);
     assert_eq!(completed["usage"]["output_tokens"], 6);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_spiron_resume_retires_live_and_orphaned_session_holders() {
+    const SESSION: &str = "test-resume-session";
+    // Reuse the real socket transport and a real advisory session lock. An
+    // extra process in the harness group inherits the lock and ignores TERM.
+    // It must also exit before the next Spiron accepts the same session.
+    let fixture = r#"#!/usr/bin/env python3
+import fcntl, json, os, pathlib, signal, socket, sys
+
+state = pathlib.Path(sys.argv[sys.argv.index('--state-dir') + 1])
+session = sys.argv[sys.argv.index('--session') + 1]
+lock = (state / (session + '.lock')).open('w')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit('session_in_use: another process serves session ' + session)
+
+if not (state / 'resume').exists():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = os.fork()
+    if child == 0:
+        while True:
+            signal.pause()
+    tmp = state / 'holder.tmp'
+    tmp.write_text(f'{os.getpid()} {child}')
+    tmp.rename(state / 'holder')
+    while True:
+        signal.pause()
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[sys.argv.index('--listen') + 1])
+listener.listen()
+seq = 0
+while True:
+    conn, _ = listener.accept()
+    with conn, conn.makefile() as stream:
+        for line in stream:
+            msg = json.loads(line)
+            seq += 1
+            reply = dict(seq=seq, session_id=session, request_id=msg['request_id'])
+            if msg['type'] == 'attach':
+                reply.update(type='ready', protocol='spiron.headless/v2', features=['turn-tool-context-v1'])
+            elif msg['type'] == 'prompt':
+                accepted = dict(reply, type='accepted', mode='turn')
+                conn.sendall((json.dumps(accepted) + '\n').encode())
+                seq += 1
+                reply.update(seq=seq, type='result', status='completed', is_error=False,
+                             duplicate=False, error=None, tool_context_bound=True, final_text='resumed',
+                             consumed_request_ids=[msg['request_id']], undelivered_steer_ids=[])
+            elif msg['type'] == 'stop':
+                sys.exit(0)
+            else:
+                continue
+            conn.sendall((json.dumps(reply) + '\n').encode())
+"#;
+
+    fn wait_for<T>(mut observe: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = observe() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not reach its barrier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exited(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .trim_start()
+                .starts_with('Z'),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!("read process state: {e}"),
+        }
+    }
+
+    struct Cleanup(Vec<i32>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for pid in self.0.drain(..) {
+                if !exited(pid) {
+                    // SAFETY: these are fixture processes we have confirmed alive.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    for crash_worker in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let work = tmp.path().join("workspace");
+        let fake = tmp.path().join("fake-spiron");
+        write_executable(&fake, fixture);
+        let (url, events, server) = spawn_mock_callback_server(false);
+        let launch = |turn| {
+            let out = Command::new(env!("CARGO_BIN_EXE_anyagents-guest"))
+                .env_remove("ANYAGENTS_GUEST_SPIRON_STDIO")
+                .args([
+                    "turn",
+                    "--detached",
+                    "--agent-id",
+                    "test-agent",
+                    "--turn-id",
+                    turn,
+                    "--harness",
+                    "spiron",
+                    "--program",
+                    fake.to_str().unwrap(),
+                    "--state-dir",
+                    state.to_str().unwrap(),
+                    "--workdir",
+                    work.to_str().unwrap(),
+                    "--session",
+                    SESSION,
+                    "--prompt",
+                    "hello",
+                    "--heartbeat-interval-ms",
+                    "0",
+                    "--callback-url",
+                    &url,
+                    "--callback-token",
+                    "test-token",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+            i32::try_from(json["pid"].as_i64().unwrap()).unwrap()
+        };
+
+        let worker = launch("turn_prior");
+        let mut cleanup = Cleanup(vec![worker]);
+        let holders = wait_for(|| std::fs::read_to_string(state.join("holder")).ok());
+        let holders: Vec<i32> = holders
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(holders.len(), 2);
+        cleanup.0.extend_from_slice(&holders);
+        // The first turn sent only its initial heartbeat and is now hung in
+        // harness startup. Dispatch a replacement as after a coordinator timeout.
+        if crash_worker {
+            // SAFETY: the worker pid was obtained from the local launcher and is live.
+            assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+            wait_for(|| exited(worker).then_some(()));
+            assert!(holders.iter().all(|&pid| !exited(pid)));
+        }
+        std::fs::write(state.join("resume"), "").unwrap();
+        cleanup.0.push(launch("turn_resumed"));
+        server.join().unwrap();
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|(_, event)| {
+                event["turn_id"] == "turn_resumed"
+                    && event["event_type"] == "turn_complete"
+                    && event["session_id"] == SESSION
+                    && event["result_text"] == "resumed"
+            }),
+            "replacement did not complete (crash_worker={crash_worker}): {events:?}\nworker: {}\nharness: {}",
+            std::fs::read_to_string(state.join("turns/turn_resumed.log")).unwrap_or_default(),
+            std::fs::read_to_string(state.join("spiron.log")).unwrap_or_default(),
+        );
+        assert!(exited(worker));
+        assert!(holders.iter().all(|&pid| exited(pid)));
+    }
+}
