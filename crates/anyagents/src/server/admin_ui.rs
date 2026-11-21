@@ -606,7 +606,11 @@ mod tests {
         let signin_html = String::from_utf8_lossy(&signin_body);
         assert!(signin_html.contains("Sign in with OIDC"));
         assert!(signin_html.contains(r#"href="/admin/auth/login""#));
-        assert!(signin_html.contains("anyagents auth login --url https://console.example.com"));
+        assert!(
+            signin_html.contains(
+                "anyagents auth login --url https://console.example.com --scope 'admin:*'"
+            )
+        );
         assert!(!signin_html.contains("<script>"));
 
         // 3. Health probes (/healthz, /readyz, /v1/webhooks/healthz) remain strictly JSON,

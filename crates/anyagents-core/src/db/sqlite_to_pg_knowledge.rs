@@ -6,7 +6,7 @@ use super::{ColBuf, ColSpec, SqliteProjection, TableSpec, sqlite_cell_to_string}
 use crate::error::Error;
 use crate::store::knowledge::projection_fields;
 
-// Run after agents (grants) and before the optional projection (documents).
+// Run after agents and groups (grants), before the optional projection (documents).
 pub(super) const KNOWLEDGE_TABLES: &[TableSpec] = &[
     TableSpec::simple(
         "knowledge_docs",
@@ -56,6 +56,18 @@ pub(super) const KNOWLEDGE_TABLES: &[TableSpec] = &[
         &[
             ColSpec::txt("id"),
             ColSpec::txt("agent_id"),
+            ColSpec::txt("namespace_pattern"),
+            ColSpec::txt("mode"),
+            ColSpec::txt("granted_by"),
+            ColSpec::int("granted_at_ms"),
+        ],
+    ),
+    TableSpec::simple(
+        "knowledge_group_grants",
+        "public.knowledge_group_grants",
+        &[
+            ColSpec::txt("id"),
+            ColSpec::txt("group_name"),
             ColSpec::txt("namespace_pattern"),
             ColSpec::txt("mode"),
             ColSpec::txt("granted_by"),

@@ -44,7 +44,7 @@ pub use browser_profiles_store::{
     validate_browser_profile_name,
 };
 pub use error::Error;
-pub use id::{AgentId, ChannelId, MessageId, UsageId};
+pub use id::{AgentId, ChannelId, GroupId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use s3_store::{
     DEFAULT_MAX_S3_OBJECT_BYTES, ObjectMeta, S3_ACCESS_KEY_ID_ENV, S3_BUCKET_ENV, S3_ENDPOINT_ENV,

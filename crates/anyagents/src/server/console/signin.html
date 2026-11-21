@@ -17,7 +17,7 @@
       <a class="btn primary auth-cta" href="/admin/auth/login">Sign in with OIDC</a>
       <div class="auth-divider"><span>or use the CLI</span></div>
       <div class="auth-cli">
-        <pre><code id="auth-command">anyagents auth login --url {{COORDINATOR_URL}}</code></pre>
+        <pre><code id="auth-command">anyagents auth login --url {{COORDINATOR_URL}} --scope 'admin:*'</code></pre>
         <span id="auth-copy"></span>
       </div>
     </section>

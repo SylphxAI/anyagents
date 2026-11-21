@@ -64,6 +64,10 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         19,
         include_str!("../../migrations_pg/019_turn_limit_pause.sql"),
     ),
+    (
+        20,
+        include_str!("../../migrations_pg/020_knowledge_group_grants.sql"),
+    ),
 ];
 
 #[cfg(test)]

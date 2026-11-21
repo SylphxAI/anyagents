@@ -352,12 +352,8 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 impl Presented {
-    pub(crate) fn is_oidc(&self) -> bool {
+    pub(crate) fn is_console_session(&self) -> bool {
         self.admin_session.is_some()
-            || self
-                .bearer_token
-                .as_deref()
-                .is_some_and(|token| !anyagents_core::is_remote_session_token(token))
     }
 
     pub fn of(parts: &Parts) -> Self {
@@ -554,42 +550,67 @@ impl FromRequestParts<AppState> for Principal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(injected) = parts.extensions.get::<InjectedPrincipal>() {
-            return Ok(injected.0.clone());
+        match authenticate_request(parts, state).await? {
+            RequestAuthority::Principal(principal) => Ok(principal),
+            RequestAuthority::Bearer(bearer) if bearer.has_scope(crate::oauth_scope::ADMIN) => {
+                Ok(Self::Operator)
+            }
+            RequestAuthority::Bearer(_) => Err(AuthRejection(AuthError::Forbidden(
+                "this endpoint requires OAuth scope admin:*".into(),
+            ))),
         }
-        let presented = Presented::of(parts);
-        if let Some(decided) = state.auth.principal_without_store(&presented) {
-            return decided.map_err(AuthRejection);
-        }
-        if let Some(bearer) = presented.bearer_token.as_deref()
-            && !anyagents_core::is_remote_session_token(bearer)
-        {
-            return crate::server::oidc_bearer::authenticate_bearer_token(
-                state.store.data_dir(),
-                bearer,
-            )
-            .await
-            .map_err(AuthRejection);
-        }
-        let is_remote = presented
-            .agent_token
-            .as_deref()
-            .or(presented.bearer_token.as_deref())
-            .is_some_and(anyagents_core::is_remote_session_token);
-        let auth = state.auth.clone();
-        let store = std::sync::Arc::clone(&state.store);
-        let principal = off_worker(move || auth.principal(&store, &presented)).await?;
-        if is_remote && matches!(principal, Principal::Agent { .. }) {
-            // Preserve the same host-isolation guards (`refuse_host_media_over_http`,
-            // `refuse_host_placement_over_http`, no host wake/revival) on direct
-            // remote-session HTTP calls as on HTTP MCP calls.
-            parts.headers.insert(
-                axum::http::header::HeaderName::from_static(crate::mcp::HTTP_MCP_HEADER),
-                axum::http::HeaderValue::from_static("1"),
-            );
-        }
-        Ok(principal)
     }
+}
+
+pub(crate) enum RequestAuthority {
+    Principal(Principal),
+    Bearer(crate::server::oidc_bearer::VerifiedBearer),
+}
+
+/// Resolve the credential once, keeping scoped OAuth authority distinct until
+/// the endpoint decides what it accepts. No scoped bearer becomes an operator.
+pub(crate) async fn authenticate_request(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Result<RequestAuthority, AuthRejection> {
+    if let Some(injected) = parts.extensions.get::<InjectedPrincipal>() {
+        return Ok(RequestAuthority::Principal(injected.0.clone()));
+    }
+    let presented = Presented::of(parts);
+    if let Some(decided) = state.auth.principal_without_store(&presented) {
+        return decided
+            .map(RequestAuthority::Principal)
+            .map_err(AuthRejection);
+    }
+    if let Some(bearer) = presented.bearer_token.as_deref()
+        && !anyagents_core::is_remote_session_token(bearer)
+    {
+        return crate::server::oidc_bearer::authenticate_bearer_token(
+            state.store.data_dir(),
+            bearer,
+        )
+        .await
+        .map(RequestAuthority::Bearer)
+        .map_err(AuthRejection);
+    }
+    let is_remote = presented
+        .agent_token
+        .as_deref()
+        .or(presented.bearer_token.as_deref())
+        .is_some_and(anyagents_core::is_remote_session_token);
+    let auth = state.auth.clone();
+    let store = std::sync::Arc::clone(&state.store);
+    let principal = off_worker(move || auth.principal(&store, &presented)).await?;
+    if is_remote && matches!(principal, Principal::Agent { .. }) {
+        // Preserve the same host-isolation guards (`refuse_host_media_over_http`,
+        // `refuse_host_placement_over_http`, no host wake/revival) on direct
+        // remote-session HTTP calls as on HTTP MCP calls.
+        parts.headers.insert(
+            axum::http::header::HeaderName::from_static(crate::mcp::HTTP_MCP_HEADER),
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    Ok(RequestAuthority::Principal(principal))
 }
 
 /// The rejection an unauthenticated or forbidden call gets. The message never

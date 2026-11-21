@@ -12,7 +12,7 @@ interface Doc extends Summary { id: string; body: string; updated_by: string; cr
 interface Revision { id: string; version: number; actor_id: string; reason: string; created_at_ms: number; deleted_at_ms?: number | null }
 interface Proposal { id: string; namespace: string; topic: string; actor_id: string; expected_version: number; created_at_ms: number; status: string;
   edit: { title?: string; body?: string; reason: string } }
-interface Grant { id: string; agent_id: string; namespace_pattern: string; mode: string; granted_by: string; granted_at_ms: number }
+interface Grant { id: string; agent_id?: string; group_id?: string; namespace_pattern: string; mode: string; granted_by: string; granted_at_ms: number }
 
 type Unavailable = { unavailable: 'missing' | 'forbidden'; message: string };
 const knowledge = <T,>(body: object, signal?: AbortSignal) => api<T>('/v1/knowledge', { method: 'POST', body, signal });
@@ -202,11 +202,11 @@ function Grants() {
     <Match when={grants.data()}>{data => <>
       <Show when={error()}><Problem>{error()}</Problem></Show>
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Agent</th><th>Namespace pattern</th><th>Mode</th><th>Granted by</th><th>Granted</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th>Recipient</th><th>Namespace pattern</th><th>Mode</th><th>Granted by</th><th>Granted</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>
         <tbody><For each={data().grants}>{grant => <tr>
-          <td><Show when={agentNames().get(grant.agent_id)} fallback={<span class="mono">{grant.agent_id}</span>}>{name => <>
+          <td><Show when={!grant.group_id} fallback={<span class="mono">group:{grant.group_id}</span>}><Show when={agentNames().get(grant.agent_id ?? '')} fallback={<span class="mono">{grant.agent_id}</span>}>{name => <>
             <div class="strong">{name()}</div><div class="mono subtle small">{grant.agent_id}</div>
-          </>}</Show></td><td class="mono strong">{grant.namespace_pattern}</td>
+          </>}</Show></Show></td><td class="mono strong">{grant.namespace_pattern}</td>
           <td><Pill tone={grant.mode === 'write' ? 'warn' : 'neutral'}>{grant.mode}</Pill></td>
           <td class="mono subtle">{grant.granted_by}</td><td class="num subtle">{dateTime(grant.granted_at_ms)}</td>
           <td class="right"><button type="button" class="btn sm ghost" onClick={async () => {
@@ -217,6 +217,6 @@ function Grants() {
     </>}</Match>
   </Switch>
   <Show when={grantOpen()}><GrantAccessDialog close={() => setGrantOpen(false)} refresh={grants.refresh}
-    grant={(agent_id, namespace_pattern, mode) => knowledge({ action: 'grant', agent_id, namespace_pattern, mode })} /></Show>
+    grant={(recipient, namespace_pattern, mode) => knowledge({ action: 'grant', ...recipient, namespace_pattern, mode })} /></Show>
   </Section>;
 }

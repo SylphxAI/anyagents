@@ -32,6 +32,7 @@ mod mcp;
 mod mcp_config;
 mod memory_service;
 mod muse_config;
+mod oauth_scope;
 mod opencode_config;
 mod operator;
 mod outbound;

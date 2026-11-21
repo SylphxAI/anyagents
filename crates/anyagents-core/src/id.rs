@@ -156,6 +156,38 @@ identifier!(MessageId, "msg");
 identifier!(ChannelId, "chn");
 identifier!(UsageId, "usg");
 
+/// A named group's stable identifier, as stored in `groups.name`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct GroupId(String);
+
+impl GroupId {
+    pub fn parse(name: &str) -> Result<Self, Error> {
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_whitespace) {
+            return Err(Error::InvalidId(name.to_string()));
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for GroupId {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::parse(name)
+    }
+}
+
+impl std::fmt::Display for GroupId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
