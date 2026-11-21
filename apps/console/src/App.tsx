@@ -17,6 +17,7 @@ import { Palette } from './ui/Palette';
 import { Dot, Kbd, Mark, Problem, ThemeToggle } from './ui/primitives';
 import { OverviewPage } from './pages/OverviewPage';
 import { AgentsPage } from './pages/AgentsPage';
+import { NodesPage } from './pages/NodesPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { VersionsPage } from './pages/VersionsPage';
@@ -161,6 +162,7 @@ export function App() {
           <Switch>
             <Match when={route().page === 'overview'}><OverviewPage /></Match>
             <Match when={route().page === 'agents'}><AgentsPage selectedId={(route() as { id?: string }).id} /></Match>
+            <Match when={route().page === 'nodes'}><NodesPage selectedId={(route() as { id?: string }).id} /></Match>
             <Match when={route().page === 'accounts'}><AccountsPage /></Match>
             <Match when={route().page === 'knowledge'}><KnowledgePage /></Match>
             <Match when={route().page === 'versions'}><VersionsPage /></Match>

@@ -112,6 +112,7 @@ pub const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
         51,
         include_str!("../migrations/052_knowledge_group_grants.sql"),
     ),
+    (52, include_str!("../migrations/053_nodes.sql")),
 ];
 
 pub const SQLITE_LATEST_VERSION: i64 = SQLITE_MIGRATIONS[SQLITE_MIGRATIONS.len() - 1].0;

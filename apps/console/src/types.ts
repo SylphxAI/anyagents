@@ -89,9 +89,50 @@ export interface Schedule {
   prompt: string; next_fire_at_ms?: number | null; last_fired_at_ms?: number;
 }
 
+export type NodeStatus = 'online' | 'offline' | 'paused' | 'revoked';
+
+export interface NodeRecord {
+  id: string;
+  owner_id: string;
+  name: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  capabilities: string[];
+  status: NodeStatus;
+  last_heartbeat_at_ms?: number | null;
+  created_at_ms: number;
+  revoked_at_ms?: number | null;
+}
+
+export interface NodeGrant {
+  id: string;
+  node_id: string;
+  agent_id: string;
+  agent_name?: string | null;
+  capability: string;
+  granted_by: string;
+  created_at_ms: number;
+  revoked_at_ms?: number | null;
+}
+
+export interface NodeAuditEvent {
+  id: string;
+  node_id: string;
+  agent_id?: string | null;
+  capability: string;
+  action: string;
+  summary: string;
+  exit_code?: number | null;
+  outcome: string;
+  started_at_ms: number;
+  finished_at_ms?: number | null;
+}
+
 export type Route =
   | { page: 'overview' }
   | { page: 'agents'; id?: string }
+  | { page: 'nodes'; id?: string }
   | { page: 'accounts' }
   | { page: 'knowledge' }
   | { page: 'versions' }

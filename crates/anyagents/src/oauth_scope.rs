@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 pub(crate) const ADMIN: &str = "admin:*";
+pub(crate) const NODE_CONNECT: &str = "node:connect";
 pub(crate) const KNOWLEDGE_READ: &str = "knowledge:read";
 pub(crate) const KNOWLEDGE_WRITE: &str = "knowledge:write";
 pub(crate) const KNOWLEDGE_GRANT: &str = "knowledge:grant";

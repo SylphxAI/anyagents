@@ -13,6 +13,7 @@ pub const UNIVERSAL_MCP_TOOLS: &[&str] = &[
     "memory",
     "schedules",
     "groups",
+    "nodes",
 ];
 
 /// Whether `raw_name` is permitted on the AnyAgents MCP surface.
