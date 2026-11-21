@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -13,6 +14,13 @@ import sys
 import termios
 import time
 import fcntl
+
+
+# Match the Google OAuth menu on displayed text, not the raw terminal escapes.
+ANSI = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))')
+AGY_GOOGLE_MENU = re.compile(
+    rb'Select\s*login\s*method\s*:\s*>\s*1\s*\.\s*Google\s*OAuth'
+)
 
 
 def artifact_ready(path):
@@ -102,7 +110,7 @@ def run(harness, artifact, binary, args):
                     log.write(chunk)
                     if harness == 'agy' and not selected:
                         last_bytes = (last_bytes + chunk)[-8192:]
-                        if b'Select login method' in last_bytes and b'Google' in last_bytes:
+                        if AGY_GOOGLE_MENU.search(ANSI.sub(b'', last_bytes)):
                             os.write(master, b'\r')
                             selected = True
                 if listener in ready:

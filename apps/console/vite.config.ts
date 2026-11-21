@@ -30,7 +30,7 @@ export default defineConfig({
         },
       });
       const files = (await readdir(resolve(root, 'src'), { recursive: true }))
-        .filter(file => file.endsWith('.tsx')).sort();
+        .filter(file => file.endsWith('.tsx') && !file.endsWith('.test.tsx')).sort();
       const sources = await Promise.all(files.map(file => {
         const path = resolve(root, 'src', file);
         this.addWatchFile(path);

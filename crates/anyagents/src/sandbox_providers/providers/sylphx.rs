@@ -165,46 +165,47 @@ impl SandboxProvider for SylphxProvider {
 
         run_blocking(move || {
             let (mount_path, state_dir, workdir) = resolve_layout(&req);
-            let preferred_vol_name = req
-                .volume
-                .as_ref()
-                .map(|v| v.id_or_name.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("anyagents-{}", sanitize_name(&req.agent_id)));
-            let existing_vol = req.existing.as_ref().and_then(|h| {
-                h.metadata
-                    .get("volume_resource")
-                    .cloned()
-                    .or_else(|| h.volume_id.clone())
-            });
-            let size_gib = req
-                .volume
-                .as_ref()
-                .and_then(|v| v.size_gib)
-                .or(cfg.default_volume_size_gib)
-                .map(u64::from);
+            let volume =
+                req.volume
+                    .as_ref()
+                    .map(|spec| {
+                        let fallback = format!("anyagents-{}", sanitize_name(&req.agent_id));
+                        let preferred = spec.id_or_name.trim();
+                        let existing = req.existing.as_ref().and_then(|h| {
+                            h.metadata.get("volume_resource").or(h.volume_id.as_ref())
+                        });
+                        client.ensure_volume(
+                            &cfg.parent,
+                            existing.map(String::as_str),
+                            if preferred.is_empty() {
+                                &fallback
+                            } else {
+                                preferred
+                            },
+                            spec.size_gib.or(cfg.default_volume_size_gib).map(u64::from),
+                        )
+                    })
+                    .transpose()?;
 
-            let volume = client.ensure_volume(
-                &cfg.parent,
-                existing_vol.as_deref(),
-                &preferred_vol_name,
-                size_gib,
-            )?;
-
-            // Serialize concurrent `ensure()` calls for the same volume within this
-            // coordinator replica so two simultaneous requests never race `POST /leases`.
-            let vol_lock_key = format!("{}::{}", cfg.parent, volume.resource_name);
-            let vol_lock = volume_ensure_lock(&vol_lock_key);
-            let _vol_guard = vol_lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Only persistent attachments have a stable identity to use for
+            // collision recovery. Scratch requests always get their own lease.
+            let vol_lock = volume
+                .as_ref()
+                .map(|v| volume_ensure_lock(&format!("{}::{}", cfg.parent, v.resource_name)));
+            let _vol_guard = vol_lock
+                .as_ref()
+                .map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()));
 
             let ttl_str = req.lease.ttl_duration_string();
             let mut reused_lease = None;
-            if let Some(prev_ref) = req.existing.as_ref().and_then(|h| {
-                h.metadata
-                    .get("lease_resource")
-                    .map(String::as_str)
-                    .or_else(|| (!h.sandbox_id.is_empty()).then_some(h.sandbox_id.as_str()))
-            }) && let Some(fetched) = client.get_lease(&cfg.parent, prev_ref)?
+            if volume.is_some()
+                && let Some(prev_ref) = req.existing.as_ref().and_then(|h| {
+                    h.metadata
+                        .get("lease_resource")
+                        .map(String::as_str)
+                        .or_else(|| (!h.sandbox_id.is_empty()).then_some(h.sandbox_id.as_str()))
+                })
+                && let Some(fetched) = client.get_lease(&cfg.parent, prev_ref)?
                 && !fetched.is_terminal()
             {
                 reused_lease =
@@ -215,6 +216,7 @@ impl SandboxProvider for SylphxProvider {
             // a live lease for this volume), discover and reuse any active lease attached
             // to `volume.resource_name` before attempting `POST /leases`.
             if reused_lease.is_none()
+                && let Some(volume) = &volume
                 && let Ok(Some(discovered)) =
                     client.find_active_lease_for_volume(&cfg.parent, &volume.resource_name)
             {
@@ -262,8 +264,9 @@ impl SandboxProvider for SylphxProvider {
                     loop {
                         match client.create_lease_with_options(
                             &cfg.parent,
-                            &volume.resource_name,
-                            &mount_path,
+                            volume
+                                .as_ref()
+                                .map(|v| (v.resource_name.as_str(), mount_path.as_str())),
                             image,
                             Some(template),
                             shape,
@@ -278,13 +281,16 @@ impl SandboxProvider for SylphxProvider {
                                     LEASE_READY_TIMEOUT,
                                 )?;
                             }
-                            Err(err) if is_lease_collision_or_timeout(&err) => {
+                            Err(err) if volume.is_some() && is_lease_collision_or_timeout(&err) => {
                                 // Recover when a concurrent replica or a timed-out POST
                                 // already attached `volume.resource_name` to a live lease.
-                                if let Ok(Some(discovered)) = client.find_active_lease_for_volume(
-                                    &cfg.parent,
-                                    &volume.resource_name,
-                                ) {
+                                if let Some(volume) = &volume
+                                    && let Ok(Some(discovered)) = client
+                                        .find_active_lease_for_volume(
+                                            &cfg.parent,
+                                            &volume.resource_name,
+                                        )
+                                {
                                     let ready = client.wait_lease_ready(
                                         &cfg.parent,
                                         discovered,
@@ -315,12 +321,14 @@ impl SandboxProvider for SylphxProvider {
             // ALWAYS run the idempotent layout init on every attach (fresh, reused, or recovered
             // after a POST timeout / 409): a lease whose creator never finished init would
             // otherwise leave a root-owned volume without `state/`. Failure fails closed.
-            client.init_persistent_layout(
-                &data_plane_resource,
-                &mount_path,
-                &state_dir,
-                &workdir,
-            )?;
+            if volume.is_some() {
+                client.init_persistent_layout(
+                    &data_plane_resource,
+                    &mount_path,
+                    &state_dir,
+                    &workdir,
+                )?;
+            }
 
             let transport_url = lease.envd_url.clone().or_else(|| {
                 Some(format!(
@@ -337,7 +345,9 @@ impl SandboxProvider for SylphxProvider {
             );
             metadata.insert("desired_image".into(), desired);
             metadata.insert("parent".to_string(), cfg.parent.clone());
-            metadata.insert("volume_resource".to_string(), volume.resource_name.clone());
+            if let Some(volume) = &volume {
+                metadata.insert("volume_resource".into(), volume.resource_name.clone());
+            }
             metadata.insert("lease_resource".to_string(), lease.resource_name.clone());
             metadata.insert("data_plane_resource".to_string(), data_plane_resource);
             metadata.insert("idle_ttl_ms".to_string(), req.lease.idle_ttl_ms.to_string());
@@ -349,7 +359,7 @@ impl SandboxProvider for SylphxProvider {
             Ok(SandboxHandle {
                 provider: ProviderKind::Sylphx,
                 sandbox_id: lease.id,
-                volume_id: Some(volume.id),
+                volume_id: volume.map(|v| v.id),
                 mount_path: normalize_unix_dir(&mount_path, DEFAULT_MOUNT_PATH),
                 state_dir,
                 workdir,
@@ -496,7 +506,7 @@ impl SandboxProvider for SylphxProvider {
 
         run_blocking(move || {
             if !lease_ref.is_empty() {
-                let _ = client.release_lease(&parent, &lease_ref);
+                client.release_lease(&parent, &lease_ref)?;
             }
             if let Some(vol) = volume_ref.filter(|s| !s.trim().is_empty()) {
                 client.delete_volume(&parent, &vol)?;
@@ -537,6 +547,8 @@ fn resolve_lease_resource(parent: &str, handle: &SandboxHandle) -> String {
         .unwrap_or_else(|| {
             if handle.sandbox_id.contains('/') {
                 handle.sandbox_id.clone()
+            } else if handle.sandbox_id.trim().is_empty() {
+                String::new()
             } else {
                 format!("{parent}/leases/{}", handle.sandbox_id)
             }
