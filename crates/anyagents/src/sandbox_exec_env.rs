@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 pub(crate) const ENV_SANDBOX_CODE_SHAPE: &str = "ANYAGENTS_SANDBOX_CODE_SHAPE";
 pub(crate) const ENV_SANDBOX_CODE_VOLUME_SIZE_GIB: &str = "ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB";
 
+/// Optional deployment-wide compute tier for sandboxes with browser profile grants.
+const ENV_SANDBOX_BROWSER_SHAPE: &str = "ANYAGENTS_SANDBOX_BROWSER_SHAPE";
+
 /// Coordinator environment prefix forwarded as deployment-wide defaults into
 /// remote sandbox leases, `guest-config.json`, and detached turns.
 pub(crate) const SANDBOX_ENV_PREFIX: &str = "ANYAGENTS_SANDBOX_ENV_";
@@ -124,15 +127,14 @@ pub(crate) fn sandbox_data_dir_from_state_root(state_root: &str) -> String {
 
 /// Resolve `(shape, volume_size_gib)` for a remote sandbox lease.
 ///
-/// Precedence:
-/// 1. Explicit per-agent binding override (`explicit_shape` / `explicit_volume_gib`).
-/// 2. When `has_repo` is true (repo-backed coding sandbox):
-///    `ANYAGENTS_SANDBOX_CODE_SHAPE` / `ANYAGENTS_SANDBOX_CODE_VOLUME_SIZE_GIB`.
-/// 3. Lean deployment default (`default_shape` / `default_volume_gib`, i.e.
-///    `ANYAGENTS_SANDBOX_SHAPE` / `ANYAGENTS_SANDBOX_VOLUME_SIZE_GIB`).
+/// Browser agents prefer the browser tier, then the code tier, over a shape
+/// recorded by an earlier lease. Other agents keep the binding-first policy,
+/// with the code tier as the fallback for repo agents. Browser grants do not
+/// affect volume sizing.
 pub(crate) fn resolve_sandbox_shape_and_volume_with_env<I>(
     has_repo: bool,
-    explicit_shape: Option<&str>,
+    has_browser_profiles: bool,
+    binding_shape: Option<&str>,
     explicit_volume_gib: Option<u32>,
     default_shape: Option<String>,
     default_volume_gib: Option<u32>,
@@ -148,16 +150,22 @@ where
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let shape = explicit_shape
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            has_repo
-                .then(|| env_nonempty(ENV_SANDBOX_CODE_SHAPE))
-                .flatten()
-        })
-        .or(default_shape);
+    let shape = if has_browser_profiles {
+        // The binding records a previously requested shape, possibly from
+        // before the agent had browser grants. Recompute the browser tier.
+        env_nonempty(ENV_SANDBOX_BROWSER_SHAPE).or_else(|| env_nonempty(ENV_SANDBOX_CODE_SHAPE))
+    } else {
+        binding_shape
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                has_repo
+                    .then(|| env_nonempty(ENV_SANDBOX_CODE_SHAPE))
+                    .flatten()
+            })
+    }
+    .or(default_shape);
     let volume_gib = explicit_volume_gib
         .filter(|&v| v > 0)
         .or_else(|| {
@@ -179,19 +187,14 @@ pub(crate) fn resolve_sandbox_shape_and_volume_for_agent(
     has_local_repo: bool,
     default_shape: Option<String>,
     default_volume_gib: Option<u32>,
-) -> (Option<String>, Option<u32>) {
+    process_env: impl IntoIterator<Item = (String, String)>,
+) -> Result<(Option<String>, Option<u32>), anyagents_core::Error> {
+    let has_browser_profiles = !store.list_agent_browser_profiles(agent_id)?.is_empty();
     let existing = store.sandbox_binding(agent_id).ok().flatten();
-    let explicit_shape = existing.as_ref().and_then(|b| {
-        serde_json::from_str::<Value>(&b.spec_json)
-            .ok()
-            .and_then(|v| {
-                v.get("shape")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-    });
+    let spec = existing
+        .as_ref()
+        .and_then(|b| serde_json::from_str::<Value>(&b.spec_json).ok());
+    let binding_shape = spec.as_ref().and_then(|v| v.get("shape")?.as_str());
     let explicit_vol = existing
         .as_ref()
         .and_then(|b| b.volume_size_gib)
@@ -204,14 +207,15 @@ pub(crate) fn resolve_sandbox_shape_and_volume_for_agent(
                 .ok()
                 .flatten()
                 .is_some());
-    resolve_sandbox_shape_and_volume_with_env(
+    Ok(resolve_sandbox_shape_and_volume_with_env(
         has_repo,
-        explicit_shape.as_deref(),
+        has_browser_profiles,
+        binding_shape,
         explicit_vol,
         default_shape,
         default_volume_gib,
-        std::env::vars(),
-    )
+        process_env,
+    ))
 }
 
 /// Merge `mcpServers.anyagents` into existing `.claude.json` (or `.claude/.claude.json`)
@@ -598,12 +602,14 @@ mod tests {
     #[test]
     fn repo_backed_sandbox_selects_code_tier_while_non_repo_stays_lean() {
         let env = vec![
+            (ENV_SANDBOX_BROWSER_SHAPE.into(), "c8m16".into()),
             (ENV_SANDBOX_CODE_SHAPE.into(), "c4m8".into()),
             (ENV_SANDBOX_CODE_VOLUME_SIZE_GIB.into(), "40".into()),
         ];
         // Non-repo sandbox stays on lean default tier.
         assert_eq!(
             resolve_sandbox_shape_and_volume_with_env(
+                false,
                 false,
                 None,
                 None,
@@ -617,6 +623,7 @@ mod tests {
         assert_eq!(
             resolve_sandbox_shape_and_volume_with_env(
                 true,
+                false,
                 None,
                 None,
                 Some("c1m2".into()),
@@ -629,6 +636,7 @@ mod tests {
         assert_eq!(
             resolve_sandbox_shape_and_volume_with_env(
                 true,
+                false,
                 Some("c8m16"),
                 Some(80),
                 Some("c1m2".into()),
@@ -641,6 +649,7 @@ mod tests {
         assert_eq!(
             resolve_sandbox_shape_and_volume_with_env(
                 true,
+                false,
                 None,
                 None,
                 Some("c1m2".into()),
@@ -649,6 +658,69 @@ mod tests {
             ),
             (Some("c1m2".into()), Some(10))
         );
+    }
+
+    #[test]
+    fn browser_grant_recomputes_shape_from_current_tiers_without_changing_volume() {
+        use anyagents_core::{BrowserProfileActor, NewAgent, SandboxBinding, Store};
+
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("browser-agent", "codex"))
+            .unwrap();
+        let mut binding = SandboxBinding::new(agent.id.clone(), "http");
+        binding.spec_json = json!({"shape": "old-lean"}).to_string();
+        binding.volume_size_gib = Some(24);
+        store.sandbox_binding_store().upsert(&binding).unwrap();
+
+        let resolve = |has_repo, browser_shape, code_shape| {
+            resolve_sandbox_shape_and_volume_for_agent(
+                &store,
+                &agent.id,
+                has_repo,
+                Some("lean".into()),
+                Some(10),
+                [
+                    (ENV_SANDBOX_BROWSER_SHAPE, browser_shape),
+                    (ENV_SANDBOX_CODE_SHAPE, code_shape),
+                    (ENV_SANDBOX_CODE_VOLUME_SIZE_GIB, Some("40")),
+                ]
+                .into_iter()
+                .filter_map(|(key, value)| Some((key.into(), String::from(value?)))),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            resolve(false, Some("browser"), Some("code")),
+            (Some("old-lean".into()), Some(24))
+        );
+        store
+            .set_agent_browser_profiles_as(
+                &BrowserProfileActor::Operator,
+                &agent.id,
+                &["test-profile".into()],
+            )
+            .unwrap();
+
+        for has_repo in [false, true] {
+            assert_eq!(
+                resolve(has_repo, Some(" browser "), Some("code")),
+                (Some("browser".into()), Some(24))
+            );
+            assert_eq!(
+                resolve(has_repo, None, Some("code")),
+                (Some("code".into()), Some(24))
+            );
+            assert_eq!(
+                resolve(has_repo, Some(" "), Some("code")),
+                (Some("code".into()), Some(24))
+            );
+            assert_eq!(
+                resolve(has_repo, None, None),
+                (Some("lean".into()), Some(24))
+            );
+        }
     }
 
     #[test]

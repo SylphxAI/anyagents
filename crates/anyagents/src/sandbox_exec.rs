@@ -1284,7 +1284,9 @@ pub(crate) fn ensure_sandbox_with_registry(
         read_synced_repo_spec(config_dir).is_some(),
         template_req.shape,
         template_req.volume.and_then(|v| v.size_gib),
-    );
+        std::env::vars(),
+    )
+    .map_err(|e| e.to_string())?;
     ensure_sandbox_with_provider(
         store,
         registry.active(),
