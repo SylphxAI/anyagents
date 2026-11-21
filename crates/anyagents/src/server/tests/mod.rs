@@ -2,7 +2,10 @@
 
 mod accounts;
 mod agents;
+// The ADR 0005 source scan recognizes these command fixtures as test-only by suffix.
+#[path = "archive_tests.rs"]
 mod archive;
+#[path = "checkout_tests.rs"]
 mod checkout;
 mod helpers;
 mod knowledge;
