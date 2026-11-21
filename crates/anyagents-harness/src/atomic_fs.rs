@@ -16,10 +16,7 @@ static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically persist `bytes` to `dst` with Unix mode `mode`, allowing empty payloads.
 pub fn atomic_write_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    atomic_write_with(dst, bytes, mode, false, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
-    })
+    atomic_write_with(dst, bytes, mode, false, |file, data| file.write_all(data))
 }
 
 /// Atomically persist non-empty `bytes` to `dst` with Unix mode `mode`.
@@ -27,10 +24,7 @@ pub fn atomic_write_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> 
 /// Fails closed with `ErrorKind::InvalidInput` if `bytes` is empty so auth tokens,
 /// credentials, profile metadata, and state JSON files can never be truncated to `0` bytes.
 pub fn atomic_write_nonempty_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    atomic_write_with(dst, bytes, mode, true, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
-    })
+    atomic_write_with(dst, bytes, mode, true, |file, data| file.write_all(data))
 }
 
 /// Atomically persist non-empty `bytes` to `dst` inside an existing parent directory.
@@ -39,8 +33,7 @@ pub fn atomic_write_nonempty_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Re
 /// markers into a retired/offline `state_dir` fails closed with `NotFound`.
 pub fn atomic_write_in_existing_dir(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     atomic_write_inner(dst, bytes, mode, true, false, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
+        file.write_all(data)
     })
 }
 

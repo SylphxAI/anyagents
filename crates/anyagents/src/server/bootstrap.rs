@@ -24,6 +24,8 @@ use super::{
     outbound_history, quota_rotation, serverless,
 };
 
+mod deployment_blobs;
+
 const SOCKET_NAME: &str = "anyagents.sock";
 
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -135,68 +137,6 @@ impl Drop for Retaining {
             supervisor.retain_processes();
         }
     }
-}
-
-/// Materialize deployment-level config, secret, profile, skill, and role blobs from
-/// PostgreSQL (`public.deployment_blobs`) into a stateless/serverless replica's
-/// local ephemeral data directory so `FileCredentialStore`, `Settings::load`,
-/// profile lookups, skills, and custom role templates work identically across cold starts.
-fn hydrate_deployment_blobs_on_start(store: &Store, data: &Path) -> Result<usize, Error> {
-    let master_key = anyagents_core::MasterKey::from_env()?;
-    let blobs = store.blob_store_with_key(master_key);
-    let mut hydrated = 0usize;
-    let secrets_dir = data.join("secrets");
-    std::fs::create_dir_all(&secrets_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700));
-    }
-    for ns in ["config", "secrets", "profiles", "skills", "roles"] {
-        let entries = blobs.get_deployment_blobs_all(ns)?;
-        for entry in entries {
-            if anyagents_core::stateless::validate_blob_path(&entry.path).is_err() {
-                continue;
-            }
-            let dest = match ns {
-                "config" => data.join(&entry.path),
-                "secrets" => data.join("secrets").join(&entry.path),
-                "profiles" => data.join("profiles").join(&entry.path),
-                "skills" => data.join("skills").join(&entry.path),
-                "roles" => data.join("roles").join(&entry.path),
-                _ => continue,
-            };
-            let mode = if entry.encrypted || ns == "secrets" {
-                0o600
-            } else {
-                0o644
-            };
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-                #[cfg(unix)]
-                if ns == "secrets" {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
-            }
-            if entry.content.is_empty() {
-                std::fs::write(&dest, [])?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode));
-                }
-            } else {
-                anyagents_harness::atomic_write_nonempty_file(&dest, &entry.content, mode)?;
-            }
-            hydrated += 1;
-        }
-    }
-    if hydrated > 0 {
-        eprintln!("anyagents-blobs: hydrated {hydrated} deployment blob(s) from postgres");
-    }
-    Ok(hydrated)
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -351,7 +291,7 @@ async fn serve(
         tokio::task::spawn_blocking(move || {
             let store = Store::open(root.join("state.db"))?;
             if store.is_postgres()
-                && let Err(err) = hydrate_deployment_blobs_on_start(&store, &root)
+                && let Err(err) = deployment_blobs::hydrate_on_start(&store, &root)
             {
                 eprintln!("anyagents-blobs: startup hydration warning: {err}");
             }
