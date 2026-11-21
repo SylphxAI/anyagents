@@ -21,7 +21,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 pub use atomic_fs::{
-    atomic_write_file, atomic_write_in_existing_dir, atomic_write_nonempty_file, atomic_write_with,
+    atomic_write_file, atomic_write_file_defer_parent_sync, atomic_write_in_existing_dir,
+    atomic_write_nonempty_file, atomic_write_with,
 };
 pub use fake::FakeHarness;
 pub use name::normalize_harness_name;

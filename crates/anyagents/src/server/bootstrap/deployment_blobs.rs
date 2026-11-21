@@ -1,6 +1,7 @@
 //! Materialize PostgreSQL-backed deployment state before opening serving routes.
 
-use std::fs::{self, DirBuilder, Permissions};
+use std::collections::{BTreeSet, HashSet};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -33,7 +34,7 @@ fn hydrate(blobs: &dyn StateBlobStore, data: &Path) -> Result<usize, Error> {
             data.join(ns)
         };
         let entries = blobs.get_deployment_blobs_all(ns)?;
-        hydrated += materialize(&root, &entries, ns == "secrets")?;
+        hydrated += materialize(data, &root, &entries, ns == "secrets")?;
     }
     Ok(hydrated)
 }
@@ -43,52 +44,86 @@ fn create_secret_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o700))
 }
 
-fn materialize(root: &Path, entries: &[BlobEntry], secret: bool) -> Result<usize, Error> {
-    let write = |entry: &BlobEntry| -> Result<usize, Error> {
+fn materialize(
+    data: &Path,
+    root: &Path,
+    entries: &[BlobEntry],
+    secret: bool,
+) -> Result<usize, Error> {
+    let mut dirs = BTreeSet::new();
+    let mut seen = HashSet::new();
+    let mut duplicate = false;
+    let mut files = Vec::new();
+    for entry in entries {
         let Ok(path) = validate_blob_path(&entry.path) else {
-            return Ok(0);
+            continue;
         };
         let dest = root.join(path);
-        if secret && let Some(parent) = dest.parent() {
-            create_secret_dir(parent)?;
+        for dir in dest.ancestors().skip(1) {
+            dirs.insert(dir.to_owned());
+            if dir == data {
+                break;
+            }
         }
+        duplicate |= !seen.insert(dest.clone());
         let mode = if secret || entry.encrypted {
             0o600
         } else {
             0o644
         };
-        // This syncs and verifies the temp inode before rename and fsyncs
-        // the parent afterwards. An empty payload must be just as atomic.
-        anyagents_harness::atomic_write_file(&dest, &entry.content, mode)?;
-        Ok(1)
+        files.push((dest, entry.content.as_slice(), mode));
+    }
+    // A path sorts before its descendants; make each directory once instead
+    // of creating/chmod'ing the same hierarchy on every file write.
+    for dir in &dirs {
+        if secret && dir.starts_with(root) {
+            create_secret_dir(dir)?;
+        } else {
+            fs::create_dir_all(dir)?;
+        }
+    }
+    let write = |(dest, bytes, mode): &(std::path::PathBuf, &[u8], u32)| -> Result<(), Error> {
+        anyagents_harness::atomic_write_file_defer_parent_sync(dest, bytes, *mode)?;
+        Ok(())
     };
-    if entries.len() <= 1 {
-        return entries.iter().map(write).sum();
+    let write_all = |batch: &[_]| batch.iter().try_for_each(write);
+    // Legacy rows may normalize to the same path; keep their order so the
+    // final rename matches the serial hydration result.
+    let result = if files.len() <= 1 || duplicate {
+        write_all(&files)
+    } else {
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            let mut result = Ok(());
+            for chunk in files.chunks(files.len().div_ceil(MAX_WRITERS)) {
+                match std::thread::Builder::new().spawn_scoped(scope, || write_all(chunk)) {
+                    Ok(worker) => workers.push(worker),
+                    Err(err) => {
+                        result = Err(err.into());
+                        break;
+                    }
+                }
+            }
+            for worker in workers {
+                let completed = worker.join().unwrap_or_else(|_| {
+                    Err(Error::Message("deployment blob writer panicked".into()))
+                });
+                result = result.and(completed);
+            }
+            result
+        })
+    };
+    // Flush once per touched directory, including newly created ancestors,
+    // deepest first. Always flush successful siblings before returning a
+    // write error. If interrupted before this barrier the durable PG copy
+    // can replay the batch; any visible file was individually synced first.
+    let mut durable = Ok(());
+    for dir in dirs.iter().rev() {
+        durable = durable.and(File::open(dir).and_then(|file| file.sync_all()));
     }
-    // Different stored paths cannot name the same destination through the
-    // normal write API, but legacy rows can normalize to the same path. Keep
-    // the old ordering if that happens rather than racing the two renames.
-    let mut seen = std::collections::HashSet::new();
-    if entries.iter().any(|entry| !seen.insert(entry.path.trim())) {
-        return entries.iter().map(write).sum();
-    }
-    std::thread::scope(|scope| {
-        let mut workers = Vec::new();
-        for chunk in entries.chunks(entries.len().div_ceil(MAX_WRITERS)) {
-            workers.push(std::thread::Builder::new().spawn_scoped(scope, move || {
-                chunk.iter().map(write).sum::<Result<usize, Error>>()
-            })?);
-        }
-        // Join even on error so no materialization can outlive startup hydration.
-        let mut result = Ok(0);
-        for worker in workers {
-            let completed = worker
-                .join()
-                .unwrap_or_else(|_| Err(Error::Message("deployment blob writer panicked".into())));
-            result = result.and_then(|total| completed.map(|written| total + written));
-        }
-        result
-    })
+    result?;
+    durable?;
+    Ok(files.len())
 }
 
 #[cfg(test)]
@@ -110,7 +145,7 @@ mod tests {
             version: 1,
             updated_at_ms: 0,
         }];
-        assert!(materialize(root, &entries, true).is_err());
+        assert!(materialize(root, root, &entries, true).is_err());
         assert_eq!(fs::read(root.join("not-a-file/retained")).unwrap(), b"keep");
         assert_eq!(fs::read_dir(root).unwrap().count(), 1);
     }
