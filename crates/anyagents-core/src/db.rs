@@ -412,10 +412,7 @@ impl PgHandle {
                     .execute(&mut *conn)
                     .await?;
                     if ver == 1 {
-                        let compat_ver = crate::migrate::MIGRATIONS
-                            .last()
-                            .map(|(v, _)| *v)
-                            .unwrap_or(40);
+                        let compat_ver = crate::migrate::SQLITE_LATEST_VERSION;
                         sqlx::query(
                             "INSERT INTO public.schema_migrations (version, applied_at_ms)
                              VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",

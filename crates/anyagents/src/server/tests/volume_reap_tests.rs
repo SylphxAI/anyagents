@@ -2,7 +2,9 @@ use super::super::agents_lifecycle::{
     VerdictRequest, archive_agent_route, delete_agent_route, verdict_route,
 };
 use super::super::*;
-use super::helpers::archetype_validation_state;
+use super::helpers::{archetype_validation_state, state_for_store};
+
+mod postgres_upgrade_tests;
 use anyagents_core::stateless::SandboxBinding;
 use anyagents_core::{Agent, NewAgent, stateless::NewRemoteTurn};
 use axum::Json;
@@ -76,6 +78,16 @@ impl Fixture {
         probe: (StatusCode, Value),
         delete: StatusCode,
     ) -> Self {
+        Self::with_store(lifecycle, live, probe, delete, None).await
+    }
+
+    async fn with_store(
+        lifecycle: &str,
+        live: bool,
+        probe: (StatusCode, Value),
+        delete: StatusCode,
+        postgres_url: Option<&str>,
+    ) -> Self {
         let mock = SandboxMock {
             calls: Default::default(),
             probe,
@@ -86,7 +98,10 @@ impl Fixture {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let dir = tempfile::tempdir().unwrap();
-        let state = archetype_validation_state(dir.path());
+        let state = match postgres_url {
+            Some(url) => state_for_store(Store::open_postgres(url, dir.path()).unwrap()),
+            None => archetype_validation_state(dir.path()),
+        };
         let parent = state
             .store
             .create_agent(NewAgent::new("parent", "opencode"))

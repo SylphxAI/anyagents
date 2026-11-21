@@ -12,7 +12,7 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub const MIGRATIONS: &[(i64, &str)] = &[
+pub const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_channel_credential.sql")),
     (3, include_str!("../migrations/003_failed_turns.sql")),
@@ -103,7 +103,15 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         48,
         include_str!("../migrations/049_archive_disposition.sql"),
     ),
+    (
+        REPAIR_ARCHIVE_DISPOSITION,
+        include_str!("../migrations/050_repair_archive_disposition.sql"),
+    ),
 ];
+
+pub const SQLITE_LATEST_VERSION: i64 = SQLITE_MIGRATIONS[SQLITE_MIGRATIONS.len() - 1].0;
+pub use SQLITE_MIGRATIONS as MIGRATIONS;
+const REPAIR_ARCHIVE_DISPOSITION: i64 = 49;
 
 /// The version that moves the mailbox search index out of the state
 /// database. Opening an older database first copies what only its search
@@ -112,8 +120,7 @@ pub const MEMORY_INDEX_SPLIT: i64 = 34;
 
 /// Apply pending migrations. Each migration commits on its own, in order.
 pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
-    let latest = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(0);
-    if current_version(conn)? >= latest {
+    if current_version(conn)? >= SQLITE_LATEST_VERSION {
         return Ok(());
     }
     conn.execute_batch(
@@ -127,11 +134,24 @@ pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
         [],
         |row| row.get(0),
     )?;
-    for (version, sql) in MIGRATIONS {
+    for (version, sql) in SQLITE_MIGRATIONS {
         if *version <= current {
             continue;
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if *version == REPAIR_ARCHIVE_DISPOSITION {
+            // SQLite has no ADD COLUMN IF NOT EXISTS. Inspect under the same
+            // writer transaction that repairs the trigger and records this version.
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents')
+                               WHERE name = 'terminal_archive_verdict')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN terminal_archive_verdict TEXT;")?;
+            }
+        }
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
@@ -163,6 +183,36 @@ pub fn current_version(conn: &Connection) -> Result<i64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_disposition_sqlite_repairs_legacy_and_already_recorded_schemas() {
+        for (baseline, missing_column) in [(0, false), (47, false), (48, false), (48, true)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);").unwrap();
+            for &(version, sql) in SQLITE_MIGRATIONS.iter().take_while(|(v, _)| *v <= baseline) {
+                if !(missing_column && version == 48) {
+                    conn.execute_batch(sql).unwrap();
+                }
+                conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                    .unwrap();
+            }
+            migrate(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(current_version(&conn).unwrap(), SQLITE_LATEST_VERSION);
+            conn.execute_batch("INSERT INTO agents (id, name, harness, state, created_at_ms, terminal_archive_verdict)
+                VALUES ('agt_test','test','opencode','archived',0,'verdict');
+                UPDATE agents SET state = 'running' WHERE id = 'agt_test';
+                UPDATE agents SET state = 'archived' WHERE id = 'agt_test';").unwrap();
+            let verdict: Option<String> = conn
+                .query_row(
+                    "SELECT terminal_archive_verdict FROM agents WHERE id = 'agt_test'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(verdict, None);
+        }
+    }
 
     #[test]
     fn redaction_migration_upgrades_scope_audit_and_group_owner_without_replacing_them() {

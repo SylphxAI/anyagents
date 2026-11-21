@@ -18,7 +18,7 @@ const PG_CHANNEL_IDENTITY_UNIQUE_SQL: &str =
     include_str!("../../migrations_pg/009_channel_identity_unique.sql");
 pub const PG_TURN_TRANSCRIPT_EVENTS_SQL: &str =
     include_str!("../../migrations_pg/012_turn_transcript_events.sql");
-pub const PG_LATEST_VERSION: i64 = 14;
+pub const PG_LATEST_VERSION: i64 = PG_MIGRATIONS[PG_MIGRATIONS.len() - 1].0;
 
 pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
     (1, PG_INIT_SQL),
@@ -48,4 +48,29 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         15,
         include_str!("../../migrations_pg/015_archive_disposition.sql"),
     ),
+    (
+        16,
+        include_str!("../../migrations_pg/016_repair_archive_disposition.sql"),
+    ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate::{SQLITE_LATEST_VERSION, SQLITE_MIGRATIONS};
+
+    #[test]
+    fn migration_versions_are_contiguous_for_both_backends() {
+        for (migrations, latest) in [
+            (PG_MIGRATIONS, PG_LATEST_VERSION),
+            (SQLITE_MIGRATIONS, SQLITE_LATEST_VERSION),
+        ] {
+            assert!(
+                migrations
+                    .iter()
+                    .map(|&(version, _)| version)
+                    .eq(1..=latest)
+            );
+        }
+    }
+}
