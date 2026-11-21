@@ -336,6 +336,7 @@ impl TakeoverTunnelHandle {
         self.reconnect_count.load(Ordering::Acquire)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn completion(&self) -> watch::Receiver<()> {
         self.done.clone()
     }
