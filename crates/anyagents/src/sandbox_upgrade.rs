@@ -7,37 +7,49 @@ use serde::Serialize;
 use crate::sandbox_exec::{release_sandbox_binding_with_provider, resolve_registry_for_binding};
 use crate::sandbox_providers::image_version::{LeaseVersion, desired_ref};
 use crate::sandbox_providers::providers::{
-    ProviderKind, ProviderRegistry, SandboxProvider as AsyncSandboxProvider,
+    ImageSpec, ProviderKind, ProviderRegistry, SandboxProvider as AsyncSandboxProvider,
 };
 use crate::sandbox_providers::sylphx::DEFAULT_TEMPLATE;
 
 const NS: &str = "markers";
-const DRAIN: &str = "sandbox-drain-lease";
+pub(crate) const DRAIN: &str = "sandbox-drain-lease";
 /// Guest heartbeats fire every 5s while live; an older `inflight_children > 0`
 /// snapshot with no active turn is stale (e.g. a completed or dead guest) and
 /// must not block turn-boundary lease recycling indefinitely.
 const INFLIGHT_HEARTBEAT_FRESHNESS_MS: i64 = 60_000;
 
-pub(crate) fn desired_image(store: &Store, binding: Option<&SandboxBinding>) -> String {
-    let registry = ProviderRegistry::from_env_or_config(Some(store.data_dir()), None).ok();
-    let spec = registry.as_ref().map(ProviderRegistry::default_image_spec);
-    desired_ref(
-        if let Some(spec) = spec {
-            spec.image.as_deref()
-        } else {
-            binding.and_then(|b| b.image.as_deref())
-        },
-        if let Some(spec) = spec {
-            spec.template.as_deref()
-        } else {
-            binding.and_then(|b| b.template.as_deref())
-        }
-        .unwrap_or(DEFAULT_TEMPLATE),
+fn desired_image(store: &Store, binding: Option<&SandboxBinding>) -> String {
+    desired_image_ref(
+        configured_image_spec(store).as_ref(),
+        binding.and_then(|b| b.image.as_deref()),
+        binding.and_then(|b| b.template.as_deref()),
     )
 }
 
-pub(crate) fn version(binding: &SandboxBinding) -> LeaseVersion {
-    serde_json::from_str::<serde_json::Value>(&binding.spec_json)
+pub(crate) fn configured_image_spec(store: &Store) -> Option<ImageSpec> {
+    ProviderRegistry::from_env_or_config(Some(store.data_dir()), None)
+        .ok()
+        .map(|registry| registry.default_image_spec().clone())
+}
+
+pub(crate) fn desired_image_ref(
+    configured: Option<&ImageSpec>,
+    image: Option<&str>,
+    template: Option<&str>,
+) -> String {
+    let (image, template) = match configured {
+        Some(spec) => (spec.image.as_deref(), spec.template.as_deref()),
+        None => (image, template),
+    };
+    desired_ref(image, template.unwrap_or(DEFAULT_TEMPLATE))
+}
+
+fn version(binding: &SandboxBinding) -> LeaseVersion {
+    version_from_spec(&binding.spec_json)
+}
+
+pub(crate) fn version_from_spec(spec_json: &str) -> LeaseVersion {
+    serde_json::from_str::<serde_json::Value>(spec_json)
         .ok()
         .and_then(|spec| {
             serde_json::from_str(spec.pointer("/metadata/lease_version")?.as_str()?).ok()
@@ -70,11 +82,18 @@ pub(crate) fn has_active_turn(store: &Store, agent: &AgentId) -> Result<bool, Er
             .is_empty())
 }
 
-fn heartbeat_reports_live_children(hb: &anyagents_core::RuntimeHeartbeat, now_ms: i64) -> bool {
-    hb.inflight_children > 0
-        && hb
-            .heartbeat_at_ms
+pub(crate) fn heartbeat_has_live_children(
+    inflight_children: i64,
+    heartbeat_at_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    inflight_children > 0
+        && heartbeat_at_ms
             .is_some_and(|ts| now_ms.saturating_sub(ts) <= INFLIGHT_HEARTBEAT_FRESHNESS_MS)
+}
+
+fn heartbeat_reports_live_children(hb: &anyagents_core::RuntimeHeartbeat, now: i64) -> bool {
+    heartbeat_has_live_children(hb.inflight_children.into(), hb.heartbeat_at_ms, now)
 }
 
 pub(crate) fn busy(store: &Store, agent: &AgentId) -> Result<bool, Error> {

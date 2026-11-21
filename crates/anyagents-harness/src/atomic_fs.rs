@@ -16,9 +16,17 @@ static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically persist `bytes` to `dst` with Unix mode `mode`, allowing empty payloads.
 pub fn atomic_write_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    atomic_write_with(dst, bytes, mode, false, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
+    atomic_write_with(dst, bytes, mode, false, |file, data| file.write_all(data))
+}
+
+/// Atomically replace a file in an existing directory, allowing an empty payload.
+///
+/// The file itself is synced and verified before rename. This is for a batch
+/// backed by an authoritative copy: the caller MUST sync every touched
+/// directory (and ancestors it created) before reporting the batch durable.
+pub fn atomic_write_file_defer_parent_sync(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write_inner(dst, bytes, mode, false, false, false, |file, data| {
+        file.write_all(data)
     })
 }
 
@@ -27,10 +35,7 @@ pub fn atomic_write_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> 
 /// Fails closed with `ErrorKind::InvalidInput` if `bytes` is empty so auth tokens,
 /// credentials, profile metadata, and state JSON files can never be truncated to `0` bytes.
 pub fn atomic_write_nonempty_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    atomic_write_with(dst, bytes, mode, true, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
-    })
+    atomic_write_with(dst, bytes, mode, true, |file, data| file.write_all(data))
 }
 
 /// Atomically persist non-empty `bytes` to `dst` inside an existing parent directory.
@@ -38,9 +43,8 @@ pub fn atomic_write_nonempty_file(dst: &Path, bytes: &[u8], mode: u32) -> io::Re
 /// Does NOT call `create_dir_all` on `dst.parent()`, so writing state holds or
 /// markers into a retired/offline `state_dir` fails closed with `NotFound`.
 pub fn atomic_write_in_existing_dir(dst: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    atomic_write_inner(dst, bytes, mode, true, false, |file, data| {
-        file.write_all(data)?;
-        file.sync_all()
+    atomic_write_inner(dst, bytes, mode, true, false, true, |file, data| {
+        file.write_all(data)
     })
 }
 
@@ -56,7 +60,7 @@ pub fn atomic_write_with<F>(
 where
     F: FnOnce(&mut File, &[u8]) -> io::Result<()>,
 {
-    atomic_write_inner(dst, bytes, mode, require_nonempty, true, write_fn)
+    atomic_write_inner(dst, bytes, mode, require_nonempty, true, true, write_fn)
 }
 
 fn atomic_write_inner<F>(
@@ -65,6 +69,7 @@ fn atomic_write_inner<F>(
     mode: u32,
     require_nonempty: bool,
     create_parents: bool,
+    sync_parent: bool,
     write_fn: F,
 ) -> io::Result<()>
 where
@@ -129,7 +134,9 @@ where
         // whole. A concurrent writer's later rename may replace it at once,
         // so `dst` is not read back: its bytes may rightly be another commit.
         fs::rename(&tmp, dst)?;
-        File::open(parent)?.sync_all()?;
+        if sync_parent {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     })();
 

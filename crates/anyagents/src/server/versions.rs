@@ -61,16 +61,25 @@ async fn versions(
         } else {
             env("ANYAGENTS_AUTO_UPDATE_POLICY").and_then(|raw| serde_json::from_value(json!(raw)).ok()).unwrap_or_default()
         };
-        let desired = upgrade::desired_image(store, None);
+        let configured = upgrade::configured_image_spec(store);
+        let desired = upgrade::desired_image_ref(configured.as_ref(), None, None);
+        let now = anyagents_core::now_ms();
         let mut counts = [0, 0, 0, 0];
         let mut agents = Vec::new();
-        for agent in store.list_agents().map_err(ApiError::from_store)? {
-            let binding = store.sandbox_binding(&agent.id).map_err(ApiError::from_store)?;
-            let active = binding.as_ref().filter(|b| upgrade::lease_key(b).is_some() && !matches!(b.lease_state.as_str(), "expired" | "detached" | "failed"));
-            let open = upgrade::busy(store, &agent.id).map_err(ApiError::from_store)?;
-            let desired_for_agent = upgrade::desired_image(store, binding.as_ref());
-            let version = active.map(upgrade::version).unwrap_or_default();
-            let requested = active.map(|b| upgrade::requested(store,b)).transpose().map_err(ApiError::from_store)?.unwrap_or_default();
+        for agent in store.sandbox_inventory(upgrade::DRAIN).map_err(ApiError::from_store)? {
+            let binding = agent.binding.as_ref();
+            let active = binding.filter(|b| b.active_lease_key().is_some());
+            let open = agent.has_open_turn
+                || upgrade::heartbeat_has_live_children(
+                    agent.inflight_children, agent.heartbeat_at_ms, now,
+                );
+            let desired_for_agent = upgrade::desired_image_ref(
+                configured.as_ref(),
+                binding.and_then(|b| b.image.as_deref()),
+                binding.and_then(|b| b.template.as_deref()),
+            );
+            let version = active.map(|b| upgrade::version_from_spec(&b.spec_json)).unwrap_or_default();
+            let requested = active.is_some() && agent.drain_requested;
             let status = match active {
                 None => 3,
                 Some(b) if b.provider != "sylphx" || (!requested && version.matches(&desired_for_agent)) => 0,

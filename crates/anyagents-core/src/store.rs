@@ -116,6 +116,7 @@ mod runtime_issues;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
+mod sandbox_inventory;
 #[cfg(test)]
 #[path = "store/schedule_archive_tests.rs"]
 mod schedule_archive_tests;
