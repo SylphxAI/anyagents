@@ -117,6 +117,25 @@ pub trait StateBlobStore: Send + Sync {
         path: &str,
     ) -> Result<Option<BlobEntry>, Error>;
 
+    /// One well-known path for a batch of agents. Filesystem stores use one
+    /// file read per ID; the PostgreSQL implementation uses an indexed query.
+    fn get_agent_file_batch(
+        &self,
+        ids: &[&AgentId],
+        namespace: &str,
+        path: &str,
+    ) -> Result<std::collections::HashMap<AgentId, BlobEntry>, Error> {
+        Ok(ids
+            .iter()
+            .filter_map(|&id| {
+                self.get_agent_file(id, namespace, path)
+                    .ok()
+                    .flatten()
+                    .map(|entry| (id.clone(), entry))
+            })
+            .collect())
+    }
+
     fn put_agent_file(
         &self,
         agent_id: &AgentId,
@@ -244,6 +263,61 @@ impl StateBlobStore for PgStateBlobStore {
             version,
             updated_at_ms,
         }))
+    }
+
+    fn get_agent_file_batch(
+        &self,
+        ids: &[&AgentId],
+        namespace: &str,
+        path: &str,
+    ) -> Result<std::collections::HashMap<AgentId, BlobEntry>, Error> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let ns = validate_agent_namespace(namespace)?;
+        let clean = validate_blob_path(path)?;
+        let pool = self.pool.clone();
+        let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        let query_path = clean.clone();
+        let rows = block_on_pg(async move {
+            sqlx::query_as::<_, (String, Vec<u8>, String, bool, i64, i64)>(
+                "SELECT agent_id, content, sha256, encrypted, version, updated_at_ms
+                 FROM public.agent_files
+                 WHERE agent_id = ANY($1) AND namespace = $2 AND path = $3",
+            )
+            .bind(ids)
+            .bind(ns)
+            .bind(query_path)
+            .fetch_all(&pool)
+            .await
+            .map_err(Error::from)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, raw, sha256, encrypted, version, updated_at_ms)| {
+                let id = AgentId::parse(&id).ok()?;
+                let content = if encrypted {
+                    self.require_key()
+                        .ok()?
+                        .decrypt(&agent_aad(&id, ns, &clean), &raw)
+                        .ok()?
+                } else {
+                    raw
+                };
+                Some((
+                    id,
+                    BlobEntry {
+                        namespace: ns.into(),
+                        path: clean.clone(),
+                        content,
+                        sha256,
+                        encrypted,
+                        version,
+                        updated_at_ms,
+                    },
+                ))
+            })
+            .collect())
     }
 
     fn put_agent_file(

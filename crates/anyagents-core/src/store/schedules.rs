@@ -600,7 +600,7 @@ fn schedule_by_id(conn: &dyn DbExec, id: &str) -> Result<AgentSchedule, Error> {
     found.ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
 }
 
-fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
+pub(super) fn schedule_from_row_db(row: &DbRow<'_>) -> Result<AgentSchedule, Error> {
     let agent_id = row.parse_str(1)?;
     let kind: String = row.get(2)?;
     let persistent = kind == WEBHOOK_SUBSCRIPTION;

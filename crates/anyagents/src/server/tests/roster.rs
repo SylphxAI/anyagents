@@ -795,3 +795,252 @@ async fn list_agents_all_paginates_live_first_and_omits_archived_instructions_wh
             .is_some_and(|s| s.contains("GRANDCHILD_PRIVATE"))
     );
 }
+
+fn roster_mcp_fixture(state: &AppState, prefix: &str) -> (String, Agent) {
+    std::fs::write(
+        state.store.data_dir().join(crate::remote::CONFIG_FILE),
+        "[server]
+public_url = \"https://agents.example.com\"
+",
+    )
+    .unwrap();
+    let caller = state
+        .store
+        .create_agent(anyagents_core::NewAgent::new(
+            format!("{prefix}-root"),
+            "spiron-cloud",
+        ))
+        .unwrap();
+    crate::remote::begin_session(&state.store, &caller).unwrap();
+    let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &caller.id);
+    (crate::remote::session_token(&cfg).unwrap(), caller)
+}
+
+fn roster_fixture_agent(
+    store: &Store,
+    name: String,
+    parent: Option<&Agent>,
+    lifecycle: &str,
+) -> Agent {
+    let mut new = anyagents_core::NewAgent::new(name, "codex");
+    new.parent_id = parent.map(|a| a.id.clone());
+    new.instructions = Some("private fixture instructions".into());
+    let agent = store.create_agent(new).unwrap();
+    store.set_agent_state(&agent.id, lifecycle).unwrap()
+}
+
+async fn call_roster(state: &AppState, token: &str, args: serde_json::Value) -> serde_json::Value {
+    use super::helpers::{post_mcp_as, tool_call};
+    let (status, body) = post_mcp_as(state, token, None, tool_call("agents", args))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    body["result"]["structuredContent"].clone()
+}
+
+fn check_roster_contract(state: &AppState) {
+    use serde_json::json;
+    let prefix = format!("roster-{}", anyagents_core::AgentId::generate().as_str());
+    let (token, caller) = roster_mcp_fixture(state, &prefix);
+    state.store.set_agent_scope(&caller.id, "isolated").unwrap();
+    let a = roster_fixture_agent(
+        &state.store,
+        format!("{prefix}-a"),
+        Some(&caller),
+        "running",
+    );
+    let b = roster_fixture_agent(
+        &state.store,
+        format!("{prefix}-b"),
+        Some(&caller),
+        "running",
+    );
+    let old = roster_fixture_agent(
+        &state.store,
+        format!("{prefix}-old"),
+        Some(&caller),
+        "archived",
+    );
+    let nested = roster_fixture_agent(
+        &state.store,
+        format!("{prefix}-nested"),
+        Some(&old),
+        "paused",
+    );
+    let hidden = roster_fixture_agent(&state.store, format!("{prefix}-hidden"), None, "running");
+    let alias = format!("{prefix}-a-renamed");
+    state.store.rename_agent(&a.id, &alias).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let list = |args| call_roster(state, &token, args);
+        let names = |v: &serde_json::Value| {
+            v["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let first =
+            list(json!({"action":"list","parent":"self","state":"running","limit":1})).await;
+        assert_eq!(names(&first), [alias.as_str()]);
+        assert_eq!(first["archived_count"], 1);
+        assert_eq!(first["summary"]["total"], 2);
+        assert_eq!(first["summary"]["running"], 2);
+        assert_eq!(first["next_cursor"], 1);
+        assert_eq!(first["agents"][0]["relationship"], "child");
+        assert_eq!(first["agents"][0]["can_message"], true);
+        assert!(first["agents"][0]["instructions"].is_null());
+        let second =
+            list(json!({"action":"list","parent":"self","state":"running","limit":1,"cursor":1}))
+                .await;
+        assert_eq!(names(&second), [b.name.as_str()]);
+        assert!(second["next_cursor"].is_null());
+        let archived = list(json!({"action":"list","parent":"self","state":"archived"})).await;
+        assert_eq!(names(&archived), [old.name.as_str()]);
+        let idle = list(json!({"action":"list","parent":"self","state":"idle"})).await;
+        assert!(names(&idle).contains(&old.name));
+        let all = list(json!({"action":"list","parent":"subagents","state":"all"})).await;
+        assert_eq!(
+            names(&all),
+            [
+                alias.clone(),
+                b.name.clone(),
+                nested.name.clone(),
+                old.name.clone()
+            ]
+        );
+        let roots = list(json!({"action":"list","parent":"root"})).await;
+        assert_eq!(names(&roots), [caller.name.as_str()]);
+        let found = list(
+            json!({"action":"list","parent":"self","include_descendants":true,"query":nested.name}),
+        )
+        .await;
+        assert_eq!(names(&found), [nested.name.as_str()]);
+        assert_eq!(found["summary"]["total"], 3);
+        assert_eq!(found["summary"]["matched"], 1);
+        assert_eq!(found["agents"][0]["relationship"], "descendant");
+        let principal = Principal::Agent {
+            agent_id: caller.id.clone(),
+            name: caller.name.clone(),
+        };
+        let http = |q| {
+            list_agents_sync_for_principal(state, &principal, &q)
+                .unwrap()
+                .0
+        };
+        let named = http(ListAgentsQuery {
+            name: Some(a.name.clone()),
+            ..Default::default()
+        });
+        assert_eq!(
+            named
+                .agents
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            [alias.as_str(), caller.name.as_str()]
+        );
+        assert!(
+            http(ListAgentsQuery {
+                name: Some(hidden.name.clone()),
+                ..Default::default()
+            })
+            .agents
+            .is_empty()
+        );
+        let all = http(ListAgentsQuery {
+            state: Some("all".into()),
+            limit: Some(1),
+            offset: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(all.agents[0].name, old.name);
+    });
+    for agent in [&nested, &old, &hidden, &a, &b, &caller] {
+        state.store.delete_agent(&agent.id).unwrap();
+    }
+}
+
+#[test]
+fn roster_mcp_and_http_contract_sqlite() {
+    let _env = env_lock();
+    let dir = crate::test_tempdir();
+    check_roster_contract(&archetype_validation_state(dir.path()));
+}
+
+#[test]
+fn roster_mcp_and_http_contract_postgres() {
+    let Ok(url) = std::env::var("ANYAGENTS_ROSTER_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skipping roster PostgreSQL contract: dedicated ANYAGENTS_ROSTER_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let _env = env_lock();
+    let dir = crate::test_tempdir();
+    check_roster_contract(&super::helpers::state_for_store(
+        Store::open_postgres(&url, dir.path()).unwrap(),
+    ));
+}
+
+#[test]
+#[ignore = "manual 10k-archive benchmark; set ANYAGENTS_ROSTER_TEST_POSTGRES_URL for a dedicated PostgreSQL database"]
+fn roster_mcp_high_cardinality() {
+    use serde_json::json;
+    use std::time::Instant;
+    let _env = env_lock();
+    let dir = crate::test_tempdir();
+    let state = match std::env::var("ANYAGENTS_ROSTER_TEST_POSTGRES_URL") {
+        Ok(url) => super::helpers::state_for_store(Store::open_postgres(&url, dir.path()).unwrap()),
+        Err(_) => archetype_validation_state(dir.path()),
+    };
+    let (token, caller) = roster_mcp_fixture(&state, "bench");
+    for i in 0..50 {
+        roster_fixture_agent(
+            &state.store,
+            format!("bench-live-{i:02}"),
+            Some(&caller),
+            "running",
+        );
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for archives in [0, 10_000] {
+        if archives > 0 {
+            for i in 0..archives {
+                roster_fixture_agent(
+                    &state.store,
+                    format!("bench-archived-{i:05}"),
+                    Some(&caller),
+                    "archived",
+                );
+            }
+        }
+        let mut samples = Vec::new();
+        for sample in 0..26 {
+            let start = Instant::now();
+            let response = runtime.block_on(call_roster(
+                &state,
+                &token,
+                json!({"action":"list","parent":"self"}),
+            ));
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(response["archived_count"], archives);
+            assert_eq!(response["summary"]["running"], 50);
+            assert_eq!(response["agents"].as_array().unwrap().len(), 50);
+            if sample != 0 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "archives={archives} mcp_ms_min={:.2} median={:.2} p95={:.2} max={:.2}",
+            samples[0], samples[12], samples[23], samples[24]
+        );
+        assert!(
+            samples[23] < 100.0,
+            "roster p95 exceeded 100ms: {samples:?}"
+        );
+    }
+}

@@ -82,6 +82,8 @@ macro_rules! agent_summary_cols {
 #[path = "store/agent_runtime_tests.rs"]
 mod agent_runtime_tests;
 mod agents;
+mod roster;
+pub use roster::{RosterAncestor, RosterSelection};
 #[cfg(test)]
 #[path = "store/audit_tests.rs"]
 mod audit_tests;
