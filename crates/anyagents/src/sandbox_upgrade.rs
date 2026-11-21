@@ -121,6 +121,11 @@ pub(crate) fn recycle_at_boundary(
     agent: &AgentId,
     provider: Option<&dyn AsyncSandboxProvider>,
 ) -> Result<Action, String> {
+    let _lifecycle = match store.try_lock_agent_lifecycle(agent) {
+        Ok(guard) => guard,
+        Err(Error::AgentBusy) => return Ok(Action::DrainScheduled),
+        Err(err) => return Err(err.to_string()),
+    };
     let Some(mut binding) = store.sandbox_binding(agent).map_err(|e| e.to_string())? else {
         return Ok(Action::ColdNextTurnLatest);
     };
@@ -128,6 +133,20 @@ pub(crate) fn recycle_at_boundary(
         return Ok(Action::ColdNextTurnLatest);
     }
     if binding.provider != "sylphx" || provider.is_some_and(|p| p.kind() != ProviderKind::Sylphx) {
+        return Ok(Action::AlreadyUpToDate);
+    }
+    if crate::sandbox_exec::takeover_pin::holds(store, &binding, anyagents_core::now_ms())
+        .map_err(|e| e.to_string())?
+    {
+        // An explicit drain request must survive until the pinned lease expires.
+        let key = lease_key(&binding).unwrap_or_default();
+        if !version(&binding).matches(&desired_image(store, Some(&binding))) {
+            store
+                .blob_store()
+                .put_agent_file(agent, NS, DRAIN, key.as_bytes(), false)
+                .map_err(|e| e.to_string())?;
+            return Ok(Action::DrainScheduled);
+        }
         return Ok(Action::AlreadyUpToDate);
     }
     let desired = desired_image(store, Some(&binding));

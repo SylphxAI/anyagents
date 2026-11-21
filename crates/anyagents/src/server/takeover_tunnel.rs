@@ -16,8 +16,8 @@
 //!   `AgentId`, or `Operator`) AND matching `takeover_token` (fail-closed).
 //! - Both the guest tunnel WS and every viewer WS send `Ping` keepalives every
 //!   25s (< 60s) to clear proxy/CDN idle cutoffs.
-//! - Unexpected drops retain the session for a brief reconnect grace window
-//!   (default 15s); explicit `Unregister` tears down immediately (`404`).
+//! - Unexpected drops do not end a remote lease pin. Standalone sessions
+//!   retain their brief reconnect grace window; explicit unregister ends either.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -47,8 +47,14 @@ use super::in_flight::Stopping;
 use super::serverless;
 use super::types::AppState;
 
+mod guest_frames;
+mod lease;
+use guest_frames::{handle_guest_binary_frame, handle_guest_control_frame};
+use lease::{ENDED, EXPIRED, LeasePin, RegisterError};
+
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 pub(crate) const DEFAULT_RECONNECT_GRACE: Duration = Duration::from_secs(15);
+const EXPIRED_VIEWER_RETENTION: Duration = Duration::from_secs(300);
 const RECONNECT_WAIT_CAP: Duration = Duration::from_secs(8);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,6 +77,8 @@ enum ControlFrame {
     Register {
         token: String,
         #[serde(default)]
+        reconnect: bool,
+        #[serde(default)]
         agent_id: Option<String>,
         #[serde(default)]
         local_origin: Option<String>,
@@ -79,6 +87,8 @@ enum ControlFrame {
         public_base_url: String,
         public_url: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_ms: Option<u64>,
     },
     Unregister,
     Error {
@@ -177,14 +187,14 @@ fn decode_binary_frame(raw: &[u8]) -> Option<(u8, u64, Bytes)> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TunnelOwner {
     Operator,
-    Agent(String),
+    Agent(anyagents_core::AgentId),
 }
 
 impl TunnelOwner {
     fn from_principal(principal: &Principal) -> Self {
         match principal {
             Principal::Operator => Self::Operator,
-            Principal::Agent { agent_id, .. } => Self::Agent(agent_id.to_string()),
+            Principal::Agent { agent_id, .. } => Self::Agent(agent_id.clone()),
         }
     }
 
@@ -244,6 +254,7 @@ struct TakeoverSession {
     public_base_url: String,
     cookie_path: String,
     secure_cookie: bool,
+    pin: Option<LeasePin>,
     conn: RwLock<TunnelConnState>,
     reconnect_notify: Notify,
     next_req_id: AtomicU64,
@@ -253,7 +264,11 @@ struct TakeoverSession {
 }
 
 impl TakeoverSession {
-    fn is_expired_try(&self, grace: Duration) -> bool {
+    fn is_evictable(&self, grace: Duration) -> bool {
+        if let Some(pin) = &self.pin {
+            return Instant::now().saturating_duration_since(pin.deadline())
+                >= EXPIRED_VIEWER_RETENTION;
+        }
         self.conn.try_read().is_ok_and(|c| c.is_expired(grace))
     }
 
@@ -262,6 +277,11 @@ impl TakeoverSession {
         grace: Duration,
     ) -> Result<(u64, mpsc::Sender<OutboundTunnelMsg>), StatusCode> {
         let deadline = Instant::now() + grace.min(RECONNECT_WAIT_CAP);
+        let grace = if self.pin.is_some() {
+            Duration::MAX
+        } else {
+            grace
+        };
         loop {
             let notified = self.reconnect_notify.notified();
             tokio::pin!(notified);
@@ -338,36 +358,30 @@ impl TakeoverRegistry {
 
     async fn get_active(&self, session_id: &str) -> Option<Arc<TakeoverSession>> {
         let entry = self.sessions.read().await.get(session_id).cloned()?;
-        if entry.conn.read().await.is_expired(self.grace_window) {
-            let mut guard = self.sessions.write().await;
-            if guard
-                .get(session_id)
-                .is_some_and(|cur| Arc::ptr_eq(cur, &entry))
-                && entry.conn.read().await.is_expired(self.grace_window)
-            {
-                guard.remove(session_id);
-                return None;
-            }
-        }
-        Some(entry)
+        (!entry.is_evictable(self.grace_window)).then_some(entry)
     }
 
     async fn register_or_reattach(
         &self,
         session_id: &str,
+        store: Arc<Store>,
         owner: TunnelOwner,
-        token: String,
+        register: Register,
         public: PublicEndpoint,
         tx: mpsc::Sender<OutboundTunnelMsg>,
-    ) -> Result<(Arc<TakeoverSession>, u64), (&'static str, &'static str, u16)> {
+    ) -> Result<(Arc<TakeoverSession>, u64), RegisterError> {
+        let Register { token, reconnect } = register;
         let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, s| !s.is_expired_try(self.grace_window));
+        sessions.retain(|_, s| !s.is_evictable(self.grace_window));
         if let Some(existing) = sessions.get(session_id).cloned() {
             if !existing.owner.may_reattach(&owner) {
                 return Err(("FORBIDDEN", "session owned by another principal", 4403));
             }
             if !constant_time_eq(existing.token.as_bytes(), token.as_bytes()) {
                 return Err(("UNAUTHORIZED", "takeover token mismatch on reconnect", 4401));
+            }
+            if let Some(pin) = &existing.pin {
+                pin.check().await?;
             }
             let generation = {
                 let mut conn = existing.conn.write().await;
@@ -386,6 +400,7 @@ impl TakeoverRegistry {
                 4429,
             ));
         }
+        let pin = LeasePin::register(store, &owner, session_id, &token, reconnect).await?;
         let entry = Arc::new(TakeoverSession {
             owner,
             token,
@@ -393,6 +408,7 @@ impl TakeoverRegistry {
             public_base_url: public.base_url,
             cookie_path: public.cookie_path,
             secure_cookie: public.secure,
+            pin,
             conn: RwLock::new(TunnelConnState {
                 generation: 1,
                 tx: Some(tx),
@@ -415,29 +431,26 @@ impl TakeoverRegistry {
         generation: u64,
         force: bool,
     ) {
-        if force {
-            let mut conn = entry.conn.write().await;
-            if conn.generation != generation {
-                return;
-            }
-            conn.tx = None;
-            conn.disconnected_at = None;
-            drop(conn);
-            entry.reconnect_notify.notify_waiters();
-        }
+        // Take locks in the same order as registration. A superseded socket
+        // cannot revoke the generation that replaced it.
         let mut sessions = self.sessions.write().await;
-        if sessions
+        if !sessions
             .get(session_id)
             .is_some_and(|cur| Arc::ptr_eq(cur, entry))
         {
-            let remove = force || {
-                let c = entry.conn.read().await;
-                c.generation == generation && c.tx.is_none()
-            };
-            if remove {
-                sessions.remove(session_id);
-            }
+            return;
         }
+        let mut conn = entry.conn.write().await;
+        if conn.generation != generation || (!force && conn.tx.is_some()) {
+            return;
+        }
+        if force && let Some(pin) = &entry.pin {
+            pin.end().await;
+        }
+        conn.tx = None;
+        conn.disconnected_at = None;
+        entry.reconnect_notify.notify_waiters();
+        sessions.remove(session_id);
     }
 }
 
@@ -611,9 +624,12 @@ async fn tunnel_ws_route(
     };
     let registry = registry_for_store(&state.store);
     let owner = TunnelOwner::from_principal(&principal);
+    let store = state.store;
     ws.max_message_size(MAX_TUNNEL_FRAME_BYTES)
         .max_frame_size(MAX_TUNNEL_FRAME_BYTES)
-        .on_upgrade(move |socket| run_guest_tunnel(socket, registry, session_id, owner, public))
+        .on_upgrade(move |socket| {
+            run_guest_tunnel(socket, registry, store, session_id, owner, public)
+        })
 }
 
 async fn send_tunnel_error_and_close(
@@ -636,9 +652,14 @@ async fn send_tunnel_error_and_close(
         .await;
 }
 
-async fn read_register_token(
+struct Register {
+    token: String,
+    reconnect: bool,
+}
+
+async fn read_register(
     ws_rx: &mut futures::stream::SplitStream<WebSocket>,
-) -> Result<String, (&'static str, String, u16)> {
+) -> Result<Register, (&'static str, String, u16)> {
     let frame = tokio::time::timeout(REGISTER_TIMEOUT, async {
         while let Some(msg) = ws_rx.next().await {
             match msg {
@@ -658,7 +679,10 @@ async fn read_register_token(
     .map_err(|_| ("TIMEOUT", "registration timed out".to_string(), 4408))?
     .map_err(|msg| ("BAD_REQUEST", msg, 4400))?;
 
-    let ControlFrame::Register { token, .. } = frame else {
+    let ControlFrame::Register {
+        token, reconnect, ..
+    } = frame
+    else {
         return Err((
             "BAD_REQUEST",
             "first tunnel frame must be `register`".into(),
@@ -668,19 +692,20 @@ async fn read_register_token(
     if !is_valid_takeover_token(&token) {
         return Err(("BAD_REQUEST", "invalid takeover token format".into(), 4400));
     }
-    Ok(token)
+    Ok(Register { token, reconnect })
 }
 
 async fn run_guest_tunnel(
     socket: WebSocket,
     registry: Arc<TakeoverRegistry>,
+    store: Arc<Store>,
     session_id: String,
     owner: TunnelOwner,
     public: PublicEndpoint,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let token = match read_register_token(&mut ws_rx).await {
-        Ok(tok) => tok,
+    let register = match read_register(&mut ws_rx).await {
+        Ok(frame) => frame,
         Err((code, msg, close)) => {
             send_tunnel_error_and_close(&mut ws_tx, code, &msg, close).await;
             return;
@@ -689,7 +714,7 @@ async fn run_guest_tunnel(
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundTunnelMsg>(TUNNEL_OUTBOUND_QUEUE);
     let (entry, generation) = match registry
-        .register_or_reattach(&session_id, owner, token.clone(), public, out_tx)
+        .register_or_reattach(&session_id, store, owner, register, public, out_tx)
         .await
     {
         Ok(res) => res,
@@ -700,11 +725,14 @@ async fn run_guest_tunnel(
     };
 
     let mut full_url = url::Url::parse(&entry.public_base_url).expect("validated base url");
-    full_url.query_pairs_mut().append_pair("token", &token);
+    full_url
+        .query_pairs_mut()
+        .append_pair("token", &entry.token);
     let Ok(ack_text) = serde_json::to_string(&ControlFrame::Registered {
         public_base_url: entry.public_base_url.clone(),
         public_url: full_url.to_string(),
         session_id: session_id.clone(),
+        ttl_ms: entry.pin.as_ref().map(LeasePin::remaining_ms),
     }) else {
         return;
     };
@@ -719,10 +747,27 @@ async fn run_guest_tunnel(
     );
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let expiry = async {
+        if let Some(pin) = &entry.pin {
+            tokio::time::sleep_until(pin.deadline().into()).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(expiry);
     let mut unregistered = false;
+    let mut terminal = None;
     loop {
         tokio::select! {
+            _ = &mut expiry => {
+                terminal = Some(EXPIRED);
+                break;
+            }
             _ = ping_interval.tick() => {
+                if let Some(pin) = &entry.pin && let Err(err) = pin.check().await {
+                    terminal = Some(err);
+                    break;
+                }
                 if ws_tx.send(Message::Ping(Bytes::from_static(b"keepalive"))).await.is_err() {
                     break;
                 }
@@ -757,8 +802,12 @@ async fn run_guest_tunnel(
         }
     }
 
-    let _ = ws_tx.send(Message::Close(None)).await;
     handle_tunnel_disconnect(&registry, &session_id, &entry, generation, unregistered).await;
+    if let Some((code, msg, close)) = terminal.or_else(|| unregistered.then_some(ENDED)) {
+        send_tunnel_error_and_close(&mut ws_tx, code, msg, close).await;
+    } else {
+        let _ = ws_tx.send(Message::Close(None)).await;
+    }
 }
 
 async fn handle_tunnel_disconnect(
@@ -786,6 +835,9 @@ async fn handle_tunnel_disconnect(
         }
     };
     if became_disconnected {
+        entry.reconnect_notify.notify_waiters();
+    }
+    if became_disconnected && entry.pin.is_none() {
         let (reg, sid, sess, grace) = (
             Arc::clone(registry),
             session_id.to_string(),
@@ -797,123 +849,6 @@ async fn handle_tunnel_disconnect(
             reg.remove_entry(&sid, &sess, generation, false).await;
             sess.reconnect_notify.notify_waiters();
         });
-    }
-}
-
-async fn handle_guest_control_frame(entry: &TakeoverSession, frame: ControlFrame) {
-    match frame {
-        ControlFrame::HttpResponseHead {
-            id,
-            status,
-            headers,
-            done,
-        } => {
-            let mut http = entry.inflight_http.lock().await;
-            let is_sse = headers.iter().any(|(k, v)| {
-                k.eq_ignore_ascii_case("content-type")
-                    && v.to_ascii_lowercase().starts_with("text/event-stream")
-            });
-            if let Some(p) = http.get_mut(&id) {
-                p.is_sse = is_sse;
-                if let Some(tx) = p.head_tx.take() {
-                    let _ = tx.send(HttpHeadPayload {
-                        status,
-                        headers,
-                        done,
-                    });
-                }
-            }
-            if done {
-                http.remove(&id);
-            }
-        }
-        ControlFrame::HttpResponseEnd { id, error } => {
-            if let Some(p) = entry.inflight_http.lock().await.remove(&id)
-                && let Some(err) = error
-            {
-                let _ = p.body_tx.try_send(Err(err));
-            }
-        }
-        ControlFrame::WsOpened {
-            id,
-            ok,
-            protocol,
-            error,
-        } => {
-            let mut ws = entry.inflight_ws.lock().await;
-            if let Some(p) = ws.get_mut(&id)
-                && let Some(tx) = p.opened_tx.take()
-            {
-                let _ = tx.send(WsOpenedPayload {
-                    ok,
-                    protocol,
-                    error,
-                });
-            }
-            if !ok {
-                ws.remove(&id);
-            }
-        }
-        ControlFrame::WsText { id, text } => {
-            let tx = entry
-                .inflight_ws
-                .lock()
-                .await
-                .get(&id)
-                .map(|p| p.viewer_tx.clone());
-            if let Some(tx) = tx {
-                let _ = tx.send(ViewerWsMsg::Text(text)).await;
-            }
-        }
-        ControlFrame::WsClose { id, code, reason } => {
-            if let Some(p) = entry.inflight_ws.lock().await.remove(&id) {
-                let cf = code.map(|c| CloseFrame {
-                    code: c,
-                    reason: Utf8Bytes::from(reason.unwrap_or_default()),
-                });
-                let _ = p.viewer_tx.send(ViewerWsMsg::Close(cf)).await;
-            }
-        }
-        _ => {}
-    }
-}
-
-async fn handle_guest_binary_frame(entry: &TakeoverSession, raw: &[u8]) {
-    let Some((tag, id, payload)) = decode_binary_frame(raw) else {
-        return;
-    };
-    if tag == BIN_TAG_WS_DATA {
-        let tx = entry
-            .inflight_ws
-            .lock()
-            .await
-            .get(&id)
-            .map(|p| p.viewer_tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(ViewerWsMsg::Binary(payload)).await;
-        }
-    } else if tag == BIN_TAG_HTTP_CHUNK {
-        let (tx, exceeded) = {
-            let mut http = entry.inflight_http.lock().await;
-            let Some(p) = http.get_mut(&id) else {
-                return;
-            };
-            if !p.is_sse && {
-                p.bytes_received = p.bytes_received.saturating_add(payload.len());
-                p.bytes_received > MAX_HTTP_RESP_BYTES
-            } {
-                (http.remove(&id).map(|p| p.body_tx), true)
-            } else {
-                (Some(p.body_tx.clone()), false)
-            }
-        };
-        if let Some(tx) = tx {
-            if exceeded {
-                let _ = tx.try_send(Err("upstream response exceeded 16 MiB limit".into()));
-            } else {
-                let _ = tx.send(Ok(payload)).await;
-            }
-        }
     }
 }
 
@@ -1006,6 +941,19 @@ async fn resolve_and_auth_viewer(
     let session = registry.get_active(session_id).await.ok_or(not_found)?;
     let auth = authenticate_viewer(session_id, &session.token, headers, uri)
         .ok_or((StatusCode::UNAUTHORIZED, "valid takeover token required"))?;
+    if let Some(pin) = &session.pin {
+        match pin.check().await {
+            Ok(()) => {}
+            Err(EXPIRED) => return Err((StatusCode::GONE, "takeover lease expired")),
+            Err(ENDED) => return Err(not_found),
+            Err(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "cannot verify takeover lease",
+                ));
+            }
+        }
+    }
     let mint = matches!(auth, ViewerAuth::QueryToken)
         .then(|| build_session_set_cookie(session_id, &session, headers))
         .flatten();
@@ -1707,6 +1655,7 @@ mod tests {
             let mut guest = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
             let register = ControlFrame::Register {
                 token: token.into(),
+                reconnect: false,
                 agent_id: None,
                 local_origin: None,
             };
@@ -1777,6 +1726,7 @@ mod tests {
         let mut guest_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
         let reg = serde_json::to_string(&ControlFrame::Register {
             token: takeover_token.into(),
+            reconnect: false,
             agent_id: None,
             local_origin: Some("http://127.0.0.1:6080".into()),
         })
@@ -1790,6 +1740,7 @@ mod tests {
             public_base_url,
             public_url,
             session_id: ack_sid,
+            ttl_ms: None,
         } = serde_json::from_str(&ack_txt).unwrap()
         else {
             panic!("expected Registered frame: {ack_txt}");
@@ -1949,6 +1900,7 @@ mod tests {
         let mut attacker_ws = dial_guest(fx.addr, session_id, &fx.agent_b_token).await;
         let hijack_reg = serde_json::to_string(&ControlFrame::Register {
             token: takeover_token.into(),
+            reconnect: false,
             agent_id: None,
             local_origin: None,
         })
@@ -1973,6 +1925,7 @@ mod tests {
         let mut wrong_tok_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
         let bad_reg = serde_json::to_string(&ControlFrame::Register {
             token: "wrong_tok".into(),
+            reconnect: false,
             agent_id: None,
             local_origin: None,
         })
@@ -2001,6 +1954,7 @@ mod tests {
         let mut guest_ws2 = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
         let reg2 = serde_json::to_string(&ControlFrame::Register {
             token: takeover_token.into(),
+            reconnect: true,
             agent_id: None,
             local_origin: None,
         })
@@ -2065,6 +2019,7 @@ mod tests {
         let mut guest_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
         let reg = serde_json::to_string(&ControlFrame::Register {
             token: token.into(),
+            reconnect: false,
             agent_id: None,
             local_origin: None,
         })

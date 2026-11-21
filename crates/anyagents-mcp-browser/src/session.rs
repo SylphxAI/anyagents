@@ -765,9 +765,18 @@ async fn launch_direct_instance(
 }
 
 pub(crate) async fn finalize_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
-    if let Some(tunnel) = inst.takeover_tunnel.take() {
+    let tunnel = inst.takeover_tunnel.take();
+    if let Some(tunnel) = &tunnel {
+        tunnel.quiesce();
+    }
+    let result = flush_instance(inst).await;
+    if let Some(tunnel) = tunnel {
         tunnel.stop().await;
     }
+    result
+}
+
+async fn flush_instance(inst: &mut BrowserInstance) -> (bool, Option<String>) {
     shutdown_backend(&mut inst.backend).await;
     // Flush cookie stores (incl. SQLite WAL/shm sidecars) and `Local State`
     // to disk before any sync-up: the browser may have been killed mid-write,

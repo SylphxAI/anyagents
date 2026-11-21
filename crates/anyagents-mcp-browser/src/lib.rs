@@ -7,6 +7,8 @@
 pub mod chromium;
 pub mod config;
 pub mod desktop;
+#[cfg(target_os = "linux")]
+pub mod guest_runtime;
 pub mod profile_sync;
 pub mod proxy;
 pub mod secrets;

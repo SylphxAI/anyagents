@@ -18,7 +18,7 @@
     "crates/anyagents/src/main.rs": 3100,
     "crates/anyagents/src/mcp/tools.rs": 2336,
     "crates/anyagents/src/repo.rs": 2743,
-    "crates/anyagents/src/sandbox_exec.rs": 3468,
+    "crates/anyagents/src/sandbox_exec.rs": 3087,
     "crates/anyagents/src/sandbox_providers/sylphx.rs": 2471,
     "crates/anyagents/src/schedule.rs": 2341,
     "crates/anyagents/src/seat_tree.rs": 1938,

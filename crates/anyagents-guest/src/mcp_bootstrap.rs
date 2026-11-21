@@ -238,7 +238,7 @@ pub(crate) fn sync_local_mcp_configs(
     let aid =
         env_val("ANYAGENTS_AGENT_ID", env).or_else(|| file_cfg.and_then(|c| c.agent_id.clone()));
     let tok = crate::media::resolve_auth_token(state_dir, env, file_cfg);
-    let servers = discover_local_mcp_servers(
+    let mut servers = discover_local_mcp_servers(
         Some(state_dir),
         Some(work_dir),
         env,
@@ -246,6 +246,16 @@ pub(crate) fn sync_local_mcp_configs(
         aid.as_deref(),
         tok.as_deref(),
     );
+    // Enable only in Linux sandbox images with the relay binary.
+    if cfg!(target_os = "linux")
+        && env_val("ANYAGENTS_BROWSER_RECONNECT", env).as_deref() == Some("1")
+        && let Some(browser) = servers.iter_mut().find(|server| server.name == "browser")
+    {
+        browser.args = vec![
+            "--guest-runtime-dir".to_string(),
+            state_dir.join(".browser-runtime").display().to_string(),
+        ];
+    }
     if !servers.is_empty() {
         apply_servers(harness, state_dir, &servers);
     }

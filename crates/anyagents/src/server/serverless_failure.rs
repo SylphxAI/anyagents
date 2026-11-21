@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyagents_core::stateless::PendingRemoteTurn;
-use anyagents_core::{Agent, AgentId, Incoming, ReceiveOutcome, Store};
+use anyagents_core::{Agent, AgentId, Error, Incoming, ReceiveOutcome, Store};
 
 use super::serverless::ReplyTarget;
 use crate::sandbox_providers::providers::{SandboxHandle, SandboxProvider};
@@ -34,6 +34,28 @@ pub(super) fn is_unhealthy_lease_exec_error(err: &str) -> bool {
 /// Release the compute lease at the sandbox provider (preserving persistent
 /// volumes) and always clear ephemeral lease columns in the binding store.
 pub(super) fn release_and_clear_sandbox_lease(store: &Store, agent_id: &AgentId) {
+    release_and_clear(store, agent_id, false);
+}
+
+fn release_and_clear(store: &Store, agent_id: &AgentId, respect_pin: bool) {
+    let Ok(_lifecycle) = store.try_lock_agent_lifecycle(agent_id) else {
+        return;
+    };
+    if respect_pin {
+        let pinned = store.sandbox_binding(agent_id).and_then(|binding| {
+            binding.map_or(Ok(false), |b| {
+                crate::sandbox_exec::takeover_pin::holds(store, &b, anyagents_core::now_ms())
+            })
+        });
+        if !matches!(pinned, Ok(false)) {
+            // Keep normal idle bookkeeping so the sweep can release after expiry.
+            let now = anyagents_core::now_ms();
+            let _ = store
+                .sandbox_binding_store()
+                .update_lease_state(agent_id, "ready", Some(now));
+            return;
+        }
+    }
     let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), agent_id);
     if let Err(err) = crate::sandbox_exec::release_sandbox_for_agent(store, agent_id, &cfg_dir) {
         eprintln!(
@@ -52,6 +74,17 @@ pub(super) async fn release_unhealthy_lease_before_retry(
     agent_id: &AgentId,
     handle: &SandboxHandle,
 ) {
+    let store_lock = Arc::clone(store);
+    let aid = agent_id.clone();
+    let Ok(Ok(lifecycle)) = tokio::task::spawn_blocking(move || {
+        let lifecycle = store_lock.try_lock_agent_lifecycle(&aid)?;
+        crate::sandbox_exec::takeover_pin::end_locked(&store_lock, &aid, None)?;
+        Ok::<_, Error>(lifecycle)
+    })
+    .await
+    else {
+        return;
+    };
     if let Err(err) = provider.release(handle).await {
         eprintln!(
             "anyagents-serverless: unhealthy lease `{}` release failed for `{}` before retry: {err}",
@@ -62,6 +95,7 @@ pub(super) async fn release_unhealthy_lease_before_retry(
     let store_clear = Arc::clone(store);
     let aid = agent_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        let _lifecycle = lifecycle;
         let _ = store_clear.sandbox_binding_store().clear_lease(&aid);
     })
     .await;
@@ -192,7 +226,7 @@ pub(super) fn finalize_settled_turn_runtime_and_binding(
         },
     );
     if turn.status == "failed" && turn.harness_kind == "sandbox" && !busy {
-        release_and_clear_sandbox_lease(store, &turn.agent_id);
+        release_and_clear(store, &turn.agent_id, true);
     } else if let Ok(Some(binding)) = store.sandbox_binding(&turn.agent_id) {
         let _ = store
             .sandbox_binding_store()

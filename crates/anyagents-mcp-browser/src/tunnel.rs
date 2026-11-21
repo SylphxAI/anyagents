@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -72,11 +73,15 @@ enum ControlFrame {
         agent_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_origin: Option<String>,
+        #[serde(default)]
+        reconnect: bool,
     },
     Registered {
         public_base_url: String,
         public_url: String,
         session_id: String,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     Unregister,
     Error {
@@ -218,13 +223,24 @@ impl std::fmt::Debug for TunnelConfig {
     }
 }
 
+const MAX_TAKEOVER_TTL: Duration = Duration::from_secs(30 * 60);
+const TERMINAL_CODES: [u16; 2] = [4410, 4411];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run,
+    Quiesce,
+    Stop,
+}
+
 /// Running background handle for an outbound takeover reverse-tunnel.
 /// Dropping the handle signals clean shutdown (`Unregister` + close).
 pub struct TakeoverTunnelHandle {
     session_id: String,
     public_base_url: String,
     public_url: String,
-    stop_tx: watch::Sender<bool>,
+    command: watch::Sender<Command>,
+    done: watch::Receiver<()>,
     connected: Arc<AtomicBool>,
     reconnect_count: Arc<AtomicU64>,
     task: Option<JoinHandle<()>>,
@@ -258,7 +274,7 @@ impl TakeoverTunnelHandle {
                 &config.auth,
                 &config.takeover_token,
                 config.agent_id.as_deref(),
-                config.local_addr,
+                (config.local_addr, false),
             ),
         )
         .await
@@ -269,7 +285,8 @@ impl TakeoverTunnelHandle {
             )
         })??;
 
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (command, commands) = watch::channel(Command::Run);
+        let (done_tx, done) = watch::channel(());
         let connected = Arc::new(AtomicBool::new(true));
         let reconnect_count = Arc::new(AtomicU64::new(0));
         let public_base_url = reg.public_base_url.clone();
@@ -278,7 +295,10 @@ impl TakeoverTunnelHandle {
         let task = tokio::spawn(run_tunnel_supervisor(SupervisorCtx {
             ws_url,
             config,
-            stop_rx,
+            commands,
+            deadline: takeover_deadline(reg.ttl_ms),
+            pinned: reg.ttl_ms.is_some(),
+            _done: done_tx,
             connected: Arc::clone(&connected),
             reconnect_count: Arc::clone(&reconnect_count),
             initial_ws: ws,
@@ -288,7 +308,8 @@ impl TakeoverTunnelHandle {
             session_id,
             public_base_url,
             public_url,
-            stop_tx,
+            command,
+            done,
             connected,
             reconnect_count,
             task: Some(task),
@@ -315,19 +336,35 @@ impl TakeoverTunnelHandle {
         self.reconnect_count.load(Ordering::Acquire)
     }
 
-    /// Gracefully send `Unregister`, close the tunnel WebSocket, and wait briefly
-    /// for the supervisor task to exit.
+    pub(crate) fn completion(&self) -> watch::Receiver<()> {
+        self.done.clone()
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+
+    /// Pause local relays immediately, keeping the control connection for Unregister.
+    pub(crate) fn quiesce(&self) {
+        let _ = self.command.send(Command::Quiesce);
+    }
+
     pub async fn stop(mut self) {
-        let _ = self.stop_tx.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let _ = self.command.send(Command::Stop);
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
     }
 }
 
 impl Drop for TakeoverTunnelHandle {
     fn drop(&mut self) {
-        let _ = self.stop_tx.send(true);
+        let _ = self.command.send(Command::Stop);
     }
 }
 
@@ -634,6 +671,7 @@ async fn dial_tunnel_ws(
 }
 
 struct RegisteredAck {
+    ttl_ms: Option<u64>,
     public_base_url: String,
     public_url: String,
 }
@@ -643,13 +681,14 @@ async fn connect_and_register(
     auth: &CoordinatorAuth,
     takeover_token: &str,
     agent_id: Option<&str>,
-    local_addr: SocketAddr,
+    (local_addr, reconnect): (SocketAddr, bool),
 ) -> Result<(WebSocketStream<TunnelIo>, RegisteredAck), String> {
     let mut ws = dial_tunnel_ws(ws_url, auth).await?;
     let register = ControlFrame::Register {
         token: takeover_token.to_string(),
         agent_id: agent_id.map(str::to_string),
         local_origin: Some(format!("http://{local_addr}")),
+        reconnect,
     };
     let text = serde_json::to_string(&register)
         .map_err(|e| format!("failed serializing register frame: {e}"))?;
@@ -666,11 +705,13 @@ async fn connect_and_register(
                     ControlFrame::Registered {
                         public_base_url,
                         public_url,
+                        ttl_ms,
                         ..
                     } => {
                         return Ok((
                             ws,
                             RegisteredAck {
+                                ttl_ms,
                                 public_base_url,
                                 public_url,
                             },
@@ -687,6 +728,12 @@ async fn connect_and_register(
             }
             Ok(WsMessage::Pong(_)) => {}
             Ok(WsMessage::Close(cf)) => {
+                if cf
+                    .as_ref()
+                    .is_some_and(|c| TERMINAL_CODES.contains(&u16::from(c.code)))
+                {
+                    return Err("takeover session ended".into());
+                }
                 let reason = cf
                     .map(|c| format!("{} {}", c.code, c.reason))
                     .unwrap_or_else(|| "closed".into());
@@ -704,75 +751,92 @@ async fn connect_and_register(
 struct SupervisorCtx {
     ws_url: Url,
     config: TunnelConfig,
-    stop_rx: watch::Receiver<bool>,
+    commands: watch::Receiver<Command>,
+    deadline: Instant,
+    pinned: bool,
+    _done: watch::Sender<()>,
     connected: Arc<AtomicBool>,
     reconnect_count: Arc<AtomicU64>,
     initial_ws: WebSocketStream<TunnelIo>,
 }
 
-async fn wait_stopped(rx: &mut watch::Receiver<bool>) {
-    let _ = rx.wait_for(|s| *s).await;
+fn takeover_deadline(ttl_ms: Option<u64>) -> Instant {
+    Instant::now()
+        + ttl_ms
+            .map(Duration::from_millis)
+            .unwrap_or(MAX_TAKEOVER_TTL)
+            .min(MAX_TAKEOVER_TTL)
+}
+
+async fn wait_command(rx: &mut watch::Receiver<Command>, predicate: impl Fn(&Command) -> bool) {
+    let _ = rx.wait_for(predicate).await;
 }
 
 async fn run_tunnel_supervisor(mut ctx: SupervisorCtx) {
     let mut current_ws = Some(ctx.initial_ws);
     let mut backoff = ctx.config.initial_backoff;
-
+    let deadline = tokio::time::sleep_until(ctx.deadline);
+    tokio::pin!(deadline);
     loop {
-        if let Some(ws) = current_ws.take() {
+        if let Some(mut ws) = current_ws.take() {
             ctx.connected.store(true, Ordering::Release);
             backoff = ctx.config.initial_backoff;
-            let stopped = pump_active_tunnel(ws, &ctx.config, &mut ctx.stop_rx).await;
+            let pump_result = tokio::select! {
+                biased;
+                _ = &mut deadline => Some(true),
+                () = wait_command(&mut ctx.commands, |c| *c != Command::Run) => None,
+                terminal = pump_active_tunnel(&mut ws, &ctx.config) => Some(terminal),
+            };
             ctx.connected.store(false, Ordering::Release);
-            if stopped || *ctx.stop_rx.borrow() {
-                return;
+            match pump_result {
+                Some(true) => return,
+                Some(false) => {}
+                None => {
+                    tokio::select! {
+                        _ = &mut deadline => return,
+                        () = wait_command(&mut ctx.commands, |c| *c == Command::Stop) => {},
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        ws.send(WsMessage::Text(r#"{"type":"unregister"}"#.into()))
+                            .await?;
+                        ws.close(None).await
+                    })
+                    .await;
+                    return;
+                }
             }
         }
 
-        // Transparent auto-reconnect with exponential backoff (default 500ms -> 5s),
-        // reusing the exact same session_id + takeover_token.
-        tokio::select! {
-            () = wait_stopped(&mut ctx.stop_rx) => return,
-            _ = tokio::time::sleep(backoff) => {}
-        }
-        if *ctx.stop_rx.borrow() {
-            return;
-        }
-
-        let attempt = tokio::time::timeout(
-            ctx.config.connect_timeout,
-            connect_and_register(
-                &ctx.ws_url,
-                &ctx.config.auth,
-                &ctx.config.takeover_token,
-                ctx.config.agent_id.as_deref(),
-                ctx.config.local_addr,
-            ),
-        )
-        .await;
+        let attempt = tokio::select! {
+            biased;
+            _ = &mut deadline => return,
+            () = wait_command(&mut ctx.commands, |c| *c != Command::Run) => return,
+            attempt = async {
+                tokio::time::sleep(backoff).await;
+                tokio::time::timeout(ctx.config.connect_timeout, connect_and_register(
+                    &ctx.ws_url, &ctx.config.auth, &ctx.config.takeover_token,
+                    ctx.config.agent_id.as_deref(), (ctx.config.local_addr, ctx.pinned),
+                )).await
+            } => attempt,
+        };
         match attempt {
-            Ok(Ok((ws, _ack))) => {
+            Ok(Ok((ws, ack))) => {
+                ctx.pinned |= ack.ttl_ms.is_some();
+                ctx.deadline = ctx.deadline.min(takeover_deadline(ack.ttl_ms));
+                deadline.as_mut().reset(ctx.deadline);
                 ctx.reconnect_count.fetch_add(1, Ordering::AcqRel);
                 current_ws = Some(ws);
             }
-            Ok(Err(err)) if err.contains("(FORBIDDEN)") || err.contains("(UNAUTHORIZED)") => {
-                eprintln!("anyagents-mcp-browser: takeover tunnel stopped permanently: {err}");
+            Ok(Err(err))
+                if err == "takeover session ended"
+                    || err.contains("(EXPIRED)")
+                    || err.contains("(ENDED)")
+                    || err.contains("(FORBIDDEN)")
+                    || err.contains("(UNAUTHORIZED)") =>
+            {
                 return;
             }
-            Ok(Err(err)) => {
-                eprintln!(
-                    "anyagents-mcp-browser: takeover tunnel reconnect failed ({err}); retrying in {}ms",
-                    backoff.as_millis()
-                );
-                backoff = backoff.saturating_mul(2).min(ctx.config.max_backoff);
-            }
-            Err(_) => {
-                eprintln!(
-                    "anyagents-mcp-browser: takeover tunnel reconnect timed out; retrying in {}ms",
-                    backoff.as_millis()
-                );
-                backoff = backoff.saturating_mul(2).min(ctx.config.max_backoff);
-            }
+            _ => backoff = backoff.saturating_mul(2).min(ctx.config.max_backoff),
         }
     }
 }
@@ -783,11 +847,7 @@ enum LocalWsOutbound {
     Close(Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>),
 }
 
-async fn pump_active_tunnel(
-    ws: WebSocketStream<TunnelIo>,
-    config: &TunnelConfig,
-    stop_rx: &mut watch::Receiver<bool>,
-) -> bool {
+async fn pump_active_tunnel(ws: &mut WebSocketStream<TunnelIo>, config: &TunnelConfig) -> bool {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<TunnelOutbound>(TUNNEL_OUTBOUND_QUEUE);
     let http_cancels: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>> =
@@ -803,23 +863,10 @@ async fn pump_active_tunnel(
     );
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut stopped_by_caller = false;
+    let mut relays = JoinSet::new();
     loop {
         tokio::select! {
-            () = wait_stopped(stop_rx) => {
-                stopped_by_caller = true;
-                if let Ok(txt) = serde_json::to_string(&ControlFrame::Unregister) {
-                    let _ = ws_tx.send(WsMessage::Text(txt.into())).await;
-                }
-                let _ = ws_tx.send(WsMessage::Close(Some(
-                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
-                        reason: "takeover_stopped".into(),
-                    },
-                ))).await;
-                let _ = ws_tx.flush().await;
-                break;
-            }
+            _ = relays.join_next(), if !relays.is_empty() => {},
             _ = ping_interval.tick() => {
                 if ws_tx.send(WsMessage::Ping(Bytes::from_static(b"keepalive"))).await.is_err() {
                     break;
@@ -862,7 +909,7 @@ async fn pump_active_tunnel(
                                 let out = out_tx.clone();
                                 let local_addr = config.local_addr;
                                 let token = config.takeover_token.clone();
-                                tokio::spawn(async move {
+                                relays.spawn(async move {
                                     let _permit = permit;
                                     proxy_local_http(
                                         local_addr,
@@ -909,7 +956,7 @@ async fn pump_active_tunnel(
                                 let out = out_tx.clone();
                                 let local_addr = config.local_addr;
                                 let token = config.takeover_token.clone();
-                                tokio::spawn(async move {
+                                relays.spawn(async move {
                                     let _permit = permit;
                                     proxy_local_ws(
                                         local_addr,
@@ -961,22 +1008,17 @@ async fn pump_active_tunnel(
                         }
                     }
                     Some(Ok(WsMessage::Pong(_))) => {}
-                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        return frame.is_some_and(|c| TERMINAL_CODES.contains(&u16::from(c.code)));
+                    }
+                    Some(Err(_)) | None => break,
                     Some(Ok(WsMessage::Frame(_))) => {}
                 }
             }
         }
     }
 
-    // Abort all active local HTTP streams & close all local WS sub-streams from this tunnel generation.
-    for (_, tx) in http_cancels.lock().await.drain() {
-        let _ = tx.send(());
-    }
-    for (_, tx) in ws_streams.lock().await.drain() {
-        let _ = tx.try_send(LocalWsOutbound::Close(None));
-    }
-
-    stopped_by_caller
+    false
 }
 
 fn build_local_path_and_query(path: &str, query: Option<&str>, token: &str) -> String {
@@ -1466,6 +1508,7 @@ mod tests {
         let reg_num = st.registrations.fetch_add(1, Ordering::SeqCst) + 1;
         let base = format!("http://{host}/takeover/{session_id}/");
         let ack = ControlFrame::Registered {
+            ttl_ms: None,
             public_base_url: base.clone(),
             public_url: format!("{base}?token={token}"),
             session_id: session_id.clone(),

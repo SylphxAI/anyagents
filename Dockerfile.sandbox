@@ -364,6 +364,8 @@ LABEL org.opencontainers.image.title="anyagents-sandbox-full" \
 
 USER root
 
+# Both the guest bootstrap and browser relay are built from this image revision.
+ENV ANYAGENTS_BROWSER_RECONNECT=1
 COPY --from=guest-builder /src/target/release/anyagents-mcp-browser /usr/local/bin/anyagents-mcp-browser
 RUN chmod 0755 /usr/local/bin/anyagents-mcp-browser \
     && apt-get update \
