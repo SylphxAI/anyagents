@@ -386,6 +386,54 @@ mod tests {
             }
             ids.push(agent.id);
         }
+        let desired = format!("sha256:{}", "a".repeat(64));
+        let running = format!("sha256:{}", "b".repeat(64));
+        std::fs::write(
+            dir.path().join("sandbox-provider.json"),
+            json!({
+                "provider": "sylphx", "endpoint": "http://127.0.0.1:1",
+                "parent": "orgs/test/projects/test/envs/test", "image": desired,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (idx, running) in [(1, &desired), (2, &running), (3, &running), (4, &running)] {
+            let binding = serde_json::from_value(json!({
+                "agent_id": ids[idx], "provider": "sylphx", "lease_id": "lease-current",
+                "lease_resource": "leases/lease-current", "lease_state": "ready",
+                "spec_json": json!({"metadata": {"lease_version": json!({
+                    "image_digest": running, "harness_version": "h1", "tpl_base_version": "t1",
+                    "sbx_guest_version": "g1",
+                }).to_string()}}).to_string(),
+            }))
+            .unwrap();
+            store.sandbox_binding_store().upsert(&binding).unwrap();
+        }
+        for (idx, marker) in [(2, "leases/lease-previous"), (3, "leases/lease-current")] {
+            store
+                .blob_store()
+                .put_agent_file(
+                    &ids[idx],
+                    "markers",
+                    crate::sandbox_upgrade::DRAIN,
+                    marker.as_bytes(),
+                    false,
+                )
+                .unwrap();
+        }
+        let turn = anyagents_core::stateless::NewRemoteTurn {
+            agent_id: ids[4].clone(),
+            turn_id: format!("turn-{tag}"),
+            harness_kind: "sandbox".into(),
+            provider_kind: Some("sylphx".into()),
+            remote_run_id: None,
+            callback_token_hash: "fixture".into(),
+            cursor: None,
+            status: "running".into(),
+            metadata_json: None,
+            next_poll_at_ms: None,
+        };
+        store.remote_turn_store().create_turn(&turn).unwrap();
         let expected_first_state = store.agent_by_name(&format!("{tag}-1")).unwrap().state;
         let auth = crate::auth::Mode::from_env(dir.path());
         let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
@@ -440,7 +488,33 @@ mod tests {
                 "upgrade_status": "cold_uses_latest", "drain_requested": false,
             })
         );
-        assert!(fixtures.all(|a| a["upgrade_status"] == "cold_uses_latest"));
+        let find = |idx: usize| {
+            fleet
+                .iter()
+                .find(|agent| agent["id"] == json!(ids[idx]))
+                .unwrap()
+        };
+        for (idx, expected, drain, open) in [
+            (1, "up_to_date", false, false),
+            (2, "outdated_idle", false, false),
+            (3, "outdated_draining", true, false),
+            (4, "outdated_draining", false, true),
+        ] {
+            let row = find(idx);
+            assert_eq!(row["upgrade_status"], expected);
+            assert_eq!(row["drain_requested"], drain);
+            assert_eq!(row["has_open_turn"], open);
+            assert_eq!(row["desired_image_digest"], desired);
+            assert_eq!(
+                row["running_image_digest"],
+                if idx == 1 { &desired } else { &running }.as_str()
+            );
+            assert_eq!(row["harness_version"], "h1");
+            assert_eq!(row["tpl_base_version"], "t1");
+            assert_eq!(row["sbx_guest_version"], "g1");
+        }
+        assert_eq!(find(499)["state"], "archived");
+        assert_eq!(data["summary"]["total"], fleet.len());
         assert_eq!(
             fleet
                 .iter()

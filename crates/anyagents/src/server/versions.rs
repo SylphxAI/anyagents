@@ -68,10 +68,7 @@ async fn versions(
         let mut agents = Vec::new();
         for agent in store.sandbox_inventory(upgrade::DRAIN).map_err(ApiError::from_store)? {
             let binding = agent.binding.as_ref();
-            let active = binding.filter(|b| {
-                b.lease_key.is_some()
-                    && !matches!(b.lease_state.as_str(), "expired" | "detached" | "failed")
-            });
+            let active = binding.filter(|b| b.active_lease_key().is_some());
             let open = agent.has_open_turn
                 || upgrade::heartbeat_has_live_children(
                     agent.inflight_children, agent.heartbeat_at_ms, now,
