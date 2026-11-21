@@ -482,3 +482,75 @@ for raw in sys.stdin:
     assert_eq!(harness.deliver(&m4), Err(HarnessError::Dead));
     assert_eq!(harness.background(), Err(HarnessError::Dead));
 }
+
+#[cfg(unix)]
+#[test]
+fn cumulative_usage_survives_a_fresh_harness_on_the_same_session() {
+    use anyagents_harness::TurnUsage;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let program = dir.path().join("results");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+# Select the next result from the test's input, not from process-local state.
+while IFS= read -r line; do
+    case "$line" in
+        *first*)   totals='"input_tokens":1000,"output_tokens":10,"cache_read_tokens":2000,"cache_write_tokens":20';;
+        *second*)  totals='"input_tokens":2500,"output_tokens":25,"cache_read_tokens":5000,"cache_write_tokens":50';;
+        *third*)   totals='"input_tokens":3100,"output_tokens":31,"cache_read_tokens":6200,"cache_write_tokens":62';;
+        *missing*) totals='';;
+        *failed*)  printf '%s\n' '{"event":"result","result":{"status":"ERROR","error":"fixture failure","usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0}}}'; continue;;
+        *next*)    totals='"input_tokens":3250,"output_tokens":31,"cache_read_tokens":6300';;
+        *reset*)   totals='"input_tokens":400,"output_tokens":32,"cache_read_tokens":6400,"cache_write_tokens":64';;
+        *after*)   totals='"input_tokens":550,"output_tokens":34,"cache_read_tokens":6500,"cache_write_tokens":65';;
+        *new*)     totals='"input_tokens":800,"output_tokens":36,"cache_read_tokens":6600,"cache_write_tokens":66';
+                   printf '%s\n' '{"event":"init","conversation_id":"cascade-b"}';;
+        *) exit 2;;
+    esac
+    printf '{"event":"result","result":{"response":"ok","usage":{%s}}}\n' "$totals"
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let start = || {
+        AgyHarness::start(
+            &program,
+            Some("cascade-a"),
+            &[("ANYAGENTS_AGENT_CONFIG", dir.path().to_str().unwrap())],
+        )
+        .unwrap()
+    };
+    let run = |harness: &mut AgyHarness, id, expected| {
+        harness.deliver(&msg(id)).unwrap();
+        assert!(harness.wait_finished(id, Duration::from_secs(5)), "{id}");
+        assert_eq!(harness.usage_for(id), Some(expected), "{id}");
+    };
+    let usage = |input_tokens, output_tokens, cache_read_tokens, cache_write_tokens| TurnUsage {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reported_cost_micros: None,
+    };
+    let mut first = start();
+    run(&mut first, "first", usage(1000, 10, 2000, 20));
+    run(&mut first, "second", usage(1500, 15, 3000, 30));
+    assert_eq!(first.served_usage(), usage(2500, 25, 5000, 50));
+    drop(first);
+
+    let mut resumed = start();
+    assert_eq!(resumed.served_usage(), TurnUsage::default());
+    run(&mut resumed, "third", usage(600, 6, 1200, 12));
+    assert_eq!(2500 + resumed.served_usage().input_tokens, 3100);
+    run(&mut resumed, "missing", TurnUsage::default());
+    run(&mut resumed, "failed", TurnUsage::default());
+    run(&mut resumed, "next", usage(150, 0, 100, 0));
+    run(&mut resumed, "reset", usage(400, 32, 6400, 64));
+    run(&mut resumed, "after", usage(150, 2, 100, 1));
+    run(&mut resumed, "new", usage(800, 36, 6600, 66));
+    assert_eq!(resumed.session_id().as_deref(), Some("cascade-b"));
+}
