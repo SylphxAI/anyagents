@@ -559,6 +559,8 @@ async fn dispatch_sandbox_turn(
             &new_turn.agent_id,
             Some(upgrade_provider.as_ref()),
         )? == crate::sandbox_upgrade::Action::DrainScheduled
+            && crate::sandbox_upgrade::has_active_turn(&store_create, &new_turn.agent_id)
+                .map_err(|e| e.to_string())?
         {
             return Ok(None);
         }
