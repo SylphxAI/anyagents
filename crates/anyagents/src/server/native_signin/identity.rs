@@ -107,12 +107,21 @@ fn parse(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).unwrap_or(Value::Null)
 }
 
-fn credential_identity(provider: &str, credential: &Value, existing: bool) -> Identity {
-    match provider {
-        "anthropic" => Identity {
-            email: email(credential, "/claudeAiOauth/email"),
-            subject: text(credential, "/claudeAiOauth/accountUuid"),
-        },
+fn credential_identity(provider: &str, credential: &Value, existing: bool) -> Option<Identity> {
+    Some(match provider {
+        "anthropic" => {
+            let mut identity = Identity {
+                email: email(credential, "/claudeAiOauth/email"),
+                subject: text(credential, "/claudeAiOauth/accountUuid"),
+            };
+            if !identity.combine(Identity {
+                email: email(credential, "/claudeAiOauth/tokenAccount/emailAddress"),
+                subject: text(credential, "/claudeAiOauth/tokenAccount/uuid"),
+            }) {
+                return None;
+            }
+            identity
+        }
         "openai" => {
             // This file was written by the vendor CLI in a private, newly
             // created home, not obtained as an unverified token from the form.
@@ -142,7 +151,7 @@ fn credential_identity(provider: &str, credential: &Value, existing: bool) -> Id
             subject: text(credential, "/account_id"),
         },
         _ => Identity::default(),
-    }
+    })
 }
 
 fn claude_account(doc: &Value) -> Identity {
@@ -187,15 +196,20 @@ pub(super) fn finish(
     let credential = files.get(spec.credential).filter(|bytes| serverless::is_incoming_auth_fresher(spec.credential, None, bytes))
         .ok_or("Native sign-in did not produce a valid OAuth credential file. Check the sandbox image and try again.")?;
     let doc = parse(credential);
-    let mut identity = credential_identity(spec.provider, &doc, false);
-    if spec.provider == "anthropic" {
-        if let Some(account) = spec.account_file.and_then(|path| files.get(path))
-            && !identity.combine(claude_account(&parse(account)))
-        {
+    let mut identity = if spec.provider == "google-antigravity" {
+        google_account(&doc)
+    } else {
+        credential_identity(spec.provider, &doc, false)
+    }
+    .ok_or(UNVERIFIED)?;
+    for account in spec
+        .account_files
+        .iter()
+        .filter_map(|path| files.get(*path))
+    {
+        if !identity.combine(claude_account(&parse(account))) {
             return Err(UNVERIFIED.into());
         }
-    } else if spec.provider == "google-antigravity" {
-        identity = google_account(&doc).ok_or(UNVERIFIED)?;
     }
     if !identity.present() {
         return Err(UNVERIFIED.into());
@@ -288,10 +302,11 @@ fn finish_verified(
                 valid = false;
                 break;
             }
-            valid &= old.combine(credential_identity(provider, &doc, true));
+            valid &=
+                credential_identity(provider, &doc, true).is_some_and(|claim| old.combine(claim));
         }
         if provider == "anthropic" && !old.present() {
-            for rel in [".claude.json", ".claude/.claude.json"] {
+            for &rel in spec.account_files {
                 valid &= old.combine(claude_account(&read(rel)?));
             }
         }
@@ -394,6 +409,95 @@ mod tests {
                 .get_deployment_blob("profiles", "anthropic/existing/.claude.json")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_identity_accepts_token_account_and_config_dir_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let spec = Spec::for_harness("claude-code").unwrap();
+        let mut files = fixture("reader@example.test", "fixture-subject", "fixture-token");
+        let config = files.remove(".claude.json").unwrap();
+        files.insert(".claude/.claude.json".into(), config);
+        let profile = finish(&store, &spec, files).unwrap();
+
+        let files = BTreeMap::from([(
+            spec.credential.into(),
+            br#"{
+            "claudeAiOauth": {"accessToken": "fixture-refresh", "tokenAccount": {
+                "emailAddress": "Reader@example.test", "uuid": "fixture-subject"
+            }}
+        }"#
+            .to_vec(),
+        )]);
+        assert_eq!(finish(&store, &spec, files).unwrap(), profile);
+        let blobs = store.blob_store();
+        let meta = blobs
+            .get_deployment_blob("profiles", &format!("{profile}/profile.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse(&meta.content)["account"], "reader@example.test");
+        assert_eq!(parse(&meta.content)["oauth_subject"], "fixture-subject");
+        let saved = blobs
+            .get_deployment_blob("profiles", &format!("{profile}/.credentials.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse(&saved.content)["claudeAiOauth"]["accessToken"],
+            "fixture-refresh"
+        );
+        assert!(
+            blobs
+                .get_deployment_blob("profiles", &format!("{profile}/.claude/.claude.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn contradictory_claude_claims_fail_closed_across_all_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let spec = Spec::for_harness("claude-code").unwrap();
+        let nested = |email, uuid| {
+            serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {"accessToken": "fixture-token", "email": "reader@example.test",
+                "accountUuid": "fixture-subject", "tokenAccount": {"emailAddress": email, "uuid": uuid}}
+        })).unwrap()
+        };
+        for (email, uuid) in [
+            ("other@example.test", "fixture-subject"),
+            ("reader@example.test", "other-subject"),
+        ] {
+            let mut files = fixture("reader@example.test", "fixture-subject", "fixture-token");
+            files.insert(spec.credential.into(), nested(email, uuid));
+            assert_eq!(finish(&store, &spec, files).unwrap_err(), UNVERIFIED);
+
+            let mut files = fixture("reader@example.test", "fixture-subject", "fixture-token");
+            let mut conflict = fixture(email, uuid, "fixture-token");
+            files.insert(
+                ".claude/.claude.json".into(),
+                conflict.remove(".claude.json").unwrap(),
+            );
+            assert_eq!(
+                finish(&store, &spec, files.clone()).unwrap_err(),
+                UNVERIFIED
+            );
+
+            files.remove(".claude.json");
+            files.insert(
+                spec.credential.into(),
+                nested("reader@example.test", "fixture-subject"),
+            );
+            assert_eq!(finish(&store, &spec, files).unwrap_err(), UNVERIFIED);
+        }
+        assert!(
+            store
+                .blob_store()
+                .list_deployment_blobs("profiles")
+                .unwrap()
+                .is_empty()
         );
     }
 

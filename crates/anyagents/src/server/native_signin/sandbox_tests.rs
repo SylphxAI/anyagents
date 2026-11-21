@@ -78,7 +78,7 @@ async fn cold_ensure_streams_keepalives_and_has_a_90_second_deadline() {
             let started = Instant::now();
             let result = progress(
                 &out,
-                "Waiting for the sign-in sandbox…",
+                Some("Waiting for the sign-in sandbox…"),
                 ensure(&provider, EnsureSandboxRequest::for_agent(SLOT)),
             )
             .await
@@ -138,7 +138,8 @@ print('Paste code here:', flush=True)
 value = input()
 config.mkdir()
 (config / '.credentials.json').write_text(value)
-(home / '.claude.json').write_text('account-' + value)
+(home / '.claude.json').write_text('legacy-' + value)
+(config / '.claude.json').write_text('account-' + value)
 "#,
     )
     .unwrap();
@@ -187,7 +188,7 @@ config.mkdir()
         assert_eq!(requests[0].agent_id, "anyagents-native-signin");
         assert!(requests[0].volume.is_none());
         assert!(requests[0].existing.is_none());
-        assert_eq!(requests[0].lease.ttl_duration_string(), "600s");
+        assert_eq!(requests[0].lease.ttl_duration_string(), "660s");
     }
     let homes: Vec<_> = {
         let polls = provider.polls.lock().unwrap();
@@ -231,7 +232,8 @@ config.mkdir()
     assert_eq!(reply.await.unwrap(), Ok(()));
     let files = second_task.await.unwrap().unwrap();
     assert_eq!(files[".claude/.credentials.json"], b"fixture-code");
-    assert_eq!(files[".claude.json"], b"account-fixture-code");
+    assert_eq!(files[".claude.json"], b"legacy-fixture-code");
+    assert_eq!(files[".claude/.claude.json"], b"account-fixture-code");
     assert!(!homes[1].0.exists());
     assert!(!Path::new(&homes[1].1).exists());
 }
@@ -272,10 +274,10 @@ async fn current_native_pty_transcripts_emit_actionable_steps() {
         let prefix = format!(
             "Opening browser to sign in…\r\nIf the browser didn't open, visit:\r\n\x1b]8;;{link}"
         );
-        transcript.update(&claude, &prefix, &output).await;
+        transcript.update(&claude, &prefix, &output).await.unwrap();
         assert!(drain_steps(&mut lines).is_empty(), "partial OSC-8");
         let raw = format!("{prefix}\x07{link}\x1b]8;;\x07\r\nPaste code here if prompted > ");
-        transcript.update(&claude, &raw, &output).await;
+        transcript.update(&claude, &raw, &output).await.unwrap();
         assert_eq!(
             drain_steps(&mut lines),
             [
@@ -285,24 +287,25 @@ async fn current_native_pty_transcripts_emit_actionable_steps() {
                     "Finish signing in in your browser, then paste the authorization code below."
                         .into()
                 ),
-                ("input".into(), String::new()),
+                ("input".into(), "authorization_code".into()),
             ]
         );
         assert!(matches!(
             transcript.relay("fixture-code"),
             Ok(Relay::Terminal { .. })
         ));
-        transcript.update(&claude, &raw, &output).await;
+        transcript.update(&claude, &raw, &output).await.unwrap();
         assert!(drain_steps(&mut lines).is_empty());
     }
 
     let agy = Spec::for_harness("agy").unwrap();
     let mut transcript = Transcript::default();
-    transcript.update(&agy, AGY_MENU, &output).await;
+    transcript.update(&agy, AGY_MENU, &output).await.unwrap();
     assert!(drain_steps(&mut lines).is_empty());
     transcript
         .update(&agy, &format!("{AGY_MENU}{}", agy_browser_step()), &output)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(
         drain_steps(&mut lines),
         [
@@ -314,7 +317,7 @@ async fn current_native_pty_transcripts_emit_actionable_steps() {
     let codex = Spec::for_harness("codex").unwrap();
     for code in ["U81Q-J76WZ", "U81Q-J76WZ9"] {
         let mut transcript = Transcript::default();
-        transcript.update(&codex, &format!("  1. Open this link in your browser and sign in to your account\r\n     https://auth.openai.com/codex/device\r\n\r\n  2. Enter this one-time code (expires in 15 minutes)\r\n     {code}\r\n"), &output).await;
+        transcript.update(&codex, &format!("  1. Open this link in your browser and sign in to your account\r\n     https://auth.openai.com/codex/device\r\n\r\n  2. Enter this one-time code (expires in 15 minutes)\r\n     {code}\r\n"), &output).await.unwrap();
         assert_eq!(
             drain_steps(&mut lines),
             [
@@ -336,6 +339,7 @@ async fn short_oauth_query_is_only_accepted_at_claude_authorize_routes() {
         format!("https://platform.claude.com/oauth/authorize?{token}"),
         format!("https://claude.ai/oauth/authorize?{token}#fragment"),
         format!("https://claude.ai/oauth/authorize?{token}&state=fixture"),
+        format!("https://claude.ai/oauth/authorize?{token}&login_hint=reader%40example.test"),
         format!("https://claude.ai/oauth/authorize?code={}", &token[5..]),
         format!("https://claude.ai/oauth/authorize?{}%2F", &token[3..]),
         format!("https://claude.ai/oauth/authorize?{}", &token[..23]),
@@ -355,7 +359,8 @@ async fn short_oauth_query_is_only_accepted_at_claude_authorize_routes() {
                 &format!("{url}\r\nPaste code here if prompted > "),
                 &output,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(drain_steps(&mut lines).is_empty(), "accepted {url}");
         assert!(transcript.relay("fixture-code").is_err());
     }
@@ -367,7 +372,8 @@ async fn short_oauth_query_is_only_accepted_at_claude_authorize_routes() {
             &format!("\x1b]8;;{url}\x1b\\Open browser\x1b]8;;\x1b\\"),
             &output,
         )
-        .await;
+        .await
+        .unwrap();
     let steps = drain_steps(&mut lines);
     assert_eq!(steps[0], ("link".into(), url));
     assert_eq!(steps.last().unwrap().0, "input");
@@ -432,4 +438,129 @@ fn python_bytes(bytes: &[u8]) -> String {
         "bytes.fromhex('{}')",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn claude_pty_retries_same_input_then_fails_fast_on_rejected_exchange() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::sync::oneshot;
+
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("fixture");
+    std::fs::write(&binary, format!(r#"#!/usr/bin/python3
+import sys, time
+print('{CLAUDE_REQUEST}', flush=True)
+for _ in range(2):
+    assert input('Paste code here if prompted > ') == 'dummy-code'
+    print('private echo: dummy-code', flush=True)
+    print("That doesn't look like the full code. Copy all of it, including the # in the middle.", flush=True)
+assert input('Paste code here if prompted > ') == 'abc#def'
+print('\nSigning in…', flush=True)
+print("Couldn't log in: private exchange diagnostic", flush=True)
+# Never exit on our own: the recognized terminal line must end the session.
+time.sleep(60)
+"#)).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let provider: Arc<dyn SandboxProvider> = Arc::new(LocalHostProvider::with_root(root.path()));
+    let (output, mut lines) = mpsc::channel(16);
+    let (input, requests) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        collect(
+            &provider,
+            EnsureSandboxRequest::for_agent(SLOT),
+            &Spec::for_harness("claude-code").unwrap(),
+            SANDBOX_PYTHON,
+            binary.to_str(),
+            &output,
+            requests,
+        )
+        .await
+    });
+    async fn next(lines: &mut mpsc::Receiver<String>, kind: &str) -> String {
+        timeout(Duration::from_secs(10), async {
+            while let Some(line) = lines.recv().await {
+                assert!(!line.contains("private"));
+                assert!(!line.contains("dummy-code"));
+                assert!(!line.contains("abc#def"));
+                let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if event["kind"] == kind {
+                    return event["text"].as_str().unwrap().to_owned();
+                }
+            }
+            panic!("missing {kind} event");
+        })
+        .await
+        .unwrap()
+    }
+    async fn submit(input: &mpsc::Sender<Input>, value: &str) {
+        let (result, reply) = oneshot::channel();
+        input
+            .send(Input {
+                value: value.into(),
+                result,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), Ok(()));
+    }
+    assert_eq!(next(&mut lines, "input").await, "authorization_code");
+    for _ in 0..2 {
+        submit(&input, "dummy-code").await;
+        assert_eq!(
+            next(&mut lines, "input_error").await,
+            "Paste the full authorization code, including the # in the middle."
+        );
+        assert!(!task.is_finished());
+    }
+    submit(&input, "abc#def").await;
+    assert_eq!(
+        next(&mut lines, "progress").await,
+        "Exchanging authorization code…"
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err(),
+        CODE_REJECTED
+    );
+}
+
+#[tokio::test]
+async fn claude_feedback_recognizes_complete_allowlisted_lines_and_never_replays_them() {
+    let claude = Spec::for_harness("claude-code").unwrap();
+    let (output, mut lines) = mpsc::channel(16);
+    let mut transcript = Transcript::default();
+    let partial_link = &CLAUDE_REQUEST[..CLAUDE_REQUEST.len() - 3];
+    transcript
+        .update(&claude, partial_link, &output)
+        .await
+        .unwrap();
+    assert!(
+        drain_steps(&mut lines).is_empty(),
+        "partial plain-text link"
+    );
+    let mut raw = format!("{CLAUDE_REQUEST}\r\nPaste code here if prompted > ");
+    transcript.update(&claude, &raw, &output).await.unwrap();
+    drain_steps(&mut lines);
+    raw.push_str("\r\nThat looks like a verification code");
+    transcript.update(&claude, &raw, &output).await.unwrap();
+    assert!(drain_steps(&mut lines).is_empty());
+    raw.push_str(" from email: 123456\r\nThat's a web address, do not paste it\r\nThat address only works in a browser on this machine\r\nThat code is not from this sign-in\r\n");
+    transcript.update(&claude, &raw, &output).await.unwrap();
+    assert_eq!(drain_steps(&mut lines), [
+        ("input_error".into(), "Paste the authorization code shown after approval, not the email verification code.".into()),
+        ("input_error".into(), "Paste the authorization code shown on the sign-in page, not a web address.".into()),
+        ("input_error".into(), "Paste the authorization code shown on the sign-in page, not a web address.".into()),
+        ("input_error".into(), "Paste the authorization code from this sign-in's browser page.".into()),
+    ]);
+    raw.push_str("private output: Signing in…\r\n");
+    raw.push_str(
+        &CLAUDE_REQUEST.replace("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"),
+    );
+    raw.push_str("\r\n");
+    transcript.update(&claude, &raw, &output).await.unwrap();
+    assert!(drain_steps(&mut lines).is_empty());
 }

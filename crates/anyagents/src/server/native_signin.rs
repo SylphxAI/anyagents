@@ -57,6 +57,7 @@ pub(super) fn router() -> Router<AppState> {
 struct StartRequest {
     #[serde(alias = "provider")]
     harness: String,
+    // Login hints stay out of the guest command and streamed authorization URL.
     // Unknown fields (including the legacy `profile`) never influence persistence.
 }
 

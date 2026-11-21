@@ -35,7 +35,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   const [session, setSession] = createSignal('');
   const [error, setError] = createSignal('');
   const [label, setLabel] = createSignal('');
-  const [inputWanted, setInputWanted] = createSignal(false);
+  const [inputMode, setInputMode] = createSignal<'none' | 'code' | 'callback'>('none');
   const [paste, setPaste] = createSignal('');
   const [pasteState, setPasteState] = createSignal<{ busy?: boolean; ok?: boolean; error?: string }>({});
   let controller: AbortController | null = null;
@@ -47,7 +47,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   async function start() {
     if (controller) return;
     const run = new AbortController(); controller = run;
-    setEvents([]); setStatus(''); setError(''); setSession(''); setInputWanted(false); setPaste(''); setPasteState({}); setPhase('running');
+    setEvents([]); setStatus(''); setError(''); setSession(''); setInputMode('none'); setPaste(''); setPasteState({}); setPhase('running');
     try {
       const login = hint();
       const response = await request('/v1/profiles/native-signin', { method: 'POST', signal: run.signal, accept: 'application/x-ndjson',
@@ -55,10 +55,19 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
       const connected = await readSignInStream(response.body, event => {
         if (run.signal.aborted) return;
         if (event.kind === 'session') { setSession(event.text ?? ''); return; }
-        if (event.kind === 'input') { setInputWanted(true); return; }
+        if (event.kind === 'input') {
+          setInputMode(event.text === 'authorization_code' ? 'code' : 'callback');
+          return;
+        }
+        if (event.kind === 'input_error') {
+          setPaste('');
+          setPasteState({ error: event.text || 'Check the authorization code and try again.' });
+          return;
+        }
         if (event.kind === 'progress' && event.text) setStatus(event.text);
         // Keepalives and other non-actionable updates must not displace a sign-in step.
         if (event.kind === 'link' || event.kind === 'code' || event.kind === 'prompt') {
+          if (event.kind === 'link' && !events().some(previous => previous.kind === 'link')) setStatus('');
           setEvents(previous => [...previous, event].slice(-60));
         }
       });
@@ -73,17 +82,23 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   async function submitPaste(event: SubmitEvent) {
     event.preventDefault();
     const value = paste().trim();
-    if (!value || !session() || pasteState().busy) return;
-    setPasteState({ busy: true });
+    const run = controller;
+    if (!run || phase() !== 'running' || !value || !session() || pasteState().busy || pasteState().ok) return;
+    const pending = { busy: true };
+    setPasteState(pending);
+    // The CLI can reject this paste on the stream before the POST settles.
+    // Only the submission that still owns the input may acknowledge delivery.
+    const isCurrent = () => controller === run && phase() === 'running' && pasteState() === pending;
     try {
-      await api('/v1/profiles/native-signin/' + encodeURIComponent(session()) + '/input', { method: 'POST', body: { value } });
-      setPasteState({ ok: true }); setPaste('');
-    } catch (cause) { setPasteState({ error: errorMessage(cause) }); }
+      await api('/v1/profiles/native-signin/' + encodeURIComponent(session()) + '/input', { method: 'POST', signal: run.signal, body: { value } });
+      if (isCurrent()) { setPasteState({ ok: true }); setPaste(''); }
+    } catch (cause) { if (isCurrent()) setPasteState({ error: errorMessage(cause) }); }
   }
 
   const link = createMemo(() => events().filter(event => event.kind === 'link').map(event => safeLink(event.text)).filter(Boolean).pop());
   const code = createMemo(() => [...events()].reverse().find(event => event.kind === 'code')?.text);
   const prompts = createMemo(() => events().filter(event => event.kind === 'prompt' && event.text));
+  const claudeCodePaste = () => option().harness === 'claude-code' && inputMode() === 'code';
 
   return <Show when={phase() !== 'done'} fallback={<div class="dialog-body">
     <div class="connect-done"><CircleCheck size={22} aria-hidden="true" /><div>
@@ -123,15 +138,17 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
               <div class="step-title">Enter this device code</div>
               <div class="device-code"><span class="mono">{code()}</span><CopyButton value={code()!} label="Copy code" text /></div>
             </li></Show>
-            <Show when={phase() === 'running' && inputWanted()}><li class={pasteState().ok ? 'done' : 'current'}>
-              <div class="step-title">Paste the callback URL or authorization code</div>
-              <p class="subtle small">After approving access, copy the address your browser lands on (or the code shown) and paste it here.</p>
+            <Show when={phase() === 'running' && inputMode() !== 'none'}><li class={pasteState().ok ? 'done' : 'current'}>
+              <div class="step-title">{claudeCodePaste() ? 'Paste the authorization code' : 'Paste the callback URL or authorization code'}</div>
+              <p class="subtle small">{claudeCodePaste()
+                ? 'After approving access, copy the full authorization code shown in your browser, including the # in the middle (code#state).'
+                : 'After approving access, copy the address your browser lands on (or the code shown) and paste it here.'}</p>
               <form class="paste-row" onSubmit={submitPaste}>
-                <input class="input mono" value={paste()} onInput={event => setPaste(event.currentTarget.value)} placeholder="http://localhost:…/callback?code=… or code"
-                  aria-label="Callback URL or authorization code" autocomplete="off" spellcheck={false} disabled={pasteState().busy || pasteState().ok} />
+                <input class="input mono" value={paste()} onInput={event => setPaste(event.currentTarget.value)} placeholder={claudeCodePaste() ? 'code#state' : 'http://localhost:…/callback?code=… or code'}
+                  aria-label={claudeCodePaste() ? 'Authorization code' : 'Callback URL or authorization code'} autocomplete="off" spellcheck={false} disabled={pasteState().busy || pasteState().ok} />
                 <button class="btn primary" disabled={!paste().trim() || pasteState().busy || pasteState().ok}>{pasteState().busy ? 'Sending…' : 'Submit'}</button>
               </form>
-              <Show when={pasteState().ok}><p class="tone-ok small">Received. Finishing sign-in…</p></Show>
+              <Show when={pasteState().ok}><p class="tone-ok small">Submitted. Waiting for the provider…</p></Show>
               <Show when={pasteState().error}><Problem>{pasteState().error}</Problem></Show>
             </li></Show>
           </ol>

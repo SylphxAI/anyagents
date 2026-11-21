@@ -78,7 +78,7 @@ def run(harness, artifact, binary, args):
                 os.execve(binary, [binary] + args, env)
             finally:
                 os._exit(126)
-        deadline = time.monotonic() + 240
+        deadline = time.monotonic() + 540
         last_bytes, total, selected = b'', 0, False
         pty_eof = False
         try:

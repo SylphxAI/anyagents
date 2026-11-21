@@ -28,13 +28,14 @@ const SLOT: &str = "anyagents-native-signin";
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(90);
 const KEEPALIVE: Duration = Duration::from_secs(6);
 const CANCELLED: &str = "Sign-in cancelled.";
-const SESSION_TIME: Duration = Duration::from_secs(245);
+const SESSION_TIME: Duration = Duration::from_secs(555);
+const CODE_REJECTED: &str = "The provider rejected the authorization code. It may be incomplete, expired, or already used. Start again to get a fresh link.";
 
 pub(super) struct Spec {
     pub harness: &'static str,
     pub provider: &'static str,
     pub credential: &'static str,
-    pub account_file: Option<&'static str>,
+    pub account_files: &'static [&'static str],
     binary: &'static str,
     args: &'static str,
     auth_hosts: &'static [&'static str],
@@ -49,7 +50,7 @@ impl Spec {
                 binary: "agy",
                 args: "",
                 credential: ".gemini/antigravity-cli/antigravity-oauth-token",
-                account_file: None,
+                account_files: &[],
                 auth_hosts: &["accounts.google.com"],
             },
             "claude-code" => Self {
@@ -58,7 +59,7 @@ impl Spec {
                 binary: "claude",
                 args: "auth login",
                 credential: ".claude/.credentials.json",
-                account_file: Some(".claude.json"),
+                account_files: &[".claude/.claude.json", ".claude.json"],
                 auth_hosts: &[
                     "claude.com",
                     "claude.ai",
@@ -72,7 +73,7 @@ impl Spec {
                 binary: "codex",
                 args: "login --device-auth",
                 credential: ".codex/auth.json",
-                account_file: None,
+                account_files: &[],
                 auth_hosts: &["auth.openai.com"],
             },
             _ => return None,
@@ -110,7 +111,7 @@ pub(super) async fn run(
         let data_dir = state.store.data_dir().to_owned();
         let resolve =
             tokio::task::spawn_blocking(move || resolve_remote_provider_registry(Some(&data_dir)));
-        let registry = progress(output, "Reading sandbox configuration…", resolve).await?
+        let registry = progress(output, Some("Reading sandbox configuration…"), resolve).await?
             .map_err(|err| report("read sandbox configuration", &err.to_string()))?
             .map_err(|err| report("read sandbox configuration", &err))?
             .ok_or("Configure a working sandbox provider (`ANYAGENTS_SANDBOX_PROVIDER`) before connecting an account in serverless mode.")?;
@@ -162,8 +163,8 @@ fn session_request(mut request: EnsureSandboxRequest) -> EnsureSandboxRequest {
     request.workdir = None;
     // The lease expires even if the coordinator dies during sign-in.
     request.lease = LeasePolicy {
-        idle_ttl_ms: 600_000,
-        max_lease_ttl_ms: 600_000,
+        idle_ttl_ms: 660_000,
+        max_lease_ttl_ms: 660_000,
     };
     request
 }
@@ -179,7 +180,7 @@ async fn collect(
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let handle = keepalive(
         output,
-        "Waiting for the sign-in sandbox…",
+        Some("Waiting for the sign-in sandbox…"),
         ensure(provider, request),
     )
     .await?;
@@ -201,15 +202,11 @@ async fn collect(
     // A dropped exec future does not stop a blocking adapter. Let launch settle
     // (bounded by exec's timeout) before asking the guest to stop this session.
     let launch = runner.launch(spec);
-    let result = keepalive(output, "Starting the native sign-in…", launch).await;
+    let result = keepalive(output, Some("Starting the native sign-in…"), launch).await;
     let result = match result {
-        Ok(()) if !output.is_closed() => progress(
-            output,
-            "Waiting for native sign-in to finish…",
-            runner.login(spec, output, input),
-        )
-        .await
-        .and_then(|result| result),
+        Ok(()) if !output.is_closed() => progress(output, None, runner.login(spec, output, input))
+            .await
+            .and_then(|result| result),
         Ok(()) => Err(CANCELLED.into()),
         Err(err) => Err(err),
     };
@@ -258,7 +255,7 @@ pub(super) async fn ensure(
 
 async fn progress<T>(
     output: &Output,
-    text: &'static str,
+    text: Option<&'static str>,
     work: impl Future<Output = T>,
 ) -> Result<T, String> {
     tokio::select! {
@@ -268,7 +265,11 @@ async fn progress<T>(
     }
 }
 
-async fn keepalive<T>(output: &Output, text: &'static str, work: impl Future<Output = T>) -> T {
+async fn keepalive<T>(
+    output: &Output,
+    text: Option<&'static str>,
+    work: impl Future<Output = T>,
+) -> T {
     let mut tick = tokio::time::interval_at(Instant::now() + KEEPALIVE, KEEPALIVE);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(work);
@@ -277,7 +278,8 @@ async fn keepalive<T>(output: &Output, text: &'static str, work: impl Future<Out
             result = &mut work => return result,
             _ = tick.tick() => {
                 // Never block the actual operation on an unread stream.
-                if let Ok(line) = serde_json::to_string(&super::SignInLine { kind: "progress", text: text.into() }) {
+                let (kind, text) = text.map_or(("keepalive", ""), |message| ("progress", message));
+                if let Ok(line) = serde_json::to_string(&super::SignInLine { kind, text: text.into() }) {
                     let _ = output.try_send(line);
                 }
             }
@@ -437,16 +439,18 @@ impl Runner<'_> {
         let started = Instant::now();
         let deadline = started + SESSION_TIME;
         let mut transcript = Transcript::default();
+        let mut submitted = false;
         let mut log = Vec::new();
         let mut next = Instant::now();
         loop {
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return Err("Sign-in timed out. Open a fresh sign-in and complete it within four minutes.".into()),
+                _ = tokio::time::sleep_until(deadline) => return Err("Sign-in timed out. Open a fresh sign-in and complete it within nine minutes.".into()),
                 Some(request) = input.recv() => {
                     let result = match transcript.relay(&request.value) {
                         Ok(payload) => self.relay(payload).await,
                         Err(message) => Err(message),
                     };
+                    submitted |= result.is_ok();
                     let _ = request.result.send(result);
                 }
                 _ = tokio::time::sleep_until(next) => {
@@ -469,12 +473,13 @@ impl Runner<'_> {
                     let chunk = STANDARD.decode(encoded).map_err(|err| report("decode sign-in output", &err.to_string()))?;
                     log.extend_from_slice(&chunk);
                     if log.len() > 262_144 { return Err("Sign-in produced too much output. Check the sandbox image.".into()); }
-                    transcript.update(spec, &String::from_utf8_lossy(&log), output).await;
+                    transcript.update(spec, &String::from_utf8_lossy(&log), output).await?;
                     match status.trim() {
                         "pending" => (),
                         "0" => break,
                         "124" => return Err("Sign-in expired. Start again to get a new link or device code.".into()),
                         "125" | "126" => return Err(report("run native sign-in", "PTY supervisor or CLI setup failed; check Python and PTY support")),
+                        _ if spec.harness == "claude-code" && submitted => return Err(CODE_REJECTED.into()),
                         _ => return Err(report("complete native sign-in", &format!("CLI exit status: {:?}", status.trim().parse::<i32>().ok()))),
                     }
                     next = Instant::now() + Duration::from_millis(850);
@@ -482,7 +487,7 @@ impl Runner<'_> {
             }
         }
         let mut files = BTreeMap::new();
-        for rel in std::iter::once(spec.credential).chain(spec.account_file) {
+        for rel in std::iter::once(spec.credential).chain(spec.account_files.iter().copied()) {
             let got = self
                 .exec(
                     "read native credentials",
@@ -548,14 +553,27 @@ struct Transcript {
     code: bool,
     manual: bool,
     callback: Option<(Url, String)>,
+    claude_feedback_offset: usize,
 }
 
 impl Transcript {
     // Only structured provider links/codes and fixed prompts leave the PTY.
     // In particular, never reflect arbitrary CLI diagnostics or pasted values.
-    async fn update(&mut self, spec: &Spec, raw: &str, output: &Output) {
+    async fn update(&mut self, spec: &Spec, raw: &str, output: &Output) -> Result<(), String> {
         let (clean, hyperlinks) = strip_escapes(raw);
-        let candidates = extract_urls(&clean, hyperlinks);
+        let candidates = if spec.harness == "claude-code" {
+            if self.links.is_empty() {
+                // OSC-8 targets are only returned once terminated. For plain
+                // text, wait for the newline so a partial handle can't win.
+                let complete = clean.rsplit_once('\n').map_or("", |(lines, _)| lines);
+                extract_urls(complete, hyperlinks)
+            } else {
+                // Later output can include echoed input and diagnostics.
+                Vec::new()
+            }
+        } else {
+            extract_urls(&clean, hyperlinks)
+        };
         // Prefer the full OSC-8 href; the printed label may wrap in the PTY.
         let before_input = self.manual || self.callback.is_some();
         let mut claude_short_link = false;
@@ -626,6 +644,9 @@ impl Transcript {
             send(output, "link", link.as_str()).await;
             self.links.push(link);
             claude_short_link |= short_link;
+            if spec.harness == "claude-code" {
+                break;
+            }
         }
         if spec.harness == "codex"
             && !self.code
@@ -653,8 +674,59 @@ impl Transcript {
             }
         }
         if !before_input && (self.manual || self.callback.is_some()) {
-            send(output, "input", "").await;
+            let mode = if spec.harness == "claude-code" && self.callback.is_none() {
+                "authorization_code"
+            } else {
+                ""
+            };
+            send(output, "input", mode).await;
         }
+        if spec.harness == "claude-code" {
+            self.claude_feedback(&clean, output).await?;
+        }
+        Ok(())
+    }
+
+    async fn claude_feedback(&mut self, clean: &str, output: &Output) -> Result<(), String> {
+        // The caller supplies the cumulative transcript. Advance only through
+        // complete lines so chunk boundaries don't lose a match or replay an old
+        // rejection; a repeated mistake on a new line must be reported again.
+        let Some(tail) = clean.get(self.claude_feedback_offset..) else {
+            return Ok(());
+        };
+        let Some(end) = tail.rfind('\n') else {
+            return Ok(());
+        };
+        self.claude_feedback_offset += end + 1;
+        for line in tail[..=end].lines().map(str::trim) {
+            let message = match line {
+                "Signing in…" | "Signing in..." => {
+                    send(output, "progress", "Exchanging authorization code…").await;
+                    continue;
+                }
+                _ if line.starts_with("Couldn't log in:") || line == "Couldn't log in" => {
+                    return Err(CODE_REJECTED.into());
+                }
+                _ if !self.manual => continue,
+                _ if line.starts_with("That doesn't look like the full code.") => {
+                    "Paste the full authorization code, including the # in the middle."
+                }
+                _ if line.starts_with("That's a web address,")
+                    || line.starts_with("That address only works in a browser on this machine") =>
+                {
+                    "Paste the authorization code shown on the sign-in page, not a web address."
+                }
+                _ if line.starts_with("That looks like a verification code") => {
+                    "Paste the authorization code shown after approval, not the email verification code."
+                }
+                _ if line.starts_with("That code is not from this sign-in") => {
+                    "Paste the authorization code from this sign-in's browser page."
+                }
+                _ => continue,
+            };
+            send(output, "input_error", message).await;
+        }
+        Ok(())
     }
 
     fn relay<'a>(&self, value: &'a str) -> Result<Relay<'a>, &'static str> {
@@ -823,9 +895,9 @@ mod tests {
         for (harness, raw, expected) in cases {
             let mut transcript = Transcript::default();
             let spec = Spec::for_harness(harness).unwrap();
-            transcript.update(&spec, "private diagnostic https://auth.openai.com/codex/device?access_token=not-public", &output).await;
+            transcript.update(&spec, "private diagnostic https://auth.openai.com/codex/device?access_token=not-public", &output).await.unwrap();
             assert!(lines.try_recv().is_err());
-            transcript.update(&spec, raw, &output).await;
+            transcript.update(&spec, raw, &output).await.unwrap();
             let mut kinds = Vec::new();
             while let Ok(line) = lines.try_recv() {
                 assert!(!line.contains("private diagnostic"));
@@ -834,7 +906,7 @@ mod tests {
             }
             assert_eq!(kinds.first().unwrap(), "link", "{harness}");
             assert_eq!(kinds.last().unwrap(), expected, "{harness}");
-            transcript.update(&spec, raw, &output).await;
+            transcript.update(&spec, raw, &output).await.unwrap();
             assert!(lines.try_recv().is_err(), "duplicate {harness} events");
         }
     }
@@ -843,7 +915,7 @@ mod tests {
     async fn callback_requires_exact_destination_and_state_and_never_accepts_shell_syntax() {
         let (output, _lines) = mpsc::channel(16);
         let mut t = Transcript::default();
-        t.update(&Spec::for_harness("agy").unwrap(), "https://accounts.google.com/o/oauth2/auth?client_id=test&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=test\nPaste authorization code", &output).await;
+        t.update(&Spec::for_harness("agy").unwrap(), "https://accounts.google.com/o/oauth2/auth?client_id=test&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=test\nPaste authorization code", &output).await.unwrap();
         assert!(
             matches!(t.relay("https://antigravity.google/oauth-callback?state=test&code=abc%2F123#"), Ok(Relay::Terminal { value }) if value == "abc/123")
         );
@@ -856,7 +928,7 @@ mod tests {
             assert!(t.relay(value).is_err());
         }
         let mut t = Transcript::default();
-        t.update(&Spec::for_harness("claude-code").unwrap(), "https://claude.com/cai/oauth/authorize?client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A9123%2Fcallback&response_type=code&state=test", &output).await;
+        t.update(&Spec::for_harness("claude-code").unwrap(), "https://claude.com/cai/oauth/authorize?client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A9123%2Fcallback&response_type=code&state=test\n", &output).await.unwrap();
         assert!(matches!(
             t.relay("http://localhost:9123/callback?code=abc&state=test"),
             Ok(Relay::Loopback {

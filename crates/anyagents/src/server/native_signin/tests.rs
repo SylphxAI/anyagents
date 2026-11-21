@@ -158,6 +158,6 @@ async fn scratch_sign_in_surfaces_capacity_failure_without_retrying_or_allocatin
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "POST");
     assert_eq!(calls[0].1, "/v1/orgs/o1/projects/p1/envs/e1/leases");
-    assert_eq!(calls[0].2["spec"]["ttl"], "600s");
+    assert_eq!(calls[0].2["spec"]["ttl"], "660s");
     assert!(calls[0].2["spec"].get("volumes").is_none());
 }
