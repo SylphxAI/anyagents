@@ -68,8 +68,10 @@ Keep changes inside the crate that owns the domain. Never pull coordinator conce
 
 - **Always-on fast checks (`changes`):** `tools/module_size_scan.py`, `tools/test_*.py`, `tests/test_release_admission.py`, `tests/test_deploy_build.py`, plus `npm test` when `packages/` or `package.json` changes.
 - **Docs / `AGENTS.md` / `sylphx.toml` / `tools/`-only PRs:** skip Rust compilation and macOS runners while passing `changes` and the required `ci-ok` gate.
-- **Leaf-crate PRs** (e.g. `crates/anyagents-guest/**`, `crates/anyagents-mcp-*/**`, `crates/anyagents-gateway/**`, leaf harness adapters): run `cargo clippy` / `cargo nextest` / `cargo test --doc` scoped strictly to the touched crates and their Cargo reverse dependents, skipping macOS and privileged Linux host acceptance unless a macOS/host-platform crate is affected.
-- **Core / coordinator / manifest / workflow changes** (`Cargo.toml`, `Cargo.lock`, `crates/anyagents-core/**`, `crates/anyagents/**`, `crates/anyagents-harness/**`, `.github/workflows/ci.yml`) and `push` to `main`: run the full Linux + macOS workspace suite.
+- **Pull requests:** format, Clippy, and unit tests on Linux. Leaf changes select touched crates and their Cargo reverse dependents; workspace-wide changes (e.g. `Cargo.lock` or `.github/workflows/ci.yml`) select all crates.
+- **Merge groups:** also run affected Linux integration and doc tests, including the separate identity and privileged host lanes when selected.
+- **macOS on PRs and merge groups:** workspace Clippy and native socket smoke tests only. Console-only, docs-only, and recognized Linux-only paths skip macOS.
+- **Pushes to `main`, nightly, and manual CI** run the full Linux and macOS suites. Release admission still requires successful CI for the exact source pushed to `main`.
 
 ## 7. Git, Formatting & Verification Rules
 
