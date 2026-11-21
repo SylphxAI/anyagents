@@ -456,6 +456,19 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
     let provider_for_media = Arc::clone(&provider);
     let agent_id = agent.id.clone();
     let ensured = tokio::task::spawn_blocking(move || {
+        // Serialize lease provisioning/persistence with archive and delete. A
+        // dispatched turn may have waited here while its agent was archived.
+        let _lifecycle = store
+            .lock_agent_lifecycle(&agent.id)
+            .map_err(|e| (None, e.to_string()))?;
+        if store
+            .agent(&agent.id)
+            .map_err(|e| (None, e.to_string()))?
+            .state
+            == "archived"
+        {
+            return Err((None, "agent is archived".into()));
+        }
         let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
         let remote_workdir = super::resolve_remote_sandbox_workdir(&store, &agent);
         let lease_env: BTreeMap<String, String> =

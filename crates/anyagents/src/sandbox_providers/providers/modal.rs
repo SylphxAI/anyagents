@@ -418,21 +418,12 @@ impl SandboxProvider for ModalProvider {
     async fn destroy(&self, handle: &SandboxHandle) -> Result<(), String> {
         let endpoint = self.config.endpoint.clone();
         let headers = self.auth_headers();
-        let sandbox_id = handle.sandbox_id.clone();
+        if !handle.sandbox_id.trim().is_empty() {
+            self.release(handle).await?;
+        }
         let volume_id = handle.volume_id.clone();
 
         run_blocking(move || {
-            let term_url = format!(
-                "{endpoint}/v1/sandboxes/{}/terminate",
-                url_encode_query_component(&sandbox_id)
-            );
-            let _ = http_call_json(
-                "POST",
-                &term_url,
-                &headers,
-                Some(&serde_json::json!({})),
-                30_000,
-            );
             if let Some(vol) = volume_id.filter(|s| !s.trim().is_empty()) {
                 let vol_url = format!("{endpoint}/v1/volumes/{}", url_encode_query_component(&vol));
                 let (status, val) = http_call_json("DELETE", &vol_url, &headers, None, 30_000)?;

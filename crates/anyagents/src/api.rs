@@ -202,6 +202,29 @@ pub struct AgentView {
     pub secrets: Vec<String>,
 }
 
+/// Additional fields on archive and terminal-verdict responses, only for remote sandboxes.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteVolumeReap {
+    pub remote_volume_reaped: bool,
+    pub remote_volume_reap_reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveResponse {
+    #[serde(flatten)]
+    pub agent: AgentView,
+    #[serde(flatten, default)]
+    pub volume: Option<RemoteVolumeReap>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerdictResponse {
+    #[serde(flatten)]
+    pub outcome: anyagents_core::Outcome,
+    #[serde(flatten)]
+    pub volume: Option<RemoteVolumeReap>,
+}
+
 impl AgentView {
     /// Convert an HTTP/socket `AgentView` back into a client-side [`anyagents_core::Agent`].
     pub fn into_agent(self) -> Result<anyagents_core::Agent, anyagents_core::Error> {

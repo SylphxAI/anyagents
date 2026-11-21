@@ -542,6 +542,14 @@ async fn dispatch_sandbox_turn(
             }
             Err(err) => return Err(err.to_string()),
         };
+        if store_create
+            .agent(&new_turn.agent_id)
+            .map_err(|e| e.to_string())?
+            .state
+            == "archived"
+        {
+            return Ok(None);
+        }
         if crate::sandbox_upgrade::recycle_at_boundary(
             &store_create,
             &new_turn.agent_id,

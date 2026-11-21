@@ -249,7 +249,7 @@ fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profi
                 archive_agent_route(caller, State(state.clone()), AxumPath("self".into()))
                     .await
                     .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
-            assert_eq!(archived.state, "archived");
+            assert_eq!(archived.agent.state, "archived");
             assert_eq!(store.agent(&agent.id).unwrap().role, agent.role);
             assert_eq!(
                 std::fs::read(profile.join("login")).unwrap(),

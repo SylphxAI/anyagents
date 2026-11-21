@@ -22,6 +22,7 @@ mod schedules;
 mod serverless;
 mod spawn;
 mod usage;
+mod volume_reap_tests;
 mod wake;
 mod webhooks;
 

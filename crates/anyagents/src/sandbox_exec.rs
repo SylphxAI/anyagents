@@ -11,8 +11,8 @@ pub(crate) use sylphx_binding::client_for_binding as sylphx_client_for_binding;
 use sylphx_binding::sylphx_lease_from_handle;
 use target::{binding_spec_value, registry_for_agent};
 pub(crate) use target::{
-    destroy_sandbox_for_agent, resolve_registry_for_agent, resolve_registry_for_binding,
-    validate_credential, validate_scoped_endpoint,
+    resolve_registry_for_agent, resolve_registry_for_binding, validate_credential,
+    validate_legacy_cleanup_target, validate_scoped_endpoint,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -924,28 +924,20 @@ pub(crate) fn sandbox_handle_from_binding(binding: &SandboxBinding) -> Option<Sa
         .get("metadata")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    if !binding.volume_resource.trim().is_empty() {
-        metadata
-            .entry("volume_resource".to_string())
-            .or_insert_with(|| binding.volume_resource.clone());
-    }
-    if binding.lease_id.is_none() && binding.lease_resource.is_none() {
-        metadata.remove("lease_resource");
-        metadata.remove("data_plane_resource");
-    }
-    if let Some(ref lr) = binding.lease_resource
-        && !lr.trim().is_empty()
-    {
-        metadata
-            .entry("lease_resource".to_string())
-            .or_insert_with(|| lr.clone());
-    }
-    if let Some(ref dp) = binding.data_plane_resource
-        && !dp.trim().is_empty()
-    {
-        metadata
-            .entry("data_plane_resource".to_string())
-            .or_insert_with(|| dp.clone());
+    // Normalized resource names take precedence over stale provider metadata.
+    for (key, value) in [
+        ("volume_resource", Some(binding.volume_resource.as_str())),
+        ("lease_resource", binding.lease_resource.as_deref()),
+        (
+            "data_plane_resource",
+            binding.data_plane_resource.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value.filter(|s| !s.trim().is_empty()) {
+            metadata.insert(key.into(), value.into());
+        } else {
+            metadata.remove(key);
+        }
     }
     if let Some(parent) = spec
         .get("parent")

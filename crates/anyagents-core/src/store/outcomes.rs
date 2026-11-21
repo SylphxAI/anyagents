@@ -59,6 +59,16 @@ pub struct Outcome {
 }
 
 impl Store {
+    /// A terminal verdict for the current archive, not a historical task run.
+    pub fn has_terminal_archive_verdict(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        self.read_conn().db_query_one(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND state = 'archived'
+                           AND terminal_archive_verdict IS NOT NULL)",
+            &db_params![agent_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Record an operator/ancestor verdict and apply its task lifecycle action atomically.
     pub fn apply_verdict(
         &self,
@@ -158,8 +168,9 @@ impl Store {
                 )?;
                 ("running", Some(mail))
             } else {
-                let sql = "UPDATE agents SET state = 'archived' WHERE id = ?1";
-                tx.db_execute(sql, &db_params![target_id])?;
+                let sql = "UPDATE agents SET state = 'archived', terminal_archive_verdict = ?2
+                           WHERE id = ?1";
+                tx.db_execute(sql, &db_params![target_id, outcome.id])?;
                 cancel_archived_schedules(tx, target_id)?;
                 ("archived", None)
             };

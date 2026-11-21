@@ -76,14 +76,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 println!("{}\t{}", view.id, view.name);
             }
         }
-        AgentsCommand::Archive { name } => {
-            let view = set_state(data, &name, "archived")?;
-            if crate::ui::is_pretty() {
-                presentation::lifecycle("Archived", &view);
-            } else {
-                println!("{}\t{}\t{}", view.id, view.name, view.state);
-            }
-        }
+        AgentsCommand::Archive { name } => archive_cmd(data, Some(name))?,
         AgentsCommand::Pause { name } => {
             let view = set_state(data, &name, "paused")?;
             if crate::ui::is_pretty() {
@@ -709,6 +702,12 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
         )
         .map_err(Error::Message)?;
         if let Some(val) = answered {
+            if val["deleted"] == false {
+                return Err(Error::Message(format!(
+                    "agent retained: {}",
+                    val["remote_volume_reap_reason"]
+                )));
+            }
             let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("-");
             let deleted_name = val.get("name").and_then(|v| v.as_str()).unwrap_or(name);
             if crate::ui::is_pretty() {
@@ -724,6 +723,13 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
+    store.set_agent_state(&found.id, "archived")?;
+    let _process = store.try_lock_agent(&found.id)?;
+    if let Some(volume) = crate::sandbox_providers::lifecycle::delete_volume(&store, &found)
+        .filter(|v| !v.remote_volume_reaped)
+    {
+        return Err(Error::Message(volume.remote_volume_reap_reason));
+    }
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);

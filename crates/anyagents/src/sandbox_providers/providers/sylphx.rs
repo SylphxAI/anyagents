@@ -497,7 +497,14 @@ impl SandboxProvider for SylphxProvider {
     async fn destroy(&self, handle: &SandboxHandle) -> Result<(), String> {
         let client = self.client();
         let parent = self.config.parent.clone();
-        let lease_ref = resolve_lease_resource(&parent, handle);
+        if !handle.sandbox_id.trim().is_empty()
+            || handle
+                .metadata
+                .get("lease_resource")
+                .is_some_and(|r| !r.trim().is_empty())
+        {
+            self.release(handle).await?;
+        }
         let volume_ref = handle
             .metadata
             .get("volume_resource")
@@ -505,9 +512,6 @@ impl SandboxProvider for SylphxProvider {
             .or_else(|| handle.volume_id.clone());
 
         run_blocking(move || {
-            if !lease_ref.is_empty() {
-                client.release_lease(&parent, &lease_ref)?;
-            }
             if let Some(vol) = volume_ref.filter(|s| !s.trim().is_empty()) {
                 client.delete_volume(&parent, &vol)?;
             }
