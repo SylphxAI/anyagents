@@ -364,6 +364,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn versions_serves_the_postgres_fleet_in_one_inventory_read() {
+        let Ok(url) = std::env::var(anyagents_core::db::TEST_POSTGRES_URL_ENV) else {
+            eprintln!("skipping PostgreSQL versions regression: test URL is unset");
+            return;
+        };
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(oidc_env_keys());
+        configure_test_oidc_env();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_postgres(&url, dir.path()).unwrap());
+        let tag = anyagents_core::AgentId::generate();
+        let mut ids = Vec::new();
+        for n in 1..=500 {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(format!("{tag}-{n}"), "codex"))
+                .unwrap();
+            if n > 400 {
+                store.set_agent_state(&agent.id, "archived").unwrap();
+            }
+            ids.push(agent.id);
+        }
+        let expected_first_state = store.agent_by_name(&format!("{tag}-1")).unwrap().state;
+        let auth = crate::auth::Mode::from_env(dir.path());
+        let app = super::super::build_webhook_router(make_state(Arc::clone(&store), auth));
+        let cookie = valid_session_cookie_header();
+        let mut timings = Vec::new();
+        let mut result = None;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/api/versions")
+                        .header(COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            timings.push(start.elapsed());
+            result = Some((status, body));
+        }
+        for id in &ids {
+            store.delete_agent(id).unwrap();
+        }
+        eprintln!("operator versions request, 400 live and 100 archived fixtures: {timings:?}");
+        let (status, body) = result.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let data: Value = serde_json::from_slice(&body).unwrap();
+        let fleet = data["agents"].as_array().unwrap();
+        let mut fixtures = fleet
+            .iter()
+            .filter(|agent| agent["name"].as_str().unwrap().starts_with(tag.as_str()));
+        let first = fixtures.next().unwrap();
+        assert_eq!(
+            first,
+            &json!({
+                "id": ids[0], "name": format!("{tag}-1"), "state": expected_first_state, "harness": "codex",
+                "has_open_turn": false, "running_image_digest": null,
+                "desired_image_digest": data["runtime"]["desired_image_digest"],
+                "harness_version": null, "tpl_base_version": null, "sbx_guest_version": null,
+                "upgrade_status": "cold_uses_latest", "drain_requested": false,
+            })
+        );
+        assert!(fixtures.all(|a| a["upgrade_status"] == "cold_uses_latest"));
+        assert_eq!(
+            fleet
+                .iter()
+                .filter(|a| a["name"].as_str().unwrap().starts_with(tag.as_str()))
+                .count(),
+            500
+        );
+    }
+
     fn valid_session_cookie_header() -> String {
         let key = admin_auth::session_signing_key_from_env().unwrap();
         let now = std::time::SystemTime::now()
