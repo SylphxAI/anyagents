@@ -452,7 +452,10 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
     base_url: String,
     extra_args: Vec<String>,
 ) -> Result<(crate::sandbox_exec::EnsuredSandbox, String), (Option<Box<SandboxHandle>>, String)> {
-    tokio::task::spawn_blocking(move || {
+    let store_for_media = Arc::clone(&store);
+    let provider_for_media = Arc::clone(&provider);
+    let agent_id = agent.id.clone();
+    let ensured = tokio::task::spawn_blocking(move || {
         let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
         let remote_workdir = super::resolve_remote_sandbox_workdir(&store, &agent);
         let lease_env: BTreeMap<String, String> =
@@ -492,7 +495,7 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
             (None, e)
         })?;
 
-        let prep: Result<String, String> = (|| {
+        let prep: Result<(), String> = (|| {
             let _ =
                 crate::sandbox_exec::hydrate_agent_files_from_store(&store, &agent.id, &cfg_dir)?;
             ensure_deployment_skills_hydrated(&store);
@@ -508,12 +511,6 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
                     &store.data_dir().join(anyagents_harness::media::MEDIA_DIR),
                 );
             }
-            let rewritten_prompt = super::s3_media_profiles::hydrate_prompt_media_for_sandbox(
-                &store,
-                &cfg_dir,
-                &ensured.handle.state_dir,
-                &prompt_for_media,
-            );
             if crate::remote::require_public_url(store.data_dir()).is_ok() {
                 let _ = ensure_serverless_remote_session_token(&store, &agent.id, &base_url)?;
             }
@@ -531,15 +528,24 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
                     &extra_args,
                 )?;
             }
-            Ok(rewritten_prompt)
+            Ok(())
         })();
         match prep {
-            Ok(rewritten) => Ok((ensured, rewritten)),
+            Ok(()) => Ok(ensured),
             Err(e) => Err((Some(Box::new(ensured.handle)), e)),
         }
     })
     .await
-    .map_err(|e| (None, format!("sandbox ensure join error: {e}")))?
+    .map_err(|e| (None, format!("sandbox ensure join error: {e}")))??;
+    let effective_prompt = super::sandbox_media::hydrate_prompt(
+        &store_for_media,
+        &agent_id,
+        provider_for_media.as_ref(),
+        &ensured.handle,
+        &prompt_for_media,
+    )
+    .await;
+    Ok((ensured, effective_prompt))
 }
 
 /// Obtain a live remote MCP session token for `agent_id` in serverless dispatch
