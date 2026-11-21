@@ -124,6 +124,10 @@ pub(crate) fn filter_and_summarize_agent_list(
     let idle = running_idle + scaled_to_zero;
     let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = agents.iter().filter(|a| a.state == "archived").count();
+    let idle_task_volumes = agents
+        .iter()
+        .filter(|a| a.idle_task_volume_age_ms.is_some())
+        .count();
 
     if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
         agents.retain(|a| agent_matches_query(a, q));
@@ -143,12 +147,6 @@ pub(crate) fn filter_and_summarize_agent_list(
     let next_cursor = (end < matched).then_some(end);
     agents.drain(..start);
     agents.truncate(cap);
-    // List responses stay compact; full instructions and schedules live on `agents inspect` / `schedules list`.
-    for a in agents.iter_mut() {
-        a.instructions = None;
-        a.schedules.clear();
-    }
-
     serde_json::json!({
         "total": total,
         "matched": matched,
@@ -161,6 +159,7 @@ pub(crate) fn filter_and_summarize_agent_list(
         "scaled_to_zero": scaled_to_zero,
         "paused": paused,
         "archived": archived,
+        "idle_task_volumes": idle_task_volumes,
     })
 }
 
@@ -170,8 +169,25 @@ pub(crate) fn filter_and_summarize_agent_list(
 // 180 KiB fits a full page of 100 compact agent summaries without prematurely
 // truncating caller-requested limits down to ~18 rows.
 pub(super) const AGENT_LIST_RESULT_BUDGET: usize = 180_000;
+pub(super) const COMPACT_AGENT_LIST_RESULT_BUDGET: usize = 15_000;
 
-pub(super) fn compact_agent_row(row: &mut serde_json::Value) {
+#[derive(Clone, Copy)]
+pub(super) enum AgentListProjection {
+    Compact,
+    Full,
+    Legacy,
+}
+
+impl From<AgentListDetail> for AgentListProjection {
+    fn from(detail: AgentListDetail) -> Self {
+        match detail {
+            AgentListDetail::Compact => Self::Compact,
+            AgentListDetail::Full => Self::Full,
+        }
+    }
+}
+
+fn legacy_agent_row(row: &mut serde_json::Value) {
     let Some(row) = row.as_object_mut() else {
         return;
     };
@@ -200,6 +216,7 @@ pub(super) fn compact_agent_row(row: &mut serde_json::Value) {
                 | "automations"
                 | "description"
                 | "has_open_turn"
+                | "idle_task_volume_age_ms"
         )
     });
     if let Some(description) = row.get("description").and_then(|v| v.as_str())
@@ -230,13 +247,28 @@ pub(super) fn bound_agent_list(
     mut value: serde_json::Value,
     key: &str,
     cursor: Option<usize>,
+    projection: AgentListProjection,
 ) -> Result<serde_json::Value, String> {
     let matched = value["summary"]["matched"].as_u64().unwrap_or(0) as usize;
     let start = cursor.unwrap_or(0).min(matched);
     let rows = value[key].as_array_mut().ok_or("missing agent rows")?;
-    for row in rows {
-        compact_agent_row(row);
-    }
+    let budget = match projection {
+        AgentListProjection::Compact => {
+            for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+                row.retain(|key, value| match key.as_str() {
+                    "id" | "name" | "state" | "idle_task_volume_age_ms" => true,
+                    "turn_state" => value.as_str().is_some_and(|s| !matches!(s, "" | "idle")),
+                    _ => false,
+                });
+            }
+            COMPACT_AGENT_LIST_RESULT_BUDGET
+        }
+        AgentListProjection::Legacy => {
+            rows.iter_mut().for_each(legacy_agent_row);
+            AGENT_LIST_RESULT_BUDGET
+        }
+        AgentListProjection::Full => AGENT_LIST_RESULT_BUDGET,
+    };
     loop {
         let returned = value[key].as_array().unwrap().len();
         let end = start.saturating_add(returned);
@@ -245,12 +277,12 @@ pub(super) fn bound_agent_list(
         value["summary"]["next_cursor"] = serde_json::json!(next);
         value["summary"]["returned"] = serde_json::json!(returned);
         let bytes = encoded_agent_list_result(&value)?.len();
-        if bytes < AGENT_LIST_RESULT_BUDGET {
+        if bytes < budget {
             return Ok(value);
         }
         if returned <= 1 {
             return Err(format!(
-                "one agent summary exceeds the {AGENT_LIST_RESULT_BUDGET}-byte MCP result budget; use agents inspect with its name or ID"
+                "one agent summary exceeds the {budget}-byte MCP result budget; use agents inspect with its name or ID"
             ));
         }
         value[key].as_array_mut().unwrap().pop();

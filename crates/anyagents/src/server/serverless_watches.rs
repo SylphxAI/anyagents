@@ -341,7 +341,8 @@ pub(crate) fn settle_turn_mailbox_cursor(
         m.get(anyagents_core::stateless::MAX_INBOX_SEQ_META_KEY)
             .and_then(serde_json::Value::as_i64)
     });
-    if turn.status == "completed" {
+    let paused = turn.status == anyagents_core::stateless::TURN_LIMIT_PAUSED;
+    if turn.status == "completed" || paused {
         if let Some(seq) = msg_seq.into_iter().chain(inbox_seq).max() {
             let _ = store.mark_delivered_up_to(&turn.agent_id, seq);
             let opener = turn
@@ -351,7 +352,7 @@ pub(crate) fn settle_turn_mailbox_cursor(
             let _ = store.note_turn_completed_with_output_for(
                 &turn.agent_id,
                 seq,
-                opener.zip(turn.result_text.as_deref()),
+                opener.zip(turn.result_text.as_deref().filter(|_| !paused)),
             );
         }
     } else if let Some(seq) = msg_seq {

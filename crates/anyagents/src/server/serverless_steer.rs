@@ -764,7 +764,8 @@ pub(crate) fn apply_turn_complete_consumed_steers(
 /// Close durable mailbox cursor and `turn_recovery` ledger over `max_steered_seq`
 /// when a remote turn completes after consuming mid-turn steers.
 pub(crate) fn settle_steered_turn_cursor(store: &Store, turn: &PendingRemoteTurn) {
-    if turn.status != "completed" {
+    let paused = turn.status == anyagents_core::stateless::TURN_LIMIT_PAUSED;
+    if turn.status != "completed" && !paused {
         return;
     }
     let Some(steered_seq) = turn
@@ -783,7 +784,7 @@ pub(crate) fn settle_steered_turn_cursor(store: &Store, turn: &PendingRemoteTurn
     let _ = store.note_turn_completed_with_output_for(
         &turn.agent_id,
         steered_seq,
-        opener.zip(turn.result_text.as_deref()),
+        opener.zip(turn.result_text.as_deref().filter(|_| !paused)),
     );
 }
 

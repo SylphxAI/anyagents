@@ -23,12 +23,22 @@ use crate::migrate::now_ms;
 
 const LOCAL_REMOTE_TURNS_DIR: &str = "remote-turns";
 
+/// A guest stopped running at its per-turn budget, not a harness failure.
+pub const TURN_LIMIT_PAUSED: &str = "turn_limit_paused";
+
 /// Allowed `pending_remote_turns.status` values.
-pub const VALID_REMOTE_TURN_STATUSES: &[&str] =
-    &["dispatched", "running", "completed", "failed", "cancelled"];
+pub const VALID_REMOTE_TURN_STATUSES: &[&str] = &[
+    "dispatched",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    TURN_LIMIT_PAUSED,
+];
 
 /// Allowed terminal settlement statuses.
-pub const TERMINAL_REMOTE_TURN_STATUSES: &[&str] = &["completed", "failed", "cancelled"];
+pub const TERMINAL_REMOTE_TURN_STATUSES: &[&str] =
+    &["completed", "failed", "cancelled", TURN_LIMIT_PAUSED];
 
 pub fn is_terminal_remote_turn_status(status: &str) -> bool {
     TERMINAL_REMOTE_TURN_STATUSES.contains(&status)
@@ -47,11 +57,7 @@ pub(super) fn validate_terminal_status(status: &str) -> Result<&'static str, Err
         .iter()
         .copied()
         .find(|s| *s == status)
-        .ok_or_else(|| {
-            Error::Message(format!(
-                "invalid terminal remote turn status `{status}` (expected completed, failed, or cancelled)"
-            ))
-        })
+        .ok_or_else(|| Error::Message(format!("invalid terminal remote turn status `{status}`")))
 }
 
 pub(super) fn validate_turn_id(turn_id: &str) -> Result<&str, Error> {
