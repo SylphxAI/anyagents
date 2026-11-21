@@ -186,6 +186,16 @@ jobs:
           cargo build -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
           binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/prod-build.json")
           echo "ANYAGENTS_PROD_BIN=$binary" >> "$GITHUB_ENV"
+      - name: Start disposable PostgreSQL for the archive upgrade test
+        if: matrix.lane == 'coordinator'
+        run: |
+          set -euo pipefail
+          pg_bin=$(pg_config --bindir)
+          pg_data=$(mktemp -d "$RUNNER_TEMP/archive-upgrade-pg.XXXXXX")
+          "$pg_bin/initdb" -D "$pg_data" --username=fixture --auth=trust --no-locale -E UTF8
+          "$pg_bin/pg_ctl" -D "$pg_data" -l "$pg_data/server.log" \
+            -o "-h 127.0.0.1 -p 55432 -k $pg_data" -w start
+          echo 'ANYAGENTS_ARCHIVE_UPGRADE_TEST_POSTGRES_URL=postgresql://fixture@127.0.0.1:55432/postgres' >> "$GITHUB_ENV"
       - name: Test
         if: matrix.lane == 'crates' || matrix.lane == 'coordinator' || matrix.lane == 'identity'
         env:
