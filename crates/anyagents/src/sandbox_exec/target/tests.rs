@@ -238,7 +238,7 @@ fn sandbox_target_billing_is_inherited_fenced_and_redacted() {
                     );
                     assert!(release_sandbox_for_agent(&store, &agent.id, &config).unwrap());
                     assert!(
-                        crate::sandbox_providers::lifecycle::delete_volume(&store, &agent)
+                        crate::sandbox_providers::lifecycle::delete_volume(&store, agent)
                             .unwrap()
                             .remote_volume_reaped
                     );
