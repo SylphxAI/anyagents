@@ -464,6 +464,15 @@ pub struct ProviderHealth {
 /// Core async multi-provider sandbox lifecycle and execution trait.
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
+    /// Non-secret identity of an explicitly scoped target, for lease fencing.
+    fn credential_target(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn scoped_lease_client(&self) -> Option<super::sylphx::SylphxSandboxClient> {
+        None
+    }
+
     /// Canonical provider kind.
     fn kind(&self) -> ProviderKind;
 

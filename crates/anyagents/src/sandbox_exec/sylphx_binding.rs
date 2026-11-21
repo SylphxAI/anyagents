@@ -10,24 +10,33 @@ pub(super) fn sylphx_lease_from_handle(
     let spec = binding.map(binding_spec_value).unwrap_or_else(|| json!({}));
     let existing = SylphxLeaseConfig::from_config_dir(config_dir);
     let sylphx_cfg = SylphxProviderConfig::resolve(data_dir).ok().flatten();
-    let endpoint = spec
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
+    let scoped = registry.active().scoped_lease_client();
+    let endpoint = scoped
+        .as_ref()
+        .map(|c| c.endpoint.clone())
+        .or_else(|| {
+            spec.get("endpoint")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| sylphx_cfg.as_ref().map(|c| c.endpoint.clone()))
         .or_else(|| existing.as_ref().map(|c| c.endpoint.clone()))
         .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_ENDPOINT"))
         .or_else(|| env_non_empty("SYLPHX_SANDBOX_URL"))
         .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_ENDPOINT"))
         .unwrap_or_else(|| "https://api.sylphx.com".to_string());
-    let token = sylphx_cfg
-        .as_ref()
-        .and_then(|c| c.token.clone())
-        .or_else(|| existing.as_ref().and_then(|c| c.token.clone()))
-        .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_TOKEN"))
-        .or_else(|| env_non_empty("SYLPHX_API_KEY"))
-        .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_TOKEN"));
+    let token = if let Some(client) = scoped {
+        client.token
+    } else {
+        sylphx_cfg
+            .as_ref()
+            .and_then(|c| c.token.clone())
+            .or_else(|| existing.as_ref().and_then(|c| c.token.clone()))
+            .or_else(|| env_non_empty("ANYAGENTS_SANDBOX_TOKEN"))
+            .or_else(|| env_non_empty("SYLPHX_API_KEY"))
+            .or_else(|| env_non_empty("ANYAGENTS_SYLPHX_TOKEN"))
+    };
     let parent = handle
         .metadata
         .get("parent")
@@ -81,6 +90,7 @@ pub(super) fn sylphx_lease_from_handle(
         .or_else(|| binding.and_then(|b| b.data_plane_resource.clone()))
         .or_else(|| lease_resource.clone());
     Ok(SylphxLeaseConfig {
+        scoped: registry.active().credential_target().is_some(),
         endpoint,
         token,
         parent,
@@ -114,7 +124,7 @@ pub(crate) fn client_for_binding(
 > {
     let handle =
         sandbox_handle_from_binding(binding).ok_or_else(|| "invalid Sylphx binding".to_string())?;
-    let registry = resolve_registry_for_binding(Some(store.data_dir()), binding)?;
+    let registry = resolve_registry_for_binding(store, binding)?;
     let config_dir = anyagents_core::agent_config_dir(store.data_dir(), &binding.agent_id);
     let cfg = sylphx_lease_from_handle(
         &handle,

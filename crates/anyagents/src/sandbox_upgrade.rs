@@ -162,7 +162,7 @@ pub(crate) fn recycle_at_boundary(
     let provider = match provider {
         Some(provider) => provider,
         None => {
-            resolved = resolve_registry_for_binding(Some(store.data_dir()), &binding)?.active();
+            resolved = resolve_registry_for_binding(store, &binding)?.active();
             resolved.as_ref()
         }
     };
@@ -270,6 +270,24 @@ pub(crate) fn renew_active_binding(store: &Store, agent: &AgentId) -> Result<boo
         recycle_at_boundary(store, agent, None)?;
     }
     Ok(renew.is_some())
+}
+
+// A running standalone shim owns its stream. Renew the current lease only;
+// never recycle it on this path, nor use a stale token or a local mirror.
+pub(crate) fn renew_scoped_lease(store: &Store, agent: &AgentId) -> Result<(), String> {
+    let Some(binding) = store.sandbox_binding(agent).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let Some(key) = lease_key(&binding) else {
+        return Ok(());
+    };
+    let (client, parent) = crate::sandbox_exec::sylphx_client_for_binding(store, &binding)?;
+    if let Some(lease) = client.get_lease(&parent, key)?
+        && !lease.is_terminal()
+    {
+        client.renew_matching_lease(&lease, &desired_image(store, Some(&binding)), None)?;
+    }
+    Ok(())
 }
 
 fn persist_observation(

@@ -688,7 +688,8 @@ pub(super) fn deliver_agent_with_media(
             ) {
                 Ok(Some(_)) | Ok(None) => {}
                 Err(err)
-                    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() =>
+                    if crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+                        || !matches!(store.sandbox_credential_ref(&agent.id), Ok(None)) =>
                 {
                     return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
                 }

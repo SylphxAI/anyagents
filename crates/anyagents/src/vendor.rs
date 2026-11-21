@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 
 mod in_process;
 mod remote_session;
+mod spiron_config;
 pub use in_process::InProcessRemoteHarness;
+use spiron_config::spiron_execution_mode_local_in_toml;
 
 /// One vendor adapter over its vendor process, in the process that hosts it:
 /// its keeper, or this one.
@@ -1311,9 +1313,19 @@ fn vendor_launch_inner(
         Some(&request.data_dir),
         Some(&request.config_dir),
     );
-    let pg_sandbox_backed = store_opt
-        .and_then(|s| s.sandbox_binding(&request.agent.id).ok().flatten())
+    let scoped = store_opt
+        .map(|s| s.sandbox_credential_ref(&request.agent.id))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .flatten()
         .is_some();
+    let pg_sandbox_backed = scoped
+        || store_opt
+            .map(|s| s.sandbox_binding(&request.agent.id))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .is_some();
     let sylphx_backed = pg_sandbox_backed
         || crate::sandbox_exec::has_remote_sandbox_provider(Some(&request.data_dir))
         || crate::sandbox_providers::sylphx::SylphxLeaseConfig::from_config_dir(
@@ -1542,7 +1554,7 @@ fn vendor_launch_inner(
         }
     }
     enforce_host_memory_env(&request.agent.harness, &mut env);
-    let planned = plan_adapter(&request, &root, env, pg_sandbox_backed)?;
+    let planned = plan_adapter(&request, &root, env, pg_sandbox_backed, scoped)?;
     if planned.launch.runs_off_host() {
         begin_remote_session(store_opt, &request.agent)?;
     }
@@ -1558,6 +1570,7 @@ fn plan_adapter(
     root: &Path,
     mut env: Vec<(String, String)>,
     pg_sandbox_backed: bool,
+    scoped: bool,
 ) -> Result<Planned, String> {
     let scripted = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
     let model = request
@@ -1572,7 +1585,7 @@ fn plan_adapter(
         pointer: pointer.map(|name| request.config_dir.join(name)),
         selector: selector.to_string(),
     };
-    if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
+    if !scoped && let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
             std::env::var("ANYAGENTS_HARNESS_BIN").unwrap_or_else(|_| "anyagents-harness".into());
         return Ok(planned(
@@ -1606,6 +1619,9 @@ fn plan_adapter(
         crate::sandbox_providers::resolve_sandbox_config(Some(&request.config_dir))
             .is_some_and(|cfg| cfg.remote_spawn);
 
+    if scoped && (scripted || effective_cloud) {
+        return Err("explicit sandbox target requires a sandbox harness".into());
+    }
     if !scripted && !effective_cloud && (sylphx_backed || legacy_remote_spawn) {
         let canonical = if request.agent.harness.eq_ignore_ascii_case("spiron-local") {
             "spiron"
@@ -1619,7 +1635,7 @@ fn plan_adapter(
                 _ => None,
             },
         );
-        if sandbox_mode.is_remote_required() {
+        if scoped || sandbox_mode.is_remote_required() {
             return Ok(planned(
                 AdapterLaunch::InProcessSandbox {
                     config_dir: request.config_dir.clone(),
@@ -2153,31 +2169,6 @@ pub(crate) fn is_spiron_harness(harness: &str) -> bool {
     let trimmed = harness.trim();
     trimmed.eq_ignore_ascii_case("spiron-local")
         || anyagents_harness::normalize_harness_name(trimmed) == "spiron"
-}
-
-fn spiron_execution_mode_local_in_toml(data: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(data.join(crate::remote::CONFIG_FILE)) else {
-        return false;
-    };
-    let Ok(val) = toml::from_str::<toml::Value>(&raw) else {
-        return false;
-    };
-    let check_eq = |v: Option<&toml::Value>| {
-        v.and_then(toml::Value::as_str)
-            .is_some_and(|s| s.trim().eq_ignore_ascii_case("local"))
-    };
-    check_eq(val.get("execution_mode"))
-        || check_eq(val.get("spiron").and_then(|v| v.get("execution_mode")))
-        || check_eq(
-            val.get("harness")
-                .and_then(|v| v.get("spiron"))
-                .and_then(|v| v.get("execution_mode")),
-        )
-        || check_eq(val.get("server").and_then(|v| v.get("execution_mode")))
-        || check_eq(
-            val.get("server")
-                .and_then(|v| v.get("spiron_execution_mode")),
-        )
 }
 
 /// Whether `harness` should execute the local external `spiron` binary
@@ -4000,7 +3991,8 @@ for raw in reader:
             extra_env: vec![],
             lock: None,
         };
-        let spiron_planned = plan_adapter(&spiron_req, dir.path(), Vec::new(), false).unwrap();
+        let spiron_planned =
+            plan_adapter(&spiron_req, dir.path(), Vec::new(), false, false).unwrap();
         assert!(spiron_planned.launch.runs_off_host());
         assert_eq!(spiron_planned.selector, "spiron");
         assert_eq!(
@@ -4034,7 +4026,8 @@ for raw in reader:
             extra_env: vec![],
             lock: None,
         };
-        let claude_planned = plan_adapter(&claude_req, dir.path(), Vec::new(), false).unwrap();
+        let claude_planned =
+            plan_adapter(&claude_req, dir.path(), Vec::new(), false, false).unwrap();
         assert!(claude_planned.launch.runs_off_host());
         assert_eq!(claude_planned.selector, "claude-code");
         assert_eq!(
@@ -4093,7 +4086,7 @@ for raw in reader:
         // First launch: prepare_host_session pins `spiron`, plan_adapter returns selector `spiron`,
         // and SessionPointer's bind_vendor call succeeds without selector mismatch.
         prepare_host_session(&req).expect("prepare_host_session for spiron@cloud");
-        let planned = plan_adapter(&req, dir.path(), Vec::new(), false).unwrap();
+        let planned = plan_adapter(&req, dir.path(), Vec::new(), false, false).unwrap();
         assert_eq!(planned.selector, "spiron");
         let pointer = planned.pointer.as_ref().expect("spiron-cloud pointer");
         assert_eq!(pointer, &cfg.join("spiron-cloud-session-id"));
@@ -4104,7 +4097,7 @@ for raw in reader:
         // Restart: prepare_host_session binds persisted `spiron-cloud-session-id`, and
         // plan_adapter passes it as `session: Some(REMOTE_AGENT_ID)` into RemoteSession.
         prepare_host_session(&req).expect("restart prepare_host_session for spiron@cloud");
-        let resumed = plan_adapter(&req, dir.path(), Vec::new(), false).unwrap();
+        let resumed = plan_adapter(&req, dir.path(), Vec::new(), false, false).unwrap();
         assert!(
             matches!(
                 resumed.launch,
@@ -4172,6 +4165,7 @@ for raw in reader:
                 &request,
                 data,
                 vec![("ANTHROPIC_API_KEY".into(), "leaked".into())],
+                false,
                 false,
             )
             .unwrap()

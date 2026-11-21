@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 use super::{ApiError, AppState, spawn_store};
 use crate::sandbox_exec::{
     GuestHeartbeatFrame, apply_guest_heartbeat, resolve_registry_for_binding,
-    resolve_remote_provider_registry, sandbox_handle_from_binding, sweep_idle_sandboxes,
+    sandbox_handle_from_binding, sweep_idle_sandboxes,
 };
 use crate::serverless_cloud::{
     CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
@@ -488,24 +488,12 @@ async fn dispatch_sandbox_turn(
 ) -> Result<Option<DispatchedRemoteTurn>, String> {
     let provider: Arc<dyn AsyncSandboxProvider> = if let Some(p) = input.sandbox_provider.clone() {
         p
-    } else if let Some(reg) = resolve_remote_provider_registry(Some(store.data_dir()))? {
-        reg.active()
     } else {
-        let store_b = Arc::clone(&store);
-        let aid_b = input.agent.id.clone();
-        let existing =
-            run_store_blocking(move || Ok(store_b.sandbox_binding(&aid_b).ok().flatten())).await?;
-        if let Some(existing) = existing
-            && existing.provider != "legacy_http"
-            && existing.provider != "local"
-        {
-            resolve_registry_for_binding(Some(store.data_dir()), &existing)?.active()
-        } else {
-            return Err(
-                "serverless sandbox dispatch requires a configured SandboxProvider (`ANYAGENTS_SANDBOX_PROVIDER`)"
-                    .to_string(),
-            );
-        }
+        let (store, id) = (Arc::clone(&store), input.agent.id.clone());
+        run_store_blocking(move || crate::sandbox_exec::resolve_registry_for_agent(&store, &id))
+            .await?
+            .ok_or("serverless sandbox dispatch requires a configured sandbox provider")?
+            .active()
     };
 
     let provider_kind_str = provider.kind().as_str().to_string();
@@ -1567,7 +1555,7 @@ async fn pull_sandbox_auth_files_if_needed(
         let Some(handle) = sandbox_handle_from_binding(&binding) else {
             return Ok(None);
         };
-        let reg = resolve_registry_for_binding(Some(store_r.data_dir()), &binding)?;
+        let reg = resolve_registry_for_binding(&store_r, &binding)?;
         Ok(Some((reg.active(), handle, candidates)))
     })
     .await;

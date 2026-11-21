@@ -993,9 +993,8 @@ pub(super) async fn delete_agent_route(
         let data_dir = state.store.data_dir();
         let config = agent_dir.join("config");
         let seat_ids = detect_seat_ids(&config);
-        if let Err(err) = crate::sandbox_providers::destroy_sandbox_for_config_dir(&config) {
-            eprintln!("anyagents-sandbox: delete destroy failed: {err}");
-        }
+        crate::sandbox_exec::destroy_sandbox_for_agent(&state.store, &found.id, &config)
+            .map_err(|err| ApiError::new(StatusCode::CONFLICT, err))?;
 
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
         remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
@@ -1298,7 +1297,9 @@ fn prepare_agent_wake_with_options(
                 }
             }
             Err(err) => {
-                if crate::sandbox_providers::SandboxMode::from_env().is_remote_required() {
+                if crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
+                    || !matches!(store.sandbox_credential_ref(&found.id), Ok(None))
+                {
                     return Err(ApiError::new(StatusCode::BAD_GATEWAY, err));
                 }
                 eprintln!("anyagents-sandbox: wake lease ensure failed: {err}");
