@@ -235,6 +235,23 @@ older fingerprint build, which checks that a version downgrade keeps logins.
 checks the public mount: the directory redirect, path and query forwarding, and
 `404` for an unknown or removed key.
 
+### Sandbox browser takeover across turns
+
+The full sandbox image runs the standalone browser MCP in reconnect mode. Only a
+live registered desktop is retained after the harness closes stdio. The
+coordinator pins the current compute lease until hand-back, stop, or the earlier
+of 30 minutes and the provider lease expiry observed at registration. A
+replacement lease does not inherit an old takeover. Both the coordinator and
+the sandbox image must be updated to get turn-to-turn continuity.
+
+With Chromium, sway, and wayvnc installed, exercise two real stdio clients and
+verify that they see the same takeover URL and tab targets, followed by worker
+cleanup on expiry:
+
+```sh
+cargo test --locked -p anyagents-mcp-browser --test guest_reconnect -- --include-ignored
+```
+
 ## Host memory under a managed UID
 
 The active-writer, discovery-retry, busy-global-lock and daemon-launch Rust

@@ -142,6 +142,63 @@ pub fn simple_payload(meta: Option<&TakeoverState>, running: bool) -> Value {
 }
 
 impl BrowserSession {
+    // EOF retains only a live reverse tunnel. Waiting here is cancel-safe: no
+    // browser state is modified, so an arriving client can take over custody.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn wait_for_detached_end(&self) {
+        let mut inner = self.inner.lock().await;
+        let Some(inst) = inner.as_mut() else { return };
+        if !inst.takeover.active || !inst.is_alive() {
+            return;
+        }
+        let Some(tunnel) = &inst.takeover_tunnel else {
+            return;
+        };
+        let mut done = tunnel.completion();
+        let BrowserBackend::Desktop { session, .. } = &inst.backend else {
+            return;
+        };
+        let session = Arc::clone(session);
+        let baseline = inst.takeover.awaited_hand_backs;
+        drop(inner);
+        let gate = session.gate();
+        let mut holder = gate.subscribe();
+        loop {
+            if gate.hand_backs() > baseline
+                || session.is_closed()
+                || !session.takeover_status().browser_running
+            {
+                return;
+            }
+            tokio::select! {
+                _ = done.changed() => return,
+                _ = holder.changed() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+            }
+        }
+    }
+
+    // Reconcile a hand-back or expired tunnel before serving any MCP tool.
+    pub(crate) async fn reap_takeover(&self) {
+        let mut inner = self.inner.lock().await;
+        let Some(inst) = inner.as_mut() else { return };
+        let Some(tunnel) = &inst.takeover_tunnel else {
+            return;
+        };
+        if tunnel.is_finished() {
+            if let Some(mut inst) = inner.take() {
+                finalize_instance(&mut inst).await;
+            }
+        } else if let BrowserBackend::Desktop { session, .. } = &inst.backend
+            && session.gate().hand_backs() > inst.takeover.awaited_hand_backs
+        {
+            inst.takeover.active = false;
+            if let Some(tunnel) = inst.takeover_tunnel.take() {
+                tunnel.stop().await;
+            }
+        }
+    }
+
     pub async fn start_takeover(&self, req: BrowserTakeoverArgs) -> Result<Value, BrowserError> {
         let url = trimmed(req.url.as_deref())
             .map(navigable_url)
@@ -204,6 +261,13 @@ impl BrowserSession {
                 g = self.inner.lock().await;
                 *g = Some(inst);
             }
+            let awaited = g
+                .as_ref()
+                .and_then(|inst| match &inst.backend {
+                    BrowserBackend::Desktop { session, .. } => Some(session.gate().hand_backs()),
+                    _ => None,
+                })
+                .unwrap_or_default();
             let mut tunnel_error: Option<String> = None;
             if let Some(u) = pub_url {
                 let old_tunnel = g.as_mut().and_then(|i| i.takeover_tunnel.take());
@@ -288,11 +352,8 @@ impl BrowserSession {
                 }
                 cur = a.current_url().await.ok();
             }
-            inst.takeover.mark(
-                TakeoverMode::WayvncNovnc,
-                session.gate().hand_backs(),
-                req.reason,
-            );
+            inst.takeover
+                .mark(TakeoverMode::WayvncNovnc, awaited, req.reason);
             let mut p = desktop_payload(&session.takeover_status(), &inst.takeover, false);
             p["profile"] = json!(inst.active_profile);
             p["url"] = json!(cur);
@@ -380,6 +441,10 @@ impl BrowserSession {
             } else {
                 "released"
             };
+            inst.takeover.active = false;
+            if let Some(tunnel) = inst.takeover_tunnel.take() {
+                tunnel.stop().await;
+            }
             let mut p = json!({"status": status, "active": false, "holder": "agent", "browser_running": alive});
             p[status] = json!(changed);
             return Ok(p);

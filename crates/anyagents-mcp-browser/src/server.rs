@@ -1,6 +1,10 @@
 //! Standalone `rmcp` stdio MCP server exposing browser automation tools.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use tokio::sync::Mutex;
 
 use base64::Engine as _;
 use rmcp::handler::server::wrapper::Parameters;
@@ -25,7 +29,9 @@ use crate::url_guard::{MAX_TEXT_BYTES, navigable_url, readable_page_url, truncat
 /// Standalone MCP server for headless Chromium CDP browser automation.
 #[derive(Clone)]
 pub struct BrowserMcpServer {
-    session: BrowserSession,
+    pub(crate) session: BrowserSession,
+    operations: Arc<Mutex<()>>,
+    client: Option<Arc<AtomicBool>>,
 }
 
 impl BrowserMcpServer {
@@ -33,12 +39,57 @@ impl BrowserMcpServer {
     pub fn new(config: BrowserServerConfig) -> Self {
         Self {
             session: BrowserSession::new(config),
+            operations: Arc::default(),
+            client: None,
         }
     }
 
     /// Gracefully shut down any running Chromium child process.
     pub async fn shutdown(&self) {
+        let _operation = self.operations.lock().await;
         let _ = self.session.close().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_client(&self) -> (Self, Arc<AtomicBool>) {
+        let mut service = self.clone();
+        let client = Arc::new(AtomicBool::new(true));
+        service.client = Some(client.clone());
+        (service, client)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn wait_for_detached_end(&self) {
+        let _operation = self.operations.lock().await;
+        self.session.wait_for_detached_end().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_client_monitor(&self, attached: Arc<AtomicBool>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _operation = server.operations.lock().await;
+                if !attached.load(Ordering::Acquire) {
+                    break;
+                }
+                server.session.reap_takeover().await;
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn finish_client(&self) -> bool {
+        let _operation = self.operations.lock().await;
+        let end = self.session.wait_for_detached_end();
+        tokio::pin!(end);
+        if futures_util::poll!(&mut end).is_ready() {
+            let _ = self.session.close().await;
+            false
+        } else {
+            true
+        }
     }
 
     /// Inspect all registered MCP tool definitions (useful in tests and introspection).
@@ -838,6 +889,15 @@ impl ServerHandler for BrowserMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let _operation = self.operations.lock().await;
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| !client.load(Ordering::Acquire))
+        {
+            return Err(ErrorData::internal_error("browser client detached", None));
+        }
+        self.session.reap_takeover().await;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         Self::tool_router().call(tcc).await
     }

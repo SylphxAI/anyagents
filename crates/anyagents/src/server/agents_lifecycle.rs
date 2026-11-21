@@ -76,6 +76,9 @@ pub(crate) fn mark_explicitly_archived_locked(
 /// Mark only this row while its lifecycle lock is held; descendant cleanup is
 /// handled separately by maintenance.
 pub(super) fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent) {
+    if let Err(err) = crate::sandbox_exec::takeover_pin::end_locked(store, &agent.id, None) {
+        eprintln!("anyagents-sandbox: cannot end archived agent takeover: {err}");
+    }
     let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
     let _ = std::fs::create_dir_all(&cfg);
     let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
@@ -964,6 +967,8 @@ pub(super) async fn delete_agent_route(
         state
             .store
             .set_agent_state(&found.id, "archived")
+            .map_err(ApiError::from_store)?;
+        crate::sandbox_exec::takeover_pin::end_locked(&state.store, &found.id, None)
             .map_err(ApiError::from_store)?;
         for sched in &prev_schedules {
             crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
