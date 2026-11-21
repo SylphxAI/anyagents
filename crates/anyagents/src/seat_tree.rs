@@ -9,7 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-fn open_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+pub(crate) fn open_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
     let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
     let flags = libc::O_RDONLY
         | libc::O_NOFOLLOW
@@ -24,7 +24,7 @@ fn open_child(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> 
     }
 }
 
-fn open_root(path: &Path) -> io::Result<File> {
+pub(crate) fn open_root(path: &Path) -> io::Result<File> {
     let absolute = std::path::absolute(path)?;
     let mut directory = File::open("/")?;
     for part in absolute.components() {
@@ -130,7 +130,7 @@ pub(crate) fn persist_inbound_media(
     })
 }
 
-fn private_media_dir(
+pub(crate) fn private_media_dir(
     parent: &File,
     name: &OsStr,
     uid: Option<u32>,

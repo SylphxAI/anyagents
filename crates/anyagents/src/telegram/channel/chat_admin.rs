@@ -49,13 +49,7 @@ impl ChatAdmin {
             Change::Title(title) => set_chat_title(chat_id, title),
             Change::Description(description) => set_chat_description(chat_id, description),
             Change::Photo(photo) => {
-                transport::set_chat_photo(
-                    &self.token,
-                    &self.channel,
-                    chat_id,
-                    photo.mime,
-                    &photo.upload,
-                )?;
+                transport::set_chat_photo(&self.token, &self.channel, chat_id, &photo.upload)?;
                 return Ok(());
             }
         };

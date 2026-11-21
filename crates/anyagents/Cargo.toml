@@ -27,7 +27,7 @@ anyagents-supervisor = { path = "../anyagents-supervisor" }
 agent-memory = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0", features = ["service"] }
 agent-tools = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0" }
 async-trait = "0.1"
-axum = { version = "0.8", features = ["json", "ws"] }
+axum = { version = "0.8", features = ["json", "multipart", "ws"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }

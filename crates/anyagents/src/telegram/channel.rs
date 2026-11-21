@@ -2788,6 +2788,7 @@ pub fn is_local_media(source: &str) -> bool {
 /// (ADR 0010 D3), and the name it is uploaded under.
 pub struct MediaUpload {
     pub file_name: String,
+    pub content_type: &'static str,
     pub bytes: Vec<u8>,
 }
 
@@ -2799,14 +2800,18 @@ impl MediaUpload {
             .and_then(|n| n.to_str())
             .unwrap_or("attachment.bin")
             .replace(['"', '\r', '\n'], "_");
-        Self { file_name, bytes }
+        Self {
+            file_name,
+            content_type: "application/octet-stream",
+            bytes,
+        }
     }
 }
 
 /// Post a media item (photo, video, audio/music, voice, document, animation) through
 /// the agent's bot. `source` is an `https://` URL or an existing Telegram
-/// `file_id`, which Telegram fetches itself, or a local path whose bytes the
-/// caller already read into `upload` (sent as `multipart/form-data`). This
+/// `file_id`, which Telegram fetches itself, or a local path/private media
+/// reference already resolved into `upload` (sent as `multipart/form-data`). This
 /// function never opens a local path: the server's own access is not the
 /// requester's.
 #[allow(clippy::too_many_arguments)]

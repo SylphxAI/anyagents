@@ -331,7 +331,8 @@ fn chat_wide_coordinates_and_action_payloads_are_validated() {
     assert_eq!(description(Some("")).unwrap(), "");
     assert!(description(Some(&"界".repeat(255))).is_ok());
     assert!(description(Some(&"界".repeat(256))).is_err());
-    assert!(photo(&FileAuthority::Own, None).is_err());
+    let fixture = Fixture::new();
+    assert!(photo(&fixture.store, &fixture.owner.id, None).is_err());
     let mut truncated = png();
     truncated.truncate(16);
     assert!(Photo::from_bytes(truncated).is_err());
@@ -373,7 +374,7 @@ async fn chat_admin_http_route_checks_authentication_target_and_host_file_access
         (
             Some(&capability),
             StatusCode::FORBIDDEN,
-            "direct public HTTP(S) image URL",
+            "private media references",
         ),
         (
             Some(&capability),

@@ -15,13 +15,20 @@ const MAX_PHOTO_DIMENSION: u32 = 4096;
 
 pub(crate) struct Photo {
     pub(super) upload: MediaUpload,
-    pub(super) mime: &'static str,
 }
 
 impl Photo {
     pub(crate) const MAX_BYTES: u64 = 10 * 1024 * 1024;
 
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
+        Self::validate(bytes, None)
+    }
+
+    pub(crate) fn from_upload(upload: MediaUpload) -> Result<Self, Error> {
+        Self::validate(upload.bytes, Some(upload.file_name))
+    }
+
+    fn validate(bytes: Vec<u8>, filename: Option<String>) -> Result<Self, Error> {
         if bytes.len() as u64 > Self::MAX_BYTES {
             return Err(Error::Message("chat photo must be at most 10 MiB".into()));
         }
@@ -41,10 +48,10 @@ impl Photo {
         reader.decode().map_err(|_| invalid_image())?;
         Ok(Self {
             upload: MediaUpload {
-                file_name: file_name.into(),
+                file_name: filename.unwrap_or_else(|| file_name.into()),
+                content_type: mime,
                 bytes,
             },
-            mime,
         })
     }
 

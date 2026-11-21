@@ -371,7 +371,7 @@ pub(super) fn call_api_multipart(
         channel_id,
         method,
         fields,
-        (field, "application/octet-stream", upload),
+        (field, upload.content_type, upload),
     )
 }
 
@@ -379,7 +379,6 @@ pub(super) fn set_chat_photo(
     token: &str,
     channel_id: &ChannelId,
     chat_id: i64,
-    mime: &str,
     upload: &MediaUpload,
 ) -> Result<String, Error> {
     upload_multipart(
@@ -387,7 +386,7 @@ pub(super) fn set_chat_photo(
         channel_id,
         SET_CHAT_PHOTO,
         [("chat_id", chat_id.to_string())],
-        ("photo", mime, upload),
+        ("photo", upload.content_type, upload),
     )
 }
 
