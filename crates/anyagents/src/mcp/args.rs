@@ -634,7 +634,7 @@ pub(super) struct ScheduleArgs {
     /// - `"webhook:<topic>"` / `"event:<topic>"` (generic authenticated webhook/event trigger)
     /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
     /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
-    /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
+    /// - `"file:<path>"` / `"path:<path>"` (file/directory changes on local or running sandbox agents; unsupported on cloud)
     #[serde(default, deserialize_with = "crate::api::absent_if_null")]
     pub(super) watch: Option<String>,
     /// Keep a webhook/event watch active for each distinct delivery. Defaults to false.
