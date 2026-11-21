@@ -64,7 +64,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                 res = ci_scope.compute_scope(
                     REPO_ROOT,
                     [f"crates/{pkg}/src/server.rs"],
-                    event="pull_request",
+                    event="merge_group",
                 )
                 self.assertTrue(res.code)
                 self.assertEqual(res.rust_scope, f"crates:{pkg}")
@@ -78,7 +78,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
         res = ci_scope.compute_scope(
             REPO_ROOT,
             ["crates/anyagents-guest/src/turn.rs"],
-            event="pull_request",
+            event="merge_group",
         )
         self.assertTrue(res.code)
         self.assertEqual(res.rust_scope, "crates:anyagents,anyagents-guest")
@@ -173,7 +173,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
             "Dockerfile",
         ):
             with self.subTest(trigger=trigger):
-                res = ci_scope.compute_scope(REPO_ROOT, [trigger], event="pull_request")
+                res = ci_scope.compute_scope(REPO_ROOT, [trigger], event="merge_group")
                 self.assertTrue(res.code)
                 self.assertEqual(res.rust_scope, "workspace")
                 self.assertEqual(res.cargo_pkg_args, "--workspace")
@@ -186,6 +186,7 @@ class RealWorkspaceScopeTests(unittest.TestCase):
         for event in ("pull_request", "merge_group"):
             for paths in (
                 ["apps/console/src/main.tsx"],
+                ["apps/console/package-lock.json"],
                 ["crates/anyagents/src/server/console/index.html"],
                 ["apps/console/templates/signin.html", "docs/releases/audit.json", "sylphx.toml"],
             ):
@@ -198,30 +199,47 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                     self.assertEqual(res.rust_scope, "none")
                     self.assertEqual(json.loads(res.linux_matrix), {"include": []})
 
-    def test_server_route_keeps_coordinator_and_host_but_not_macos(self) -> None:
+    def test_server_route_keeps_coordinator_but_not_macos(self) -> None:
         for event in ("pull_request", "merge_group"):
             res = ci_scope.compute_scope(REPO_ROOT, [
                 "crates/anyagents/src/server/messaging.rs", "docs/architecture-audit.jsonl",
                 "apps/console/src/main.tsx",
             ], event=event)
             self.assertEqual(res.rust_scope, "crates:anyagents")
-            self.assertTrue(res.run_host_acceptance)
+            self.assertEqual(res.run_host_acceptance, event == "merge_group")
             self.assertTrue(res.run_console)
             self.assertFalse(res.run_macos)
             self.assertEqual(res.cargo_doc_args, "")
+            expected = ["lint", "coordinator"]
+            if event == "merge_group":
+                expected.extend(("identity", "host"))
             self.assertEqual(json.loads(res.linux_matrix), {"include": [
                 {"lane": lane, "packages": "-p anyagents", "docs": ""}
-                for lane in ("lint", "coordinator", "identity", "host")
+                for lane in expected
             ]})
 
     def test_storage_only_keeps_full_linux_including_host(self) -> None:
         paths = ["crates/anyagents-core/migrations_pg/011_example.sql",
                  "crates/anyagents-core/src/db/sqlite_to_pg.rs"]
-        res = ci_scope.compute_scope(REPO_ROOT, paths)
+        res = ci_scope.compute_scope(REPO_ROOT, paths, event="merge_group")
         self.assertEqual(res.rust_scope, "workspace")
         self.assertTrue(res.run_host_acceptance)
         self.assertFalse(res.run_macos)
         self.assertTrue(ci_scope.compute_scope(REPO_ROOT, [*paths, "Cargo.lock"]).run_macos)
+
+    def test_workspace_pr_runs_only_rust_lint_and_unit_lanes(self) -> None:
+        for paths, diff_failed in ((["Cargo.lock"], False), ([], True)):
+            with self.subTest(paths=paths, diff_failed=diff_failed):
+                res = ci_scope.compute_scope(REPO_ROOT, paths, diff_failed=diff_failed)
+                self.assertEqual(res.rust_scope, "workspace")
+                self.assertTrue(res.run_macos)
+                self.assertFalse(res.run_host_acceptance)
+                self.assertEqual(res.cargo_doc_args, "")
+                self.assertEqual(json.loads(res.linux_matrix), {"include": [
+                    {"lane": "lint", "packages": "--workspace", "docs": ""},
+                    {"lane": "crates", "packages": "--workspace --exclude anyagents", "docs": ""},
+                    {"lane": "coordinator", "packages": "-p anyagents", "docs": ""},
+                ]})
 
     def test_explicit_host_crates_include_macos(self) -> None:
         for name in ("keeper", "agent", "toolchain", "harness-spiron"):
@@ -229,8 +247,8 @@ class RealWorkspaceScopeTests(unittest.TestCase):
                 path = f"crates/anyagents-{name}/src/lib.rs"
                 self.assertTrue(ci_scope.compute_scope(REPO_ROOT, [path]).run_macos)
 
-    def test_push_workflow_dispatch_and_diff_failed_run_full_workspace(self) -> None:
-        for event in ("push", "workflow_dispatch", "release"):
+    def test_push_schedule_dispatch_and_diff_failed_run_full_workspace(self) -> None:
+        for event in ("push", "schedule", "workflow_dispatch", "release"):
             res = ci_scope.compute_scope(REPO_ROOT, ["README.md"], event=event)
             self.assertEqual(res.rust_scope, "workspace")
             self.assertTrue(res.run_macos)
@@ -241,9 +259,10 @@ class RealWorkspaceScopeTests(unittest.TestCase):
             self.assertEqual(lanes["crates"]["packages"], "--workspace --exclude anyagents")
             self.assertEqual(lanes["crates"]["docs"], "--workspace")
 
-        failed = ci_scope.compute_scope(REPO_ROOT, [], event="pull_request", diff_failed=True)
+        failed = ci_scope.compute_scope(REPO_ROOT, [], event="merge_group", diff_failed=True)
         self.assertEqual(failed.rust_scope, "workspace")
         self.assertTrue(failed.run_macos)
+        self.assertTrue(failed.run_host_acceptance)
 
 
 class SyntheticWorkspaceScopeTests(unittest.TestCase):
@@ -362,6 +381,70 @@ class GitRangeTests(unittest.TestCase):
             (assets / asset).write_text("nonempty asset")
         with self.assertRaisesRegex(ValueError, "missing Rust substitution marker"):
             ci_scope.check_console_assets(self.root)
+
+
+class ConsoleLockfileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        assets = self.root / ci_scope.CONSOLE_DIR
+        assets.mkdir(parents=True)
+        for asset in ci_scope.CONSOLE_ASSETS:
+            (assets / asset).write_bytes((REPO_ROOT / ci_scope.CONSOLE_DIR / asset).read_bytes())
+        self.lockfile = self.root / "apps/console/package-lock.json"
+        self.lockfile.parent.mkdir(parents=True)
+
+    def write_lock(self, resolved: object) -> None:
+        # Include a valid entry before the test value so checking only the first
+        # resolution cannot make a mixed lockfile pass.
+        self.lockfile.write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {"name": "fixture"},
+            "node_modules/one": {"resolved": "https://registry.npmjs.org/one/-/one-1.0.0.tgz"},
+            "node_modules/one/node_modules/two": {"resolved": resolved},
+        }}), encoding="utf-8")
+
+    def check_assets(self) -> tuple[int, str]:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            rc = ci_scope.main(["--root", str(self.root), "--check-console-assets"])
+        return rc, stderr.getvalue()
+
+    def test_public_npm_resolution(self) -> None:
+        self.write_lock("https://registry.npmjs.org/@scope/two/-/two-1.0.0.tgz")
+        self.assertEqual(self.check_assets(), (0, ""))
+
+    def test_off_registry_and_invalid_resolutions_fail_closed(self) -> None:
+        for value in (
+            "https://registry-cache.example/two/-/two-1.0.0.tgz",
+            "http://registry.npmjs.org/two.tgz",
+            "https://registry.npmjs.org.example/two.tgz",
+            "https://registry.npmjs.org@registry-cache.example/two.tgz",
+            "https://registry.npmjs.org/",
+            "https://registry.npmjs.org/two\n.tgz",
+            "file:two.tgz", "", None, ["https://registry.npmjs.org/two.tgz"],
+        ):
+            with self.subTest(value=value):
+                self.write_lock(value)
+                rc, stderr = self.check_assets()
+                self.assertEqual(rc, 1)
+                self.assertIn("resolved URLs must use https://registry.npmjs.org/", stderr)
+                self.assertNotIn("registry-cache.example", stderr)
+
+    def test_missing_malformed_and_ambiguous_lockfiles_fail_closed(self) -> None:
+        rc, stderr = self.check_assets()
+        self.assertEqual(rc, 1)
+        self.assertIn("expected regular lockfile", stderr)
+        for contents, message in (
+            ("{", "Expecting property name"),
+            ('{"packages":null}', "expected npm lockfile"),
+            ('{"packages":{}, "packages":{}}', "duplicate JSON key"),
+        ):
+            with self.subTest(contents=contents):
+                self.lockfile.write_text(contents, encoding="utf-8")
+                rc, stderr = self.check_assets()
+                self.assertEqual(rc, 1)
+                self.assertIn(message, stderr)
 
 
 if __name__ == "__main__":

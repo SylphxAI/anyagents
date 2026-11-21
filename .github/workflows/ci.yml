@@ -1,8 +1,8 @@
 name: ci
 
 # Continuous integration for a public repository: module size ratchet, policy
-# checks, format, clippy and crate-graph-scoped workspace tests on Linux and
-# macOS.
+# checks, format, clippy and crate-graph-scoped tests on Linux, plus native
+# smoke tests or full workspace coverage on macOS.
 #
 # GitHub-hosted standard runners are free only on a public repository, so a
 # private one must never reach them: every job here carries
@@ -21,6 +21,8 @@ on:
   merge_group:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -106,9 +108,9 @@ jobs:
           git diff --exit-code HEAD -- "$assets"
           test -z "$(git ls-files --others -- "$assets")"
 
-  # Compile only the Cargo package set required by each lane. The slow
-  # identity integration binary gets its own runner; the rest of the
-  # coordinator suite stays on one runner and automatically includes new tests.
+  # PRs use affected unit tests only. Queue and trunk runs also cover
+  # integration tests, doctests and privileged host acceptance when planned.
+  # The slow identity integration binary gets its own runner.
   linux:
     needs: changes
     if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
@@ -175,7 +177,7 @@ jobs:
           read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
           cargo clippy "${pkg_args[@]}" --all-targets --locked -- -D warnings
       - name: Build harness helper binary
-        if: matrix.lane == 'crates' && needs.changes.outputs.needs_fake_opencode == 'true'
+        if: github.event_name != 'pull_request' && matrix.lane == 'crates' && needs.changes.outputs.needs_fake_opencode == 'true'
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
       - name: Build runtime binary
         if: matrix.lane == 'host'
@@ -194,10 +196,18 @@ jobs:
           set -euo pipefail
           read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
           test_args=()
-          case "$LANE" in
-            coordinator) test_args=(-E 'not binary_id(=anyagents::identity)') ;;
-            identity) test_args=(--test identity) ;;
-          esac
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The coordinator has binary targets only; --lib would fail.
+            test_args=(--bins)
+            if [ "$LANE" = crates ]; then
+              test_args=(--lib --bins)
+            fi
+          else
+            case "$LANE" in
+              coordinator) test_args=(-E 'not binary_id(=anyagents::identity)') ;;
+              identity) test_args=(--test identity) ;;
+            esac
+          fi
           cargo nextest run "${pkg_args[@]}" "${test_args[@]}" --locked --no-fail-fast
           if [ -n "$CARGO_DOC_ARGS" ]; then
             read -r -a doc_args <<< "$CARGO_DOC_ARGS"
@@ -252,14 +262,16 @@ jobs:
           # A file the server opens for a seat is opened by that seat.
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$ANYAGENTS_UNIT_TEST_BIN" --exact seat_tree::tests::privileged_seat_open_refuses_what_the_seat_cannot_read --nocapture
 
-  # The macOS lane: runs whenever workspace-wide or macOS/platform-branching
-  # crates are affected. Skipped for docs/tools-only and Linux-sandbox/leaf PRs.
+  # The macOS lane: PRs and merge groups use compile/lint and native smoke tests.
+  # Keep full tests on main (including exact-source CI for releases), nightly,
+  # and manual runs. Path-based skips still come from the scope planner.
   macos:
     needs: changes
     if: github.event.repository.private == false && needs.changes.outputs.run_macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 45
     env:
+      MACOS_FULL_TEST: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: 'on'
       SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'READ_ONLY' || 'READ_WRITE' }}
@@ -290,29 +302,25 @@ jobs:
         with:
           key: sccache
       - name: Format
+        if: env.MACOS_FULL_TEST == 'true'
         run: cargo fmt --all -- --check
       - name: Clippy
-        env:
-          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: macOS socket credential and descriptor smoke tests
+        if: env.MACOS_FULL_TEST == 'false'
+        # Exercise getpeereid and the non-Linux FD_CLOEXEC fallback on real
+        # sockets. nextest fails if either exact test name disappears.
         run: |
-          set -euo pipefail
-          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
-          cargo clippy "${pkg_args[@]}" --all-targets --locked -- -D warnings
+          cargo nextest run -p anyagents-keeper --lib --locked --no-tests=fail -E 'test(=wire::tests::the_peer_is_this_user)'
+          cargo nextest run -p anyagents-keeper --lib --locked --no-tests=fail -E 'test(=wire::tests::a_descriptor_travels_with_its_frame)'
       - name: Build harness helper binaries
-        if: needs.changes.outputs.needs_fake_opencode == 'true'
+        if: env.MACOS_FULL_TEST == 'true' && needs.changes.outputs.needs_fake_opencode == 'true'
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
-      - name: Test
-        env:
-          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
-          CARGO_DOC_ARGS: ${{ needs.changes.outputs.cargo_doc_args }}
+      - name: Full workspace tests
+        if: env.MACOS_FULL_TEST == 'true'
         run: |
-          set -euo pipefail
-          read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
-          cargo nextest run "${pkg_args[@]}" --locked --no-fail-fast
-          if [ -n "$CARGO_DOC_ARGS" ]; then
-            read -r -a doc_args <<< "$CARGO_DOC_ARGS"
-            cargo test --doc "${doc_args[@]}" --locked
-          fi
+          cargo nextest run --workspace --locked --no-fail-fast
+          cargo test --doc --workspace --locked
 
   # GitHub treats a skipped required check as green. This gate always issues a
   # verdict, including when a prerequisite is cancelled, and checks that each

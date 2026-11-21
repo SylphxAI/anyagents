@@ -2,8 +2,9 @@
 """Plan required CI jobs from the tested tree and its event base.
 
 Diff events run policy checks plus the affected lanes. No trustworthy diff or
-unrecognized input means full CI. Only explicit platform-neutral paths can
-skip macOS; main and manual runs always exercise the workspace on both OSes.
+unrecognized input means workspace-wide scope. PRs run affected unit tests;
+merge groups run every affected Linux lane. Only explicit platform-neutral
+paths can skip macOS; main, scheduled, and manual runs test both OSes in full.
 """
 
 from __future__ import annotations
@@ -52,6 +53,8 @@ WORKSPACE_TRIGGER_PATTERNS = (
 )
 
 CONSOLE_DIR = "crates/anyagents/src/server/console"
+CONSOLE_LOCKFILE = "apps/console/package-lock.json"
+NPM_RESOLVED_URL = re.compile(r"https://registry\.npmjs\.org/[^\s\\\x00-\x1f\x7f]+")
 CONSOLE_ASSETS = frozenset({
     "index.html", "signin.html", "auth_recovery.html", "console.css", "console.js",
 })
@@ -289,6 +292,7 @@ def affected_packages(
 def _scope(
     reason: str,
     *,
+    pr: bool = False,
     graph: WorkspaceGraph | None = None,
     affected: tuple[str, ...] | list[str] = (),
     workspace: bool = False,
@@ -306,18 +310,22 @@ def _scope(
     doc_args = "--workspace" if workspace else pkg_args(
         [pkg for pkg in crates if graph is not None and graph.packages[pkg].has_lib]
     )
+    if pr:
+        doc_args = ""
+        host = False
     scope = "workspace" if workspace else "crates:" + ",".join(affected) if affected else "none"
     cargo_args = "--workspace" if workspace else pkg_args(list(affected))
-    # Each lane gets its exact Cargo scope. The complement of the identity
-    # binary stays in coordinator, so new coordinator tests are never omitted.
+    # In queue and trunk CI, the complement of the identity binary stays
+    # in coordinator so new integration tests are never omitted.
     lanes = []
     if cargo_args:
         lanes.append({"lane": "lint", "packages": cargo_args, "docs": ""})
     if crate_args:
         lanes.append({"lane": "crates", "packages": crate_args, "docs": doc_args})
     if coordinator:
-        lanes.extend({"lane": lane, "packages": "-p anyagents", "docs": ""}
-                     for lane in ("coordinator", "identity"))
+        lanes.append({"lane": "coordinator", "packages": "-p anyagents", "docs": ""})
+        if not pr:
+            lanes.append({"lane": "identity", "packages": "-p anyagents", "docs": ""})
     if host:
         lanes.append({"lane": "host", "packages": "-p anyagents", "docs": ""})
     return ScopeResult(
@@ -335,8 +343,8 @@ def _scope(
     )
 
 
-def _full_workspace_scope(reason: str, *, macos: bool = True) -> ScopeResult:
-    return _scope(reason, workspace=True, macos=macos, host=True, npm=True, console=True)
+def _full_workspace_scope(reason: str, *, macos: bool = True, pr: bool = False) -> ScopeResult:
+    return _scope(reason, pr=pr, workspace=True, macos=macos, host=True, npm=True, console=True)
 
 
 def _match_member_crate(path: str, sorted_member_paths: list[tuple[str, str]]) -> str | None:
@@ -354,8 +362,9 @@ def compute_scope(
     diff_failed: bool = False,
 ) -> ScopeResult:
     """Compute CI scope outputs for a change set."""
+    pr = event == "pull_request"
     if diff_failed:
-        return _full_workspace_scope("diff-failed")
+        return _full_workspace_scope("diff-failed", pr=pr)
     if event not in ("pull_request", "merge_group"):
         return _full_workspace_scope(f"event:{event}")
 
@@ -363,9 +372,9 @@ def compute_scope(
     run_npm = run_console = False
     for path in changed_paths:
         if any(ord(char) < 32 for char in path):
-            return _full_workspace_scope(f"control-character-in-path:{path!r}")
+            return _full_workspace_scope(f"control-character-in-path:{path!r}", pr=pr)
         if any(pat.fullmatch(path) for pat in WORKSPACE_TRIGGER_PATTERNS):
-            return _full_workspace_scope(f"workspace-trigger:{path!r}")
+            return _full_workspace_scope(f"workspace-trigger:{path!r}", pr=pr)
         if any(pat.fullmatch(path) for pat in NON_RUST_PATTERNS):
             continue
         if any(pat.fullmatch(path) for pat in NPM_PATTERNS):
@@ -390,7 +399,7 @@ def compute_scope(
     ):
         # Shared store changes still exercise every Linux dependent. Shipped
         # storage migrations don't change the workstation/platform contract.
-        return _full_workspace_scope("storage-only", macos=False)
+        return _full_workspace_scope("storage-only", macos=False, pr=pr)
 
     graph = load_workspace_graph(root)
     sorted_members = sorted(graph.path_to_pkg.items(), key=lambda item: -len(item[0]))
@@ -402,22 +411,23 @@ def compute_scope(
             touched_crates.add(ROOT_COORDINATOR_PKG)
             continue
         if path.startswith(COORDINATOR_DIR + "/"):
-            return _full_workspace_scope(f"coordinator-platform:{path!r}")
+            return _full_workspace_scope(f"coordinator-platform:{path!r}", pr=pr)
         pkg = _match_member_crate(path, sorted_members)
         if pkg is None:
-            return _full_workspace_scope(f"unclassified-path:{path!r}")
+            return _full_workspace_scope(f"unclassified-path:{path!r}", pr=pr)
         # Manifest/build changes can add/remove and rewire dependencies.
         if path in (f"{graph.packages[pkg].rel_path}/Cargo.toml", f"{graph.packages[pkg].rel_path}/build.rs"):
-            return _full_workspace_scope(f"crate-build-input:{path!r}")
+            return _full_workspace_scope(f"crate-build-input:{path!r}", pr=pr)
         touched_crates.add(pkg)
 
     affected, normal_reach = affected_packages(graph, touched_crates)
     if CORE_PROMOTE_PKG in normal_reach:
-        return _full_workspace_scope(f"core-dependent:{','.join(sorted(touched_crates))}")
+        return _full_workspace_scope(f"core-dependent:{','.join(sorted(touched_crates))}", pr=pr)
 
     non_root_normal = normal_reach - {ROOT_COORDINATOR_PKG}
     return _scope(
         f"scoped-crates:{','.join(sorted(touched_crates))}",
+        pr=pr,
         graph=graph,
         affected=affected,
         macos=any(
@@ -490,8 +500,32 @@ def check_purity(root: Path) -> None:
         raise ValueError("open-source purity violations:\n" + "\n".join(violations))
 
 
+def check_console_lockfile(root: Path) -> None:
+    """Allow only public npm tarball origins, including in nested entries."""
+    lockfile = root / CONSOLE_LOCKFILE
+    if lockfile.is_symlink() or not lockfile.is_file():
+        raise ValueError(f"expected regular lockfile: {CONSOLE_LOCKFILE}")
+
+    def checked_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for key, value in pairs:
+            if key in values:
+                raise ValueError(f"{CONSOLE_LOCKFILE}: duplicate JSON key")
+            if key == "resolved" and (
+                not isinstance(value, str) or not NPM_RESOLVED_URL.fullmatch(value)
+            ):
+                # Do not repeat rejected URLs; they can contain private data.
+                raise ValueError(f"{CONSOLE_LOCKFILE}: resolved URLs must use https://registry.npmjs.org/")
+            values[key] = value
+        return values
+
+    lock = json.loads(lockfile.read_text(encoding="utf-8"), object_pairs_hook=checked_object)
+    if not isinstance(lock, dict) or not isinstance(lock.get("packages"), dict):
+        raise ValueError(f"{CONSOLE_LOCKFILE}: expected npm lockfile with a packages object")
+
+
 def check_console_assets(root: Path) -> None:
-    """Validate the same file/UTF-8 contract as the Rust include_str! calls."""
+    """Validate embedded Rust inputs and the console lockfile before npm ci."""
     files = root / CONSOLE_DIR
     if {p.name for p in files.iterdir()} != CONSOLE_ASSETS:
         raise ValueError(f"expected exactly these embedded assets: {sorted(CONSOLE_ASSETS)}")
@@ -506,6 +540,7 @@ def check_console_assets(root: Path) -> None:
         placeholders = set(re.findall(r"\{\{[A-Z_]+\}\}", contents))
         if not contents.strip() or not markers.get(path.name, set()) <= placeholders:
             raise ValueError(f"empty asset or missing Rust substitution marker: {path}")
+    check_console_lockfile(root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -556,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             paths = changed_git_paths(root, args.base, args.head)
         except (ValueError, OSError, subprocess.CalledProcessError) as err:
-            print(f"Unavailable candidate diff; using full CI: {err}", file=sys.stderr)
+            print(f"Unavailable candidate diff; using workspace-wide scope: {err}", file=sys.stderr)
             diff_failed = True
     result = compute_scope(root, paths, event=args.event, diff_failed=diff_failed)
     outputs = result.to_github_outputs()
