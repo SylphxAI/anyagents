@@ -371,6 +371,28 @@ class GitRangeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "docs/a.md:1: hardcoded user home"):
             ci_scope.check_purity(self.root)
 
+    def test_vendor_boundary_blocks_production_but_not_fixtures_or_forwarding(self) -> None:
+        policy = "crates/anyagents/tests/open_source_purity.rs"
+        self.commit(policy, (REPO_ROOT / policy).read_text())
+        signature = '"https://chatgpt.com/backend-api/wham/usage"'
+        fixture = f'const URL: &str = {signature};\n'
+        for path in (
+            "crates/anyagents/tests/oauth_fixture.rs",
+            "crates/anyagents/src/server/native_signin/fixture.rs",
+            "crates/anyagents-harness-spiron/src/fixture.rs",
+            "crates/anyagents/src/serverless_cloud.rs",
+            "apps/console/src/accounts/ConnectDialog.tsx",
+        ):
+            self.commit(path, fixture)
+        production = "crates/anyagents/src/forward.rs"
+        forwarding = 'fn forward(req: Request) { sink(req.header("user-agent")); }\n'
+        with_test = forwarding + "#[cfg(test)]\nmod fixture {\n" + fixture + "}\n"
+        self.commit(production, with_test)
+        ci_scope.check_purity(self.root)
+        self.commit(production, with_test + fixture)
+        with self.assertRaisesRegex(ValueError, "forward.rs:6: private Codex API"):
+            ci_scope.check_purity(self.root)
+
     def test_console_assets_reject_missing_templates_and_substitution_markers(self) -> None:
         assets = self.root / ci_scope.CONSOLE_DIR
         assets.mkdir(parents=True)

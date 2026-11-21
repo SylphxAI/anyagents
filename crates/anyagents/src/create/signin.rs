@@ -4,12 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, Error, Store, agent_config_dir};
 
-use super::credentials::{OAUTH_REFRESH_ATTEMPT_FILE, OAUTH_REFRESH_RESERVATION_FILE};
 use super::profile_identity::{extract_profile_dedup_key, sanitize_profile_slug};
 use super::profiles::{
     copy_seat_file_if_newer, ensure_provider_profile_meta, sync_and_list_provider_profiles_inner,
 };
-use super::quota::sync_anthropic_profile_metadata;
 use super::{
     chmod_seat_file_readable, extract_profile_account_identity, list_harness_profiles,
     propagate_profile_files_to_bound_agents, update_profile_json_identity, upstream_provider_of,
@@ -780,26 +778,6 @@ pub(crate) fn resolve_and_commit_staged_signin(
                     );
                 }
             }
-            if let Some(tok) = cred
-                .pointer("/claudeAiOauth/accessToken")
-                .and_then(serde_json::Value::as_str)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                let http = ureq::Agent::config_builder()
-                    .timeout_global(Some(std::time::Duration::from_secs(6)))
-                    .build()
-                    .new_agent();
-                let _ = sync_anthropic_profile_metadata(
-                    &http,
-                    data,
-                    staging_dir,
-                    ".staging",
-                    &tok,
-                    &mut cred,
-                    true,
-                );
-            }
             if let Ok(updated) = serde_json::to_string(&cred) {
                 let _ = std::fs::create_dir_all(staging_dir.join(".claude"));
                 write_required_file(&root_cred, updated.as_bytes(), 0o600)?;
@@ -976,8 +954,6 @@ pub(crate) fn finalize_profile_signin(
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     ensure_provider_profile_meta(&prof_dir, provider, None);
-    let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE));
-    let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_RESERVATION_FILE));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-usage-backoff-until-ms"));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-quota-reset-ms"));
@@ -1022,20 +998,6 @@ pub(crate) fn finalize_profile_signin(
                     let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
                     write_required_file(&root_cred, updated.as_bytes(), 0o600)?;
                     write_required_file(&sub_cred, updated.as_bytes(), 0o600)?;
-                }
-                if let Some(tok) = cred
-                    .pointer("/claudeAiOauth/accessToken")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                {
-                    let http = ureq::Agent::config_builder()
-                        .timeout_global(Some(std::time::Duration::from_secs(6)))
-                        .build()
-                        .new_agent();
-                    let _ = sync_anthropic_profile_metadata(
-                        &http, data, &prof_dir, profile, &tok, &mut cred, true,
-                    );
                 }
             }
             propagate_profile_files_to_bound_agents(

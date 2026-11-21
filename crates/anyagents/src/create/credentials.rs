@@ -1,6 +1,6 @@
-//! Profile markers, OAuth refresh disk reservation, Anthropic OAuth refresh, credential seeding, and propagation.
+//! Profile markers, credential seeding, and propagation.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyagents_core::{Agent, Error, Store, agent_config_dir};
 use anyagents_harness::normalize_harness_name;
@@ -63,192 +63,9 @@ pub(crate) fn seeded_profile_name(config_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub(super) const OAUTH_REFRESH_RESERVATION_FILE: &str = ".anyagents-refresh-reservation";
-
-pub(super) const OAUTH_REFRESH_ATTEMPT_FILE: &str = ".anyagents-oauth-refresh-attempt-ms";
-
-const OAUTH_REFRESH_MIN_RESERVE_BYTES: usize = 16_384;
-
-pub(super) fn persist_refreshed_credentials(
-    root: &Path,
-    rels: &[&str],
-    bytes: &[u8],
-) -> Result<(), Error> {
-    let recovery = root.join(".anyagents-pending-credentials.json");
-    write_required_file(&recovery, bytes, 0o600)?;
-    for rel in rels {
-        write_required_file(&root.join(rel), bytes, 0o600)?;
-    }
-    std::fs::remove_file(recovery)?;
-    Ok(())
-}
-
-pub(super) struct OAuthRefreshDiskReservation {
-    profile_root: PathBuf,
-    reservation_path: PathBuf,
-}
-
-impl OAuthRefreshDiskReservation {
-    /// Fail-closed pre-flight guard before issuing any single-use or rotating
-    /// OAuth `refresh_token` network request:
-    /// 1. Ensures target credential parent directories exist under `profile_root`.
-    /// 2. Pre-writes and `sync_all()`s `.anyagents-refresh-reservation`
-    ///    (`>= max(existing_cred_bytes * 2, 8192)` bytes, scaled by target copies)
-    ///    plus syncs `profile_root` so `ENOSPC`/`EROFS`/`EACCES` abort BEFORE the
-    ///    OAuth server rotates and revokes the existing `refresh_token`.
-    /// 3. Records `.anyagents-oauth-refresh-attempt-ms` via checked `write_required_file`.
-    pub(super) fn acquire(
-        profile_root: &Path,
-        target_rels: &[&str],
-        existing_cred_bytes: usize,
-        attempt_ms: i64,
-    ) -> Result<Self, Error> {
-        for rel in target_rels {
-            if let Some(parent) = profile_root.join(rel).parent()
-                && parent != profile_root
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let copies = target_rels.len().saturating_add(2).max(2);
-        let reserve_bytes = existing_cred_bytes
-            .saturating_mul(copies)
-            .max(existing_cred_bytes.saturating_mul(2))
-            .max(OAUTH_REFRESH_MIN_RESERVE_BYTES);
-        let reservation_path = profile_root.join(OAUTH_REFRESH_RESERVATION_FILE);
-        if std::fs::symlink_metadata(&reservation_path)
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            std::fs::remove_file(&reservation_path)?;
-        }
-        let write_res = (|| -> Result<(), Error> {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&reservation_path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            let payload = vec![b'0'; reserve_bytes];
-            file.write_all(&payload)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::File::open(profile_root)?.sync_all()?;
-            Ok(())
-        })();
-        if let Err(err) = write_res {
-            let _ = std::fs::remove_file(&reservation_path);
-            return Err(err);
-        }
-        let guard = Self {
-            profile_root: profile_root.to_path_buf(),
-            reservation_path,
-        };
-        write_required_file(
-            &profile_root.join(OAUTH_REFRESH_ATTEMPT_FILE),
-            format!("{attempt_ms}\n").as_bytes(),
-            0o600,
-        )?;
-        Ok(guard)
-    }
-
-    pub(super) fn persist_credentials(mut self, rels: &[&str], bytes: &[u8]) -> Result<(), Error> {
-        let _ = std::fs::remove_file(&self.reservation_path);
-        self.reservation_path.clear();
-        persist_refreshed_credentials(&self.profile_root, rels, bytes)
-    }
-}
-
-impl Drop for OAuthRefreshDiskReservation {
-    fn drop(&mut self) {
-        if !self.reservation_path.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.reservation_path);
-        }
-    }
-}
-
-pub(super) fn anthropic_oauth_usage_url() -> String {
-    std::env::var("ANYAGENTS_ANTHROPIC_OAUTH_USAGE_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://api.anthropic.com/api/oauth/usage".to_string())
-}
-
-pub(super) fn post_anthropic_oauth_refresh(
-    http: &ureq::Agent,
-    req_body: &str,
-) -> Option<serde_json::Value> {
-    let custom_url = std::env::var("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let urls: Vec<&str> = match custom_url.as_deref() {
-        Some(u) => vec![u],
-        None => vec![
-            "https://api.anthropic.com/v1/oauth/token",
-            "https://platform.claude.com/v1/oauth/token",
-        ],
-    };
-    for url in urls {
-        if let Ok(rresp) = http
-            .post(url)
-            .header("content-type", "application/json")
-            .header("user-agent", "claude-code/2.1.310")
-            .send(req_body.as_bytes())
-            && let Ok(rbody) = rresp.into_body().read_to_string()
-            && let Ok(rval) = serde_json::from_str::<serde_json::Value>(&rbody)
-            && rval
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty())
-        {
-            return Some(rval);
-        }
-    }
-    None
-}
-
-fn seat_sanitized_anthropic_credentials(src_bytes: &[u8], now_ms: i64) -> Vec<u8> {
-    if crate::server::serverless::is_serverless_mode()
-        || (crate::sandbox::is_isolated_test_env()
-            && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none())
-    {
-        return src_bytes.to_vec();
-    }
-    let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(src_bytes) else {
-        return src_bytes.to_vec();
-    };
-    if let Some(oauth) = val
-        .get_mut("claudeAiOauth")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        let exp = oauth
-            .get("expiresAt")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        oauth.insert("refreshToken".to_string(), serde_json::Value::Null);
-        if exp <= now_ms {
-            oauth.insert(
-                "accessToken".to_string(),
-                serde_json::Value::String(String::new()),
-            );
-            oauth.insert("expiresAt".to_string(), serde_json::Value::Number(0.into()));
-        }
-        if let Ok(out) = serde_json::to_vec(&val) {
-            return out;
-        }
-    }
-    src_bytes.to_vec()
-}
-
 // Both paths are aliases within one selected profile, not independent accounts.
 // Prefer the usable token with the latest expiry rather than a stale root alias.
-fn read_anthropic_profile_credentials(profile_root: &Path) -> Option<Vec<u8>> {
+pub(super) fn read_anthropic_profile_credentials(profile_root: &Path) -> Option<Vec<u8>> {
     [".credentials.json", ".claude/.credentials.json"]
         .into_iter()
         .filter_map(|rel| std::fs::read(profile_root.join(rel)).ok())
@@ -261,125 +78,13 @@ fn read_anthropic_profile_credentials(profile_root: &Path) -> Option<Vec<u8>> {
         })
 }
 
-pub(super) fn refresh_anthropic_profile_oauth_if_due(
-    data: &Path,
-    profile_root: &Path,
-) -> Result<(), Error> {
-    if crate::sandbox::is_isolated_test_env()
-        && std::env::var_os("ANYAGENTS_ANTHROPIC_OAUTH_TOKEN_URL").is_none()
-    {
-        return Ok(());
-    }
-    let Some(cred_bytes) = read_anthropic_profile_credentials(profile_root) else {
-        return Ok(());
-    };
-    let Ok(mut cred) = serde_json::from_slice::<serde_json::Value>(&cred_bytes) else {
-        return Ok(());
-    };
-    let now_ms = anyagents_core::now_ms();
-    let expires_at = cred
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(i64::MAX);
-    if expires_at > now_ms.saturating_add(45 * 60 * 1_000) {
-        return Ok(());
-    }
-    let attempt_path = profile_root.join(".anyagents-oauth-refresh-attempt-ms");
-    let last_attempt_ms = std::fs::read_to_string(&attempt_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let min_retry_ms = if expires_at <= now_ms.saturating_add(30 * 60 * 1_000) {
-        60_000
-    } else {
-        300_000
-    };
-    if now_ms.saturating_sub(last_attempt_ms) < min_retry_ms {
-        return Ok(());
-    }
-    let Some(rtok) = cred
-        .pointer("/claudeAiOauth/refreshToken")
-        .and_then(serde_json::Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(());
-    };
-    let reservation = OAuthRefreshDiskReservation::acquire(
-        profile_root,
-        &[".credentials.json", ".claude/.credentials.json"],
-        cred_bytes.len(),
-        now_ms,
-    )?;
-    let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(8)))
-        .build()
-        .new_agent();
-    let req_body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": rtok,
-        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-    })
-    .to_string();
-    let Some(rval) = post_anthropic_oauth_refresh(&http, &req_body) else {
-        return Ok(());
-    };
-    let Some(new_acc) = rval
-        .get("access_token")
-        .and_then(serde_json::Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(());
-    };
-    if let Some(oauth) = cred
-        .get_mut("claudeAiOauth")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        oauth.insert(
-            "accessToken".to_string(),
-            serde_json::Value::String(new_acc),
-        );
-        if let Some(new_ref) = rval
-            .get("refresh_token")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            oauth.insert(
-                "refreshToken".to_string(),
-                serde_json::Value::String(new_ref.to_string()),
-            );
-        }
-        if let Some(exp_in) = rval.get("expires_in").and_then(serde_json::Value::as_i64) {
-            oauth.insert(
-                "expiresAt".to_string(),
-                serde_json::Value::Number((now_ms + exp_in * 1_000).into()),
-            );
-        }
-        if let Ok(updated) = serde_json::to_string(&cred) {
-            if let Err(err) = reservation.persist_credentials(
-                &[".credentials.json", ".claude/.credentials.json"],
-                updated.as_bytes(),
-            ) {
-                let _ = std::fs::remove_file(&attempt_path);
-                return Err(err);
-            }
-            let _ = std::fs::remove_file(profile_root.join(".anyagents-usage-backoff-until-ms"));
-            if let Some(profile_name) = profile_root.file_name().and_then(|n| n.to_str())
-                && let Err(err) = propagate_profile_files_to_bound_agents(
-                    data,
-                    "anthropic",
-                    profile_name,
-                    &[".credentials.json", ".claude/.credentials.json"],
-                )
-            {
-                let _ = std::fs::remove_file(&attempt_path);
-                return Err(err);
-            }
-        }
-    }
-    Ok(())
+// Do not roll back a token pair already rotated by the CLI for the same account.
+fn retain_anthropic_credentials(source: &[u8], destination: &[u8]) -> bool {
+    json_oauth_expires_at(destination) > json_oauth_expires_at(source)
+        && !matches!(
+            (json_oauth_identity(source), json_oauth_identity(destination)),
+            (Some(source_id), Some(destination_id)) if source_id != destination_id
+        )
 }
 
 pub(crate) fn sync_anthropic_agent_credentials_from_profile(
@@ -392,40 +97,21 @@ pub(crate) fn sync_anthropic_agent_credentials_from_profile(
     if !target_config.is_dir() || !profile_root.is_dir() {
         return;
     }
-    if let Err(err) = refresh_anthropic_profile_oauth_if_due(data, profile_root) {
-        eprintln!(
-            "anthropic oauth refresh skipped for {}: {err}",
-            profile_root.display()
-        );
-    }
     let Some(raw_src_bytes) = read_anthropic_profile_credentials(profile_root) else {
         return;
     };
     let now_ms = anyagents_core::now_ms();
-    let Some(src_exp) = json_oauth_expires_at(&raw_src_bytes) else {
-        return;
-    };
-    if src_exp <= now_ms {
-        return;
-    }
-    let sanitized = seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms);
     let mut rewrote_any = false;
     for rel in [".credentials.json", ".claude/.credentials.json"] {
         let dst = target_config.join(rel);
         let needs_rewrite = match std::fs::read(&dst) {
             Ok(dst_bytes) => {
-                if dst_bytes == sanitized {
-                    false
-                } else {
-                    let dst_exp = json_oauth_expires_at(&dst_bytes).unwrap_or(0);
-                    dst_bytes.is_empty()
-                        || dst_exp <= now_ms.saturating_add(30 * 60 * 1_000)
-                        || src_exp > dst_exp
-                }
+                dst_bytes != raw_src_bytes
+                    && !retain_anthropic_credentials(&raw_src_bytes, &dst_bytes)
             }
             Err(_) => !dst.is_dir(),
         };
-        if needs_rewrite && write_seat_shared_file(&dst, &sanitized, 0o660) {
+        if needs_rewrite && write_seat_shared_file(&dst, &raw_src_bytes, 0o660) {
             rewrote_any = true;
         }
     }
@@ -584,6 +270,12 @@ pub(crate) fn seed_harness_credentials(
             }
             let other_cfg = agent_config_dir(data, &other.id);
             let other_bound = bound_profile_name(&other_cfg);
+            if (other.id == agent.id && profile_changed && last_seeded.is_some())
+                || seeded_profile_name(&other_cfg)
+                    .is_some_and(|seeded| Some(seeded.as_str()) != other_bound.as_deref())
+            {
+                continue;
+            }
             let same_or_compatible_bound = other_bound.as_deref() == Some(bound.as_str())
                 || other_bound.as_deref().is_some_and(|ob| {
                     let (b_prov, b_prof) = bound.split_once('/').unwrap_or((&bound, "default"));
@@ -621,9 +313,6 @@ pub(crate) fn seed_harness_credentials(
                     }
                 }
             }
-        }
-        if provider == "anthropic" {
-            refresh_anthropic_profile_oauth_if_due(data, &primary_profile_root)?;
         }
     }
     ensure_agy_mcp_config(store, data, agent, &profile_roots, target_config);
@@ -707,13 +396,8 @@ pub(crate) fn seed_harness_credentials(
             } else {
                 None
             };
-            if let Some(raw_src_bytes) = source {
+            if let Some(src_bytes) = source {
                 let now_ms = anyagents_core::now_ms();
-                let src_bytes = if is_anthropic_cred {
-                    seat_sanitized_anthropic_credentials(&raw_src_bytes, now_ms)
-                } else {
-                    raw_src_bytes
-                };
                 if src_bytes.is_empty() && !is_auth_cred {
                     let already_empty = dst.is_file() && dst.metadata().is_ok_and(|m| m.len() == 0);
                     if !already_empty {
@@ -732,25 +416,10 @@ pub(crate) fn seed_harness_credentials(
                             found_in_profile = true;
                             break;
                         }
-                        // Do not regress a newer isolated seat token to an expired
-                        // or older profile snapshot. A profile/account cutover must
-                        // still replace it, and retained seat bytes stay sanitized.
                         if !profile_changed
                             && is_anthropic_cred
-                            && json_oauth_expires_at(&dst_bytes).is_some_and(|dst_exp| {
-                                dst_exp > now_ms
-                                    && Some(dst_exp) > json_oauth_expires_at(&src_bytes)
-                            })
-                            && !matches!(
-                                (json_oauth_identity(&src_bytes), json_oauth_identity(&dst_bytes)),
-                                (Some(src_id), Some(dst_id)) if src_id != dst_id
-                            )
+                            && retain_anthropic_credentials(&src_bytes, &dst_bytes)
                         {
-                            let sanitized =
-                                seat_sanitized_anthropic_credentials(&dst_bytes, now_ms);
-                            if sanitized != dst_bytes {
-                                write_required_file(&dst, &sanitized, 0o660)?;
-                            }
                             found_in_profile = true;
                             break;
                         }
@@ -1137,17 +806,12 @@ pub(super) fn propagate_credentials(
                     src = prof_dir.join(f);
                 }
             }
-            let raw_bytes = match std::fs::read(&src) {
+            let bytes = match std::fs::read(&src) {
                 Ok(bytes) => bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue, // Optional aliases may be absent.
                 Err(err) => return Err(err.into()),
             };
             {
-                let bytes = if matches!(*rel, ".credentials.json" | ".claude/.credentials.json") {
-                    seat_sanitized_anthropic_credentials(&raw_bytes, anyagents_core::now_ms())
-                } else {
-                    raw_bytes
-                };
                 if bytes.is_empty() {
                     return Err(Error::Message(format!(
                         "empty credential source for {dir_id}: {rel}"

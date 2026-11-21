@@ -355,71 +355,6 @@ pub(super) fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
     None
 }
 
-pub(super) fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
-    let db_path = ["agent.db", ".omp/agent/agent.db"]
-        .into_iter()
-        .map(|r| prof_dir.join(r))
-        .find(|p| p.is_file())?;
-    if let Some(conn) = crate::seat_tree::open_readonly_seat_sqlite(&db_path)
-        && let Ok(data_str) = conn.query_row(
-            "SELECT data FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str)
-        && let Some(access) = val
-            .get("access")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| s.trim().to_string())
-        && !access.is_empty()
-    {
-        let refresh = val
-            .get("refresh")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        return Some((access, refresh));
-    }
-    let bytes = std::fs::read(db_path).ok()?;
-    for needle in [
-        &b"{\"access\":\"eyJ"[..],
-        &b"{\"type\":\"oauth\",\"refresh\":\""[..],
-    ] {
-        for idx in (0..bytes.len().saturating_sub(needle.len())).rev() {
-            if &bytes[idx..idx + needle.len()] == needle {
-                let slice = &bytes[idx..bytes.len().min(idx + 2048)];
-                let Some(end) = slice.iter().position(|b| *b == b'}') else {
-                    continue;
-                };
-                let Ok(json_str) = std::str::from_utf8(&slice[..=end]) else {
-                    continue;
-                };
-                let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-                    continue;
-                };
-                let Some(access) = val
-                    .get("access")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|s| s.trim().to_string())
-                else {
-                    continue;
-                };
-                let refresh = val
-                    .get("refresh")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if access.starts_with("eyJ") {
-                    return Some((access, refresh));
-                }
-            }
-        }
-    }
-    None
-}
-
 fn decode_b64url(input: &str) -> Option<Vec<u8>> {
     let val_of = |b: u8| -> Option<u8> {
         match b {
@@ -450,12 +385,4 @@ fn decode_b64url(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-pub(super) fn extract_jwt_sub_tail(jwt: &str) -> Option<String> {
-    let payload_b64 = jwt.split('.').nth(1)?;
-    let decoded = decode_b64url(payload_b64)?;
-    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let sub = val.get("sub")?.as_str()?;
-    Some(sub.split('|').next_back().unwrap_or(sub).to_string())
 }

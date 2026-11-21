@@ -5,7 +5,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyagents_core::{Error, Store, now_ms};
+use anyagents_core::{Error, Store, agent_config_dir, now_ms};
 use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::CommandRunner;
 use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock};
@@ -1019,6 +1019,11 @@ fn record_live_quota_resets(store: &Store, data_dir: &Path, health: &HealthBoard
             .filter(|&reset_ms| reset_ms > now)
         {
             create::record_profile_quota_reset(data_dir, &agent, reset_ms);
+        } else if agent_config_dir(data_dir, &agent.id)
+            .join(".anyagents-last-error.json")
+            .is_file()
+        {
+            create::try_rotate_exhausted_profile(store, data_dir, &agent, false);
         }
     }
 }

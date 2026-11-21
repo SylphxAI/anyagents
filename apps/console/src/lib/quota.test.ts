@@ -110,3 +110,13 @@ test('window labels read naturally', () => {
   assert.equal(windowLabel('5h'), '5h');
   assert.equal(windowLabel('custom'), 'Custom');
 });
+
+test('display a locally known tier without implying quota', () => {
+  const connected = parseUsage('(max)');
+  assert.equal(connected.tier, 'max');
+  assert.deepEqual(connected.windows, []);
+  assert.equal(connected.note, undefined);
+  const expired = parseUsage('oauth expired (max)');
+  assert.equal(expired.expired, true);
+  assert.equal(expired.tier, 'max');
+});

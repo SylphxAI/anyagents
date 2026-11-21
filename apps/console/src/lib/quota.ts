@@ -62,7 +62,7 @@ export function parseUsage(usage?: string | null): UsageReading {
   }
 
   // A trailing "(tier)" annotates the whole reading, unless it is part of a balance.
-  const tier = /\s\(([^()]*)\)\s*$/.exec(text);
+  const tier = /(?:^|\s)\(([^()]*)\)\s*$/.exec(text);
   if (tier && !BALANCE.test(text) && !/^active\b/i.test(text)) {
     reading.tier = tier[1].trim() || undefined;
     text = text.slice(0, tier.index).trim();

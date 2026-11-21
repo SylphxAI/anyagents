@@ -233,22 +233,21 @@ def _scan_rust_top_level_braces(text: str) -> tuple[list[int], dict[int, int]] |
     return line_start_depth, open_braces
 
 
-def count_rust_production_lines(text: str) -> int:
-    """Count production lines in a Rust source file, excluding top-level `#[cfg(test)]` inline `mod` blocks."""
-    lines = text.splitlines()
+def rust_test_module_ranges(text: str, lines: list[str]) -> list[tuple[int, int]]:
+    """Return half-open line ranges for top-level `#[cfg(test)]` inline `mod` blocks."""
     total = len(lines)
     if total == 0:
-        return 0
+        return []
     # Fast path: files with no cfg-test attributes require no lexical brace scan.
     if "#[cfg(" not in text or "test" not in text:
-        return total
+        return []
 
     scanned = _scan_rust_top_level_braces(text)
     if scanned is None:
-        return total
+        return []
     line_start_depth, open_braces = scanned
 
-    excluded_lines = 0
+    ranges = []
     idx = 0
     while idx < total:
         if line_start_depth[idx] == 0 and is_cfg_test_attribute(lines[idx]):
@@ -273,12 +272,18 @@ def count_rust_production_lines(text: str) -> int:
                         open_line = j + 1
                     if open_line is not None and open_line in open_braces:
                         close_line = open_braces[open_line]
-                        excluded_lines += close_line - idx + 1
+                        ranges.append((idx, close_line + 1))
                         idx = close_line + 1
                         continue
         idx += 1
 
-    return total - excluded_lines
+    return ranges
+
+
+def count_rust_production_lines(text: str) -> int:
+    """Count production lines, excluding top-level Rust test modules."""
+    lines = text.splitlines()
+    return len(lines) - sum(end - start for start, end in rust_test_module_ranges(text, lines))
 
 
 def count_source_lines(path: Path) -> int:

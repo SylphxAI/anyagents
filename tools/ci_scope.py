@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from vendor_boundary import check_vendor_boundary
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 PKG_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -498,6 +499,9 @@ def check_purity(root: Path) -> None:
                 )
     if violations:
         raise ValueError("open-source purity violations:\n" + "\n".join(violations))
+
+
+    check_vendor_boundary(root)
 
 
 def check_console_lockfile(root: Path) -> None:

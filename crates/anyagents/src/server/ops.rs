@@ -708,28 +708,8 @@ mod tests {
     }
 
     #[test]
-    fn openai_and_all_provider_5h_and_weekly_quota_parsing() {
-        // OpenAI/Codex payload with BOTH primary_window (5h) and secondary_window (7d).
-        let openai_val = json!({
-            "plan_type": "pro",
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 25.0,
-                    "limit_window_seconds": 18000,
-                    "reset_after_seconds": 7200
-                },
-                "secondary_window": {
-                    "used_percent": 40.0,
-                    "limit_window_seconds": 604800,
-                    "reset_after_seconds": 259200
-                }
-            }
-        });
-        let summary = crate::create::format_openai_usage_summary(&openai_val).unwrap();
-        assert!(summary.contains("5h: 75% left ↻2h"), "{summary}");
-        assert!(summary.contains("7d: 60% left ↻3d"), "{summary}");
-        assert!(summary.ends_with(" (pro)"), "{summary}");
-        let (q5, q7) = parse_quota_windows_from_usage(&summary);
+    fn canonical_usage_summaries_parse_reported_quota_windows() {
+        let (q5, q7) = parse_quota_windows_from_usage("5h: 75% left ↻2h · 7d: 60% left ↻3d (pro)");
         assert_eq!(
             q5,
             Some(QuotaWindow {
@@ -756,6 +736,15 @@ mod tests {
         );
         assert_eq!(g5.unwrap().remaining_pct, 95);
         assert_eq!(g7.unwrap().remaining_pct, 70);
+
+        // A local plan, expiry or active reset is not a measured quota window.
+        for usage in ["(max 20x)", "oauth expired", "limited ↻10m (ultra)"] {
+            assert_eq!(
+                parse_quota_windows_from_usage(usage),
+                (None, None),
+                "{usage}"
+            );
+        }
     }
 
     #[tokio::test]

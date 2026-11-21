@@ -1,20 +1,15 @@
-//! Profile usage rebalancing, forced credential refresh, exhausted-profile rotation, and healthy profile binding.
+//! Profile rebalancing, exhausted-profile rotation, and healthy profile binding.
 
 use std::path::{Path, PathBuf};
 
-use anyagents_core::{Agent, AgentId, Error, Store, agent_config_dir};
+use anyagents_core::{Agent, AgentId, Store, agent_config_dir};
 
-use super::credentials::{
-    OAUTH_REFRESH_ATTEMPT_FILE, OAUTH_REFRESH_RESERVATION_FILE, OAuthRefreshDiskReservation,
-    anthropic_oauth_usage_url, persist_refreshed_credentials, post_anthropic_oauth_refresh,
-};
-use super::quota::sync_anthropic_profile_metadata;
+use super::subscription_status::{is_passive_subscription, local_subscription_status};
 use super::{
     ProviderProfileEntry, bound_profile_name, bound_profile_of_provider,
     clear_stale_agy_quota_error_steps, compatible_harnesses_for, configure_agent_runtime,
     list_harness_profiles, parse_remaining_pct_from_usage, poke_agent_wake_socket,
-    probe_profile_remaining_pct, propagate_profile_files_to_bound_agents,
-    sync_fresher_bound_agent_credentials, upstream_provider_of, write_profile_marker,
+    probe_profile_remaining_pct, upstream_provider_of, write_profile_marker,
 };
 
 fn parse_effective_rebalance_pct(usage: &str) -> Option<i64> {
@@ -214,271 +209,8 @@ pub(super) fn rebalance_provider_profiles(
     }
 }
 
-pub(crate) fn force_refresh_provider_profiles(
-    data: &Path,
-    target: Option<&str>,
-) -> Result<(), Error> {
-    let filter = target.map(str::trim).filter(|s| {
-        !s.is_empty() && !s.eq_ignore_ascii_case("refresh") && !s.eq_ignore_ascii_case("reset")
-    });
-    let _ = std::fs::remove_file(data.join("profiles/.last-agent-cred-sync-ms"));
-    sync_fresher_bound_agent_credentials(data);
-    let now_ms = anyagents_core::now_ms();
-    if let Ok(store) = Store::open(data.join("state.db"))
-        && let Ok(agents) = store.list_agents()
-    {
-        for agent in agents {
-            if agent.state == "archived" {
-                continue;
-            }
-            let cfg = agent_config_dir(data, &agent.id);
-            let _ = std::fs::remove_file(cfg.join(".anyagents-last-quota-check-ms"));
-        }
-    }
-    let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(4)))
-        .build()
-        .new_agent();
-    let profiles_root = data.join("profiles");
-    let Ok(providers) = std::fs::read_dir(&profiles_root) else {
-        return Ok(());
-    };
-    for prov_entry in providers.flatten() {
-        let prov_path = prov_entry.path();
-        if !prov_path.is_dir() {
-            continue;
-        }
-        let provider = prov_entry.file_name().to_string_lossy().into_owned();
-        let Ok(prof_dirs) = std::fs::read_dir(&prov_path) else {
-            continue;
-        };
-        for prof_entry in prof_dirs.flatten() {
-            let prof_dir = prof_entry.path();
-            if !prof_dir.is_dir() {
-                continue;
-            }
-            let profile = prof_entry.file_name().to_string_lossy().into_owned();
-            if profile.starts_with('.') {
-                continue;
-            }
-            let full_name = format!("{provider}/{profile}");
-            if let Some(f) = filter
-                && f != provider
-                && f != profile
-                && f != full_name
-            {
-                continue;
-            }
-            let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
-            let _ = std::fs::remove_file(prof_dir.join(".anyagents-last-usage.txt"));
-            let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE));
-            let _ = std::fs::remove_file(prof_dir.join(OAUTH_REFRESH_RESERVATION_FILE));
-            match provider.as_str() {
-                "anthropic" => {
-                    let Ok(cred_text) = std::fs::read_to_string(prof_dir.join(".credentials.json"))
-                        .or_else(|_| {
-                            std::fs::read_to_string(prof_dir.join(".claude/.credentials.json"))
-                        })
-                    else {
-                        continue;
-                    };
-                    let Ok(mut cred) = serde_json::from_str::<serde_json::Value>(&cred_text) else {
-                        continue;
-                    };
-                    let mut tok = cred
-                        .pointer("/claudeAiOauth/accessToken")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let rtok = cred
-                        .pointer("/claudeAiOauth/refreshToken")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let expires_at = cred
-                        .pointer("/claudeAiOauth/expiresAt")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
-                    let usage_url = anthropic_oauth_usage_url();
-                    let tok_valid = !tok.is_empty()
-                        && expires_at > now_ms + 300_000
-                        && http
-                            .get(&usage_url)
-                            .header("authorization", &format!("Bearer {tok}"))
-                            .header("anthropic-beta", "oauth-2025-04-20")
-                            .header("cache-control", "no-cache")
-                            .header("user-agent", "claude-code/2.1.310")
-                            .call()
-                            .is_ok();
-                    let last_attempt_ms =
-                        std::fs::read_to_string(prof_dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
-                            .ok()
-                            .and_then(|s| s.trim().parse::<i64>().ok())
-                            .unwrap_or(0);
-                    let mut refreshed_token = false;
-                    if !tok_valid
-                        && !rtok.is_empty()
-                        && now_ms.saturating_sub(last_attempt_ms) >= 300_000
-                    {
-                        let reservation = OAuthRefreshDiskReservation::acquire(
-                            &prof_dir,
-                            &[".credentials.json", ".claude/.credentials.json"],
-                            cred_text.len(),
-                            now_ms,
-                        )?;
-                        let req_body = serde_json::json!({
-                            "grant_type": "refresh_token",
-                            "refresh_token": rtok,
-                            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                        })
-                        .to_string();
-                        if let Some(rval) = post_anthropic_oauth_refresh(&http, &req_body)
-                            && let Some(new_acc) = rval
-                                .get("access_token")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|s| s.trim().to_string())
-                            && !new_acc.is_empty()
-                        {
-                            tok = new_acc.clone();
-                            refreshed_token = true;
-                            if let Some(oauth) = cred
-                                .get_mut("claudeAiOauth")
-                                .and_then(serde_json::Value::as_object_mut)
-                            {
-                                oauth.insert(
-                                    "accessToken".to_string(),
-                                    serde_json::Value::String(new_acc),
-                                );
-                                if let Some(new_ref) = rval
-                                    .get("refresh_token")
-                                    .and_then(serde_json::Value::as_str)
-                                {
-                                    oauth.insert(
-                                        "refreshToken".to_string(),
-                                        serde_json::Value::String(new_ref.to_string()),
-                                    );
-                                }
-                                if let Some(exp_in) =
-                                    rval.get("expires_in").and_then(serde_json::Value::as_i64)
-                                {
-                                    oauth.insert(
-                                        "expiresAt".to_string(),
-                                        serde_json::Value::Number((now_ms + exp_in * 1000).into()),
-                                    );
-                                }
-                            }
-                            let updated = serde_json::to_string(&cred)
-                                .map_err(|e| Error::Message(e.to_string()))?;
-                            reservation.persist_credentials(
-                                &[".credentials.json", ".claude/.credentials.json"],
-                                updated.as_bytes(),
-                            )?;
-                        }
-                    }
-                    if !tok.is_empty() {
-                        let _ = sync_anthropic_profile_metadata(
-                            &http, data, &prof_dir, &profile, &tok, &mut cred, true,
-                        );
-                        if refreshed_token && let Ok(updated) = serde_json::to_string(&cred) {
-                            persist_refreshed_credentials(
-                                &prof_dir,
-                                &[".credentials.json", ".claude/.credentials.json"],
-                                updated.as_bytes(),
-                            )?;
-                            propagate_profile_files_to_bound_agents(
-                                data,
-                                "anthropic",
-                                &profile,
-                                &[".credentials.json", ".claude/.credentials.json"],
-                            )?;
-                        }
-                    }
-                }
-                "openai" => {
-                    let Ok(auth_text) = std::fs::read_to_string(prof_dir.join("auth.json"))
-                        .or_else(|_| std::fs::read_to_string(prof_dir.join(".codex/auth.json")))
-                    else {
-                        continue;
-                    };
-                    let Ok(mut auth) = serde_json::from_str::<serde_json::Value>(&auth_text) else {
-                        continue;
-                    };
-                    let rtok = auth
-                        .pointer("/tokens/refresh_token")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if !rtok.is_empty() {
-                        let reservation = OAuthRefreshDiskReservation::acquire(
-                            &prof_dir,
-                            &["auth.json", ".codex/auth.json"],
-                            auth_text.len(),
-                            now_ms,
-                        )?;
-                        let req_body = serde_json::json!({
-                            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-                            "grant_type": "refresh_token",
-                            "refresh_token": rtok,
-                        })
-                        .to_string();
-                        if let Ok(rresp) = http
-                            .post("https://auth.openai.com/oauth/token")
-                            .header("content-type", "application/json")
-                            .send(req_body.as_bytes())
-                            && let Ok(rbody) = rresp.into_body().read_to_string()
-                            && let Ok(rval) = serde_json::from_str::<serde_json::Value>(&rbody)
-                            && let Some(new_acc) = rval
-                                .get("access_token")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|s| s.trim().to_string())
-                            && !new_acc.is_empty()
-                            && let Some(tokens_obj) = auth
-                                .get_mut("tokens")
-                                .and_then(serde_json::Value::as_object_mut)
-                        {
-                            tokens_obj.insert(
-                                "access_token".to_string(),
-                                serde_json::Value::String(new_acc),
-                            );
-                            if let Some(new_ref) = rval
-                                .get("refresh_token")
-                                .and_then(serde_json::Value::as_str)
-                            {
-                                tokens_obj.insert(
-                                    "refresh_token".to_string(),
-                                    serde_json::Value::String(new_ref.to_string()),
-                                );
-                            }
-                            if let Ok(updated) = serde_json::to_string_pretty(&auth) {
-                                reservation.persist_credentials(
-                                    &["auth.json", ".codex/auth.json"],
-                                    updated.as_bytes(),
-                                )?;
-                                propagate_profile_files_to_bound_agents(
-                                    data,
-                                    "openai",
-                                    &profile,
-                                    &["auth.json", ".codex/auth.json"],
-                                )?;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Checks if `agent`'s currently bound profile has recovered quota (`> 5% left`
-/// after a plan upgrade or vendor mid-window reset) OR is exhausted (`0% left`)
-/// while another profile under the same upstream provider has healthy quota (`>= 20%`).
-/// Rate-limited by `.anyagents-last-quota-check-ms` (120s cooldown) when called
-/// during status reconciliation so background checks never spam vendor APIs.
+/// Move a held agent to a profile without observed exhaustion. Only a live
+/// public API-key reading may clear a hold before its harness-reported reset.
 pub(crate) fn try_rotate_exhausted_profile(
     store: &Store,
     data: &Path,
@@ -569,7 +301,19 @@ pub(super) fn try_rotate_exhausted_profile_in(
             let q = anyagents_harness::quota::recorded_reset_at_ms(&val).unwrap_or(0);
             cleared_ms > 0 && ts > cleared_ms && q > now_ms && now_ms.saturating_sub(ts) < 900_000
         });
-    let cur_pct = if post_clear_error {
+    let auth_error = is_passive_subscription(&provider)
+        && !has_active_quota_hold
+        && crate::vendor::read_persisted_last_error(&cfg).is_some_and(|(error, _)| {
+            crate::server::compute_block_reason(None, error.as_deref(), now_ms).as_deref()
+                == Some("sign_in_required")
+        });
+    if !has_active_quota_hold {
+        if !auth_error || store.has_open_turn(&agent.id).unwrap_or(true) {
+            return None;
+        }
+        super::subscription_status::record_auth_rejection(&prof_dir, &current_provider);
+    }
+    let cur_pct = if auth_error || post_clear_error || is_passive_subscription(&provider) {
         Some(0)
     } else {
         probe_profile_remaining_pct(
@@ -592,7 +336,7 @@ pub(super) fn try_rotate_exhausted_profile_in(
         poke_agent_wake_socket(data, &agent.id);
         return Some(format!("{current_provider}/{current_prof}"));
     }
-    if has_active_quota_hold && cur_pct.is_some_and(|pct| pct <= 0) {
+    if cur_pct.is_some_and(|pct| pct <= 0) {
         let bound_counts = count_bound_profile_agents(
             data,
             &store.list_live_agents().unwrap_or_default(),
@@ -611,13 +355,20 @@ pub(super) fn try_rotate_exhausted_profile_in(
             if cand_prof == current_prof && cand_provider == current_provider {
                 continue;
             }
-            if let Some(rem_pct) = probe_profile_remaining_pct(
+            let mut rem_pct = probe_profile_remaining_pct(
                 data,
                 &cand_provider,
                 &cand_prof,
                 agent.model.as_deref(),
-            ) && rem_pct > 0
+            );
+            if rem_pct.is_none()
+                && is_passive_subscription(&provider)
+                && local_subscription_status(&cand_path, &provider, now_ms).usable
             {
+                // Rank usable, unmeasured subscriptions by load, not an invented quota.
+                rem_pct = Some(1);
+            }
+            if let Some(rem_pct) = rem_pct.filter(|&pct| pct > 0) {
                 let cnt = bound_counts.get(&cand_prof).copied().unwrap_or(0);
                 let score = (rem_pct * 100) / (cnt + 1);
                 if best.as_ref().is_none_or(|(_, _, best_score, best_rem)| {
@@ -680,109 +431,23 @@ pub(super) fn count_bound_profile_agents(
 
 const PROFILE_HEALTHY_USAGE_FRESHNESS_MS: i64 = 65_000;
 
-const PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS: i64 = 300_000;
-
-/// Positive-signal health check for a candidate profile directory. Returns true only when
-/// the profile directory itself carries conclusive unhealthy evidence: a quota reading
-/// of zero percent left written within the last minute, or an expired OAuth token whose
-/// most recent refresh attempt also happened recently (so the token cannot silently
-/// recover on its own). Never probes the network and never treats a missing or stale
-/// signal as unhealthy evidence.
-fn google_oauth_expiry_ms(val: &serde_json::Value) -> Option<i64> {
-    for ptr in ["/token/expiry", "/expiry"] {
-        if let Some(raw) = val.pointer(ptr).and_then(serde_json::Value::as_str)
-            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim())
-        {
-            return Some(dt.timestamp_millis());
-        }
+fn profile_has_unhealthy_evidence(dir: &Path, provider: &str) -> bool {
+    if is_passive_subscription(provider) {
+        let now_ms = anyagents_core::now_ms();
+        return local_subscription_status(dir, provider, now_ms).expired
+            || super::quota::overlay_active_quota_reset_on_cached_usage(dir, None, "", now_ms)
+                .starts_with(super::quota::USAGE_LIMITED_PREFIX);
     }
-    for ptr in [
-        "/token/expires_at",
-        "/expires_at",
-        "/token/expiry_date",
-        "/expiry_date",
-    ] {
-        if let Some(n) = val.pointer(ptr).and_then(serde_json::Value::as_i64) {
-            return Some(if n > 0 && n < 10_000_000_000 {
-                n.saturating_mul(1_000)
-            } else {
-                n
-            });
-        }
-    }
-    None
-}
-
-fn profile_has_unhealthy_evidence(dir: &Path) -> bool {
-    let now_ms = anyagents_core::now_ms();
-    let usage_path = dir.join(".anyagents-last-usage.txt");
-    let usage_text_and_age = std::fs::read_to_string(&usage_path).ok().map(|usage| {
-        let age_ms = std::fs::metadata(&usage_path)
-            .and_then(|meta| meta.modified())
-            .map(|mtime| {
-                std::time::SystemTime::now()
-                    .duration_since(mtime)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(i64::MAX);
-        (usage, age_ms)
-    });
-    if let Some((ref usage, age_ms)) = usage_text_and_age {
-        let trimmed = usage.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("oauth expired") && age_ms < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS
-        {
-            return true;
-        }
-        if parse_remaining_pct_from_usage(trimmed, None) == Some(0)
-            && age_ms < PROFILE_HEALTHY_USAGE_FRESHNESS_MS
-        {
-            return true;
-        }
-    }
-    let last_attempt_ms = std::fs::read_to_string(dir.join(OAUTH_REFRESH_ATTEMPT_FILE))
+    let path = dir.join(".anyagents-last-usage.txt");
+    path.metadata()
+        .and_then(|meta| meta.modified())
         .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let recent_refresh_attempt = last_attempt_ms > 0
-        && now_ms.saturating_sub(last_attempt_ms) < PROFILE_HEALTHY_OAUTH_ATTEMPT_FRESHNESS_MS;
-
-    if let Ok(cred_text) = std::fs::read_to_string(dir.join(".credentials.json"))
-        .or_else(|_| std::fs::read_to_string(dir.join(".claude/.credentials.json")))
-        && let Ok(cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
-    {
-        let expires_at = cred
-            .pointer("/claudeAiOauth/expiresAt")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(i64::MAX);
-        if expires_at <= now_ms && recent_refresh_attempt {
-            return true;
-        }
-    }
-
-    if let Ok(tok_text) =
-        std::fs::read_to_string(dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
-            .or_else(|_| std::fs::read_to_string(dir.join(".gemini/oauth_creds.json")))
-        && let Ok(tok) = serde_json::from_str::<serde_json::Value>(&tok_text)
-    {
-        let expires_at = google_oauth_expiry_ms(&tok).unwrap_or(i64::MAX);
-        let has_refresh_token = tok
-            .pointer("/token/refresh_token")
-            .or_else(|| tok.get("refresh_token"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty());
-        let usage_failed = usage_text_and_age.as_ref().is_none_or(|(u, _)| {
-            u.trim() == "__NONE__" || u.trim().to_ascii_lowercase().starts_with("oauth expired")
-        });
-        if (expires_at <= now_ms && (!has_refresh_token || recent_refresh_attempt))
-            || (recent_refresh_attempt && usage_failed)
-        {
-            return true;
-        }
-    }
-
-    false
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age.as_millis() < PROFILE_HEALTHY_USAGE_FRESHNESS_MS as u128)
+        && std::fs::read_to_string(path)
+            .ok()
+            .and_then(|usage| parse_remaining_pct_from_usage(&usage, None))
+            == Some(0)
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
@@ -830,10 +495,18 @@ pub(super) fn select_or_bind_profile(
     }
     let default_entry = available.iter().find(|(n, _)| n == "default");
     let chosen_entry = match default_entry {
-        Some((_, default_dir)) if profile_has_unhealthy_evidence(default_dir) => available
-            .iter()
-            .find(|(n, dir)| n != "default" && !profile_has_unhealthy_evidence(dir))
-            .or(default_entry),
+        Some((_, default_dir)) if profile_has_unhealthy_evidence(default_dir, &provider) => {
+            available
+                .iter()
+                .find(|(n, dir)| {
+                    n != "default"
+                        && !profile_has_unhealthy_evidence(dir, &provider)
+                        && (!is_passive_subscription(&provider)
+                            || local_subscription_status(dir, &provider, anyagents_core::now_ms())
+                                .usable)
+                })
+                .or(default_entry)
+        }
         _ => default_entry,
     }
     .or_else(|| available.first());

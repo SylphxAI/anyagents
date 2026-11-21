@@ -1526,16 +1526,12 @@ pub(crate) fn persist_synced_auth_files(
                 );
                 // Clear stale OAuth error/backoff caches locally and in Postgres so
                 // `/v1/profiles` on every stateless replica immediately probes fresh quota.
-                for stale_marker in [
-                    ".anyagents-oauth-refresh-attempt-ms",
-                    ".anyagents-last-usage.txt",
-                ] {
-                    let _ = std::fs::remove_file(prof_dir.join(stale_marker));
-                    let _ = blobs.delete_deployment_blob(
-                        "profiles",
-                        &format!("{provider}/{profile}/{stale_marker}"),
-                    );
-                }
+                let stale_marker = ".anyagents-last-usage.txt";
+                let _ = std::fs::remove_file(prof_dir.join(stale_marker));
+                let _ = blobs.delete_deployment_blob(
+                    "profiles",
+                    &format!("{provider}/{profile}/{stale_marker}"),
+                );
                 updated += 1;
             }
         }
@@ -1674,13 +1670,9 @@ pub(crate) fn persist_profile_dir_to_deployment_blobs(
             persisted += 1;
         }
     }
-    for stale_marker in [
-        ".anyagents-oauth-refresh-attempt-ms",
-        ".anyagents-last-usage.txt",
-    ] {
-        let _ = blobs
-            .delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
-    }
+    let stale_marker = ".anyagents-last-usage.txt";
+    let _ =
+        blobs.delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
     Ok(persisted)
 }
 
@@ -1758,14 +1750,10 @@ pub(crate) fn persist_signed_in_profile_auth_files(
         &meta_bytes,
         0o644,
     );
-    for stale_marker in [
-        ".anyagents-oauth-refresh-attempt-ms",
-        ".anyagents-last-usage.txt",
-    ] {
-        let _ = std::fs::remove_file(prof_dir.join(stale_marker));
-        let _ = blobs
-            .delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
-    }
+    let stale_marker = ".anyagents-last-usage.txt";
+    let _ = std::fs::remove_file(prof_dir.join(stale_marker));
+    let _ =
+        blobs.delete_deployment_blob("profiles", &format!("{provider}/{profile}/{stale_marker}"));
     Ok(persisted)
 }
 
@@ -3996,11 +3984,6 @@ done
             )
             .unwrap();
         std::fs::write(
-            prof_dir.join(".anyagents-oauth-refresh-attempt-ms"),
-            b"9999999999999\n",
-        )
-        .unwrap();
-        std::fs::write(
             prof_dir.join(".anyagents-last-usage.txt"),
             b"oauth expired\n",
         )
@@ -4041,11 +4024,6 @@ done
             .unwrap()
             .expect("profile blob persisted");
         assert_eq!(stored_profile.content, fresh_tok);
-        assert!(
-            !prof_dir
-                .join(".anyagents-oauth-refresh-attempt-ms")
-                .exists()
-        );
         assert!(!prof_dir.join(".anyagents-last-usage.txt").exists());
 
         // 3. Monotonic guard: an older expiry token MUST NOT overwrite the newer token.

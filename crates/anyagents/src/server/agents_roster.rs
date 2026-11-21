@@ -504,6 +504,9 @@ pub(crate) fn compute_block_reason(
         if lower.contains("sign in")
             || lower.contains("not logged in")
             || lower.contains("unauthorized")
+            || lower.contains("token expired")
+            || lower.contains("token has expired")
+            || lower.contains("invalid_grant")
         {
             return Some("sign_in_required".to_string());
         }
