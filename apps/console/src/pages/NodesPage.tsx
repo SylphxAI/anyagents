@@ -1,5 +1,5 @@
 import { For, Match, Show, Switch, createMemo, createSignal } from 'solid-js';
-import { Laptop, Pause, Play, Plus, ShieldCheck, Terminal, Trash2 } from 'lucide-solid';
+import { ArrowUpRight, FileText, Laptop, Pause, Play, Plus, ShieldCheck, Terminal, Trash2 } from 'lucide-solid';
 import { api, createPoll, errorMessage } from '../api';
 import { ago, dateTime } from '../format';
 import { useConsole } from '../state';
@@ -32,6 +32,20 @@ const statusMeta: Record<NodeStatus, { label: string; tone: Tone }> = {
   paused: { label: 'Paused', tone: 'warn' },
   revoked: { label: 'Revoked', tone: 'bad' },
 };
+
+const capMeta: Record<string, { label: string; tone: Tone; icon: typeof Terminal }> = {
+  exec: { label: 'exec', tone: 'neutral', icon: Terminal },
+  exit: { label: 'exit', tone: 'info', icon: ArrowUpRight },
+  files: { label: 'files', tone: 'info', icon: FileText },
+};
+
+function CapabilityPills(props: { caps: string[] }) {
+  return <For each={props.caps}>{cap => {
+    const meta = () => capMeta[cap] ?? { label: cap, tone: 'neutral' as Tone, icon: Terminal };
+    const Icon = meta().icon;
+    return <Pill tone={meta().tone}><Icon size={11} /> {meta().label}</Pill>;
+  }}</For>;
+}
 
 function outcomeTone(outcome: string): Tone {
   switch (outcome) {
@@ -145,6 +159,7 @@ export function NodesPage(props: { selectedId?: string }) {
                 </span>
                 <span class="doc-meta">
                   <span class="mono truncate">{node.os}/{node.arch} · {node.hostname}</span>
+                  <span><CapabilityPills caps={node.capabilities} /></span>
                   <span class="num">{node.last_heartbeat_at_ms ? ago(node.last_heartbeat_at_ms) : 'never'}</span>
                 </span>
               </button>;
@@ -213,7 +228,7 @@ function NodeDetail(props: { node: NodeRecord; refresh: () => void }) {
           <h2>{props.node.name} <Pill tone={meta().tone} dot>{meta().label}</Pill></h2>
           <p class="subtle">
             <span class="mono">{props.node.os}/{props.node.arch}</span> · Owner <span class="mono">{props.node.owner_id}</span>
-            {' · '}Capabilities: <For each={props.node.capabilities}>{cap => <span class="tag">{cap}</span>}</For>
+            {' · '}<CapabilityPills caps={props.node.capabilities} />
           </p>
           <div class="doc-byline subtle">
             Paired <span class="num">{dateTime(props.node.created_at_ms)}</span>
@@ -360,7 +375,7 @@ function GrantNodeAccessDialog(props: { node: NodeRecord; close: () => void; ref
         <input class="input mono" name="agent_id" placeholder="agt_…" required autocomplete="off" spellcheck={false} />
       </Field>
     </Show>
-    <Field label="Capability" hint="Slice 1A dispatches `exec`; other advertised capabilities remain extensible.">
+    <Field label="Capability" hint="Available capabilities: exec (remote command), exit (egress proxy), files (scoped file access).">
       <select class="input mono" name="capability" value={capOptions()[0]}>
         <For each={capOptions()}>{cap => <option value={cap}>{cap}</option>}</For>
       </select>

@@ -47,6 +47,15 @@ pub(super) enum FilesTunnelEvent {
     },
 }
 
+/// Event from a multiplexed egress stream through the tunnel.
+#[derive(Debug)]
+pub(super) enum StreamTunnelEvent {
+    Opened,
+    Data { data_b64: String },
+    Error { error: String },
+    Closed { bytes_tx: u64, bytes_rx: u64 },
+}
+
 #[derive(Debug)]
 pub(super) struct ExecOutcome {
     pub(super) exit_code: Option<i32>,
@@ -66,6 +75,7 @@ struct NodeConn {
     close_tx: mpsc::Sender<()>,
     execs: Arc<Mutex<HashMap<String, mpsc::Sender<ExecTunnelEvent>>>>,
     files_reqs: Arc<Mutex<HashMap<String, mpsc::Sender<FilesTunnelEvent>>>>,
+    streams: Arc<Mutex<HashMap<String, mpsc::Sender<StreamTunnelEvent>>>>,
 }
 
 /// Bounded in-memory registry of active outbound node WebSocket tunnels.
@@ -101,6 +111,7 @@ impl NodeRegistry {
             close_tx,
             execs: Arc::new(Mutex::new(HashMap::new())),
             files_reqs: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
         });
         let previous = self
             .conns
@@ -124,6 +135,7 @@ impl NodeRegistry {
             drop(map);
             fail_all_execs(&conn.execs, "node tunnel disconnected").await;
             fail_all_files(&conn.files_reqs, "node tunnel disconnected").await;
+            close_all_streams(&conn.streams).await;
             true
         } else {
             false
@@ -142,6 +154,7 @@ impl NodeRegistry {
                 .await;
             fail_all_execs(&conn.execs, reason).await;
             fail_all_files(&conn.files_reqs, reason).await;
+            close_all_streams(&conn.streams).await;
         }
     }
 
@@ -170,6 +183,7 @@ impl NodeRegistry {
                 .await;
             fail_all_execs(&conn.execs, reason).await;
             fail_all_files(&conn.files_reqs, reason).await;
+            close_all_streams(&conn.streams).await;
             let _ = conn.close_tx.try_send(());
         }
     }
@@ -429,6 +443,84 @@ impl NodeRegistry {
         conn.files_reqs.lock().await.insert(req_id.clone(), ev_tx);
         Ok((conn, req_id, ev_rx))
     }
+
+    /// Open a multiplexed egress stream through a connected node.
+    pub(super) async fn dispatch_stream_open(
+        &self,
+        node_id: &NodeId,
+        stream_id: String,
+        host: String,
+        port: u16,
+    ) -> Result<mpsc::Receiver<StreamTunnelEvent>, String> {
+        let conn = self
+            .conns
+            .read()
+            .await
+            .get(node_id.as_str())
+            .cloned()
+            .ok_or_else(|| format!("node `{node_id}` has no active WebSocket tunnel"))?;
+        let (ev_tx, ev_rx) = mpsc::channel::<StreamTunnelEvent>(64);
+        conn.streams.lock().await.insert(stream_id.clone(), ev_tx);
+        if conn
+            .tx
+            .send(NodeServerFrame::StreamOpen {
+                stream_id: stream_id.clone(),
+                host,
+                port,
+            })
+            .await
+            .is_err()
+        {
+            conn.streams.lock().await.remove(&stream_id);
+            return Err("node tunnel closed before stream dispatch".into());
+        }
+        Ok(ev_rx)
+    }
+
+    /// Forward data to a multiplexed egress stream.
+    pub(super) async fn dispatch_stream_data(
+        &self,
+        node_id: &NodeId,
+        stream_id: &str,
+        data_b64: String,
+    ) -> Result<(), String> {
+        let conn = self
+            .conns
+            .read()
+            .await
+            .get(node_id.as_str())
+            .cloned()
+            .ok_or_else(|| format!("node `{node_id}` has no active WebSocket tunnel"))?;
+        conn.tx
+            .send(NodeServerFrame::StreamData {
+                stream_id: stream_id.to_string(),
+                data_b64,
+            })
+            .await
+            .map_err(|_| "node tunnel closed".to_string())
+    }
+
+    /// Close a multiplexed egress stream.
+    pub(super) async fn dispatch_stream_close(
+        &self,
+        node_id: &NodeId,
+        stream_id: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .conns
+            .read()
+            .await
+            .get(node_id.as_str())
+            .cloned()
+            .ok_or_else(|| format!("node `{node_id}` has no active WebSocket tunnel"))?;
+        conn.streams.lock().await.remove(stream_id);
+        conn.tx
+            .send(NodeServerFrame::StreamClose {
+                stream_id: stream_id.to_string(),
+            })
+            .await
+            .map_err(|_| "node tunnel closed".to_string())
+    }
 }
 
 async fn wait_files_event(
@@ -491,6 +583,10 @@ async fn fail_all_files(
             reason: reason.to_string(),
         });
     }
+}
+
+async fn close_all_streams(streams: &Mutex<HashMap<String, mpsc::Sender<StreamTunnelEvent>>>) {
+    streams.lock().await.drain();
 }
 
 struct StoreRegistrySlot {
@@ -666,13 +762,25 @@ pub(super) async fn run_node_tunnel(
                                 }
                             }
                             // ── Multiplexed TCP egress stream responses ──
-                            NodeClientFrame::StreamOpened { .. }
-                            | NodeClientFrame::StreamData { .. }
-                            | NodeClientFrame::StreamError { .. }
-                            | NodeClientFrame::StreamClosed { .. } => {
-                                // Stream relay frames are handled by the
-                                // coordinator's proxy dispatch (future work);
-                                // log and discard on the tunnel side for now.
+                            NodeClientFrame::StreamOpened { stream_id } => {
+                                if let Some(tx) = conn.streams.lock().await.get(&stream_id) {
+                                    let _ = tx.send(StreamTunnelEvent::Opened).await;
+                                }
+                            }
+                            NodeClientFrame::StreamData { stream_id, data_b64 } => {
+                                if let Some(tx) = conn.streams.lock().await.get(&stream_id) {
+                                    let _ = tx.send(StreamTunnelEvent::Data { data_b64 }).await;
+                                }
+                            }
+                            NodeClientFrame::StreamError { stream_id, error } => {
+                                if let Some(tx) = conn.streams.lock().await.remove(&stream_id) {
+                                    let _ = tx.send(StreamTunnelEvent::Error { error }).await;
+                                }
+                            }
+                            NodeClientFrame::StreamClosed { stream_id, bytes_tx, bytes_rx } => {
+                                if let Some(tx) = conn.streams.lock().await.remove(&stream_id) {
+                                    let _ = tx.send(StreamTunnelEvent::Closed { bytes_tx, bytes_rx }).await;
+                                }
                             }
                             // ── Scoped files responses ──
                             NodeClientFrame::FilesResult { req_id, entries, data_b64, error } => {

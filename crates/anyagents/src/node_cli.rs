@@ -15,6 +15,7 @@ use crate::{client, operator, server, ui};
 pub(crate) mod egress;
 pub(crate) mod files;
 pub(crate) mod install;
+pub(crate) mod proxy;
 pub(crate) mod runner;
 pub(crate) mod ssrf_guard;
 
@@ -400,11 +401,28 @@ pub(crate) fn run(data: &Path, args: NodeCliArgs) -> Result<(), Error> {
             Ok(())
         }
         NodeCommand::Proxy { node, listen } => {
-            // Placeholder: proxy command requires coordinator integration.
-            Err(Error::Message(format!(
-                "proxy command for node `{node}` listening on `{listen}` is not yet \
-                 integrated with coordinator proxy dispatch"
-            )))
+            let config_path = resolve_node_config_path(args.config.as_deref())?;
+            let cfg = load_node_config_at(&config_path)?.ok_or_else(|| {
+                Error::Message(format!(
+                    "no node config at {}; pair first",
+                    config_path.display()
+                ))
+            })?;
+            let node_id = if node.starts_with("nd_") {
+                node.clone()
+            } else {
+                cfg.node_id.clone()
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| Error::Message(format!("runtime: {e}")))?;
+            rt.block_on(proxy::run_proxy(
+                &cfg.coordinator_url,
+                &cfg.node_token,
+                &node_id,
+                &listen,
+            ))
         }
     }
 }
