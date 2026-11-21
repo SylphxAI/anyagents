@@ -288,6 +288,10 @@ for raw in sys.stdin:
         continue
     uuid = msg.get("uuid", "")
     text = msg.get("message", {{}}).get("content", "")
+    if "LOCAL_RUNTIME_STEER_OK" in text:
+        # Check what the harness actually gets before acknowledging the steer.
+        notes = [s.split(": ", 1)[1][:-1] for s in text.splitlines() if s.startswith("[Media (")]
+        assert [pathlib.Path(p).read_bytes() for p in notes] == [b"steer-photo", b"steer-document"]
     with transcript.open("a", encoding="utf-8") as f:
         f.write(json.dumps({{"type": "user", "uuid": uuid, "message": {{"role": "user", "content": text}}}}) + "\n")
         f.flush()
@@ -701,7 +705,9 @@ async fn coordinator_sandbox_midturn_steer_e2e_advances_cursor_before_complete_a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn coordinator_local_runtime_midturn_steer_e2e_via_local_host_provider() {
+    let _env = super::super::tests::env_lock();
     let dir = crate::test_tempdir();
     let local_root = crate::test_tempdir();
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -821,10 +827,18 @@ async fn coordinator_local_runtime_midturn_steer_e2e_via_local_host_provider() {
     })
     .await;
 
-    let msg2 = match store
-        .receive(&worker.id, Incoming::new("LOCAL_RUNTIME_STEER_OK"))
-        .unwrap()
-    {
+    let media_dir = store
+        .data_dir()
+        .join(anyagents_harness::media::MEDIA_DIR)
+        .join(worker.id.as_str());
+    std::fs::create_dir_all(&media_dir).unwrap();
+    std::fs::write(media_dir.join("photo.jpg"), b"steer-photo").unwrap();
+    std::fs::write(media_dir.join("document.pdf"), b"steer-document").unwrap();
+    let steer = format!(
+        "LOCAL_RUNTIME_STEER_OK\n[Media (photo): /v1/media/{}/photo.jpg]\n[Media (document): /v1/media/{}/document.pdf]",
+        worker.id, worker.id,
+    );
+    let msg2 = match store.receive(&worker.id, Incoming::new(steer)).unwrap() {
         anyagents_core::ReceiveOutcome::New(m) | anyagents_core::ReceiveOutcome::Duplicate(m) => m,
     };
     assert_eq!(msg2.seq, 2);

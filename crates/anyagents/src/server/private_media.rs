@@ -46,7 +46,7 @@ pub(super) fn router() -> Router<AppState> {
 
 /// The network listener may share a state with a trusted single-user Unix
 /// socket. A caller-supplied agent header alone is never upload/download auth.
-struct MediaAgent(AgentId);
+pub(super) struct MediaAgent(pub(super) AgentId);
 
 impl FromRequestParts<AppState> for MediaAgent {
     type Rejection = axum::response::Response;
@@ -67,7 +67,7 @@ impl FromRequestParts<AppState> for MediaAgent {
         {
             Principal::Agent { agent_id, .. } => Ok(Self(agent_id)),
             Principal::Operator => Err(ApiError::forbidden(
-                "private media requires an authenticated agent",
+                "media transfer requires an authenticated agent",
             )
             .into_response()),
         }

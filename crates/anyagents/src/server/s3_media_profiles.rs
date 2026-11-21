@@ -4,10 +4,10 @@
 //! Security boundary: S3 credentials (`ANYAGENTS_S3_*`) and `ANYAGENTS_MASTER_KEY`
 //! stay strictly inside the coordinator. Agents authenticate with their own
 //! capability token (`x-anyagents-agent`) and can access only browser profiles
-//! granted to them and media owned by themselves or their descendants.
+//! granted to them and inbound media in their own namespace.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 use anyagents_core::s3_media::{media_content_type, media_s3_key};
@@ -55,6 +55,13 @@ pub(super) fn router() -> Router<AppState> {
             "/v1/media/{agent_id}/{media_id}",
             get(scoped_media_file_route),
         )
+}
+
+pub(super) fn public_media_router() -> Router<AppState> {
+    Router::new().route(
+        "/v1/media/{agent_id}/{media_id}",
+        get(public_scoped_media_file_route),
+    )
 }
 
 pub(crate) fn browser_profile_s3_key(profile: &str) -> String {
@@ -604,7 +611,7 @@ fn validate_media_segment(raw: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
-fn load_scoped_media_bytes(
+pub(super) fn load_scoped_media_bytes(
     store: &Store,
     agent_id: &AgentId,
     media_id: &str,
@@ -636,22 +643,37 @@ fn load_scoped_media_bytes(
     if let Ok(Some(blob)) = blobs.get_deployment_blob("media", &scoped_path) {
         return Ok(Some(blob.content));
     }
-    if let Ok(Some(blob)) = blobs.get_deployment_blob("media", media_id) {
-        return Ok(Some(blob.content));
+    match read_scoped_local_media(store, agent_id, media_id) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err.kind().to_string(),
+        )),
     }
+}
 
-    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
-    for candidate in [
-        media_dir.join(agent_id.as_str()).join(media_id),
-        media_dir.join(media_id),
-    ] {
-        if candidate.is_file()
-            && let Ok(raw) = std::fs::read(&candidate)
-        {
-            return Ok(Some(raw));
-        }
+fn read_scoped_local_media(
+    store: &Store,
+    owner: &AgentId,
+    media_id: &str,
+) -> std::io::Result<Vec<u8>> {
+    use crate::seat_tree::open_child;
+    use std::os::unix::fs::MetadataExt as _;
+
+    // The configured data directory is trusted; do not follow symlinks in the
+    // media namespace or read devices, directories or hard-linked host files.
+    let data = std::fs::File::open(store.data_dir())?;
+    let media = open_child(&data, OsStr::new(anyagents_harness::media::MEDIA_DIR), true)?;
+    let owner_dir = open_child(&media, OsStr::new(owner.as_str()), true)?;
+    let file = open_child(&owner_dir, OsStr::new(media_id), false)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(std::io::Error::other("invalid scoped media file"));
     }
-    Ok(None)
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut bytes)?;
+    Ok(bytes)
 }
 
 async fn scoped_media_file_route(
@@ -659,10 +681,36 @@ async fn scoped_media_file_route(
     State(state): State<AppState>,
     AxumPath((agent_ref, media_id)): AxumPath<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let clean_media = validate_media_segment(&media_id)?;
+    scoped_media_response(state, principal, agent_ref, media_id).await
+}
+
+async fn public_scoped_media_file_route(
+    super::private_media::MediaAgent(agent_id): super::private_media::MediaAgent,
+    State(state): State<AppState>,
+    AxumPath((agent_ref, media_id)): AxumPath<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let owner = require_media_owner(&agent_id, &agent_ref)?;
+    read_scoped_media_response(state, owner, media_id).await
+}
+
+fn require_media_owner(agent_id: &AgentId, agent_ref: &str) -> Result<AgentId, ApiError> {
+    if agent_ref == agent_id.as_str() || agent_ref == "self" {
+        Ok(agent_id.clone())
+    } else {
+        Err(ApiError::forbidden(
+            "not authorized to read another agent's media",
+        ))
+    }
+}
+
+async fn scoped_media_response(
+    state: AppState,
+    principal: Principal,
+    agent_ref: String,
+    media_id: String,
+) -> Result<impl IntoResponse, ApiError> {
     let store = Arc::clone(&state.store);
-    let media_for_ct = clean_media.clone();
-    let bytes = spawn_store(move || {
+    let owner = spawn_store(move || {
         let target = resolve_target_agent(&store, &principal, &agent_ref)?;
         let allowed = match &principal {
             Principal::Operator => true,
@@ -676,133 +724,32 @@ async fn scoped_media_file_route(
                 "not authorized to read media belonging to this agent",
             ));
         }
-        load_scoped_media_bytes(&store, &target.id, &clean_media)
+        Ok(target.id)
     })
-    .await?
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media file not found"))?;
-
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, media_content_type(&media_for_ct))],
-        bytes,
-    ))
+    .await?;
+    read_scoped_media_response(state, owner, media_id).await
 }
 
-/// Hydrate both portable `/v1/media/<agent_id>/<media_id>` refs (from S3 or PG
-/// `deployment_blobs`) and legacy `<data_dir>/media/<file_name>` refs into
-/// `<cfg_dir>/media/<file_name>`, rewriting paths in `prompt` to
-/// `<state_dir>/media/<file_name>` for isolated sandbox turns.
-pub(crate) fn hydrate_prompt_media_for_sandbox(
-    store: &Store,
-    cfg_dir: &Path,
-    state_dir: &str,
-    prompt: &str,
-) -> String {
-    let remote_media_prefix = format!("{}/media", state_dir.trim_end_matches('/'));
-    let mut rewritten = prompt.to_string();
-    let stage_dir = cfg_dir.join("media");
-
-    // 1. Portable scoped refs: `/v1/media/<agent_id>/<media_id>`.
-    let scoped_prefix = "/v1/media/";
-    let mut scoped_refs: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut search_from = 0usize;
-    while let Some(rel_idx) = rewritten[search_from..].find(scoped_prefix) {
-        let start = search_from + rel_idx + scoped_prefix.len();
-        let rest = &rewritten[start..];
-        let end_offset = rest
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '<' | '>' | ',' | ';')
-            })
-            .unwrap_or(rest.len());
-        let tail = rest[..end_offset].trim();
-        if let Some((aid, mid)) = tail.split_once('/')
-            && !aid.is_empty()
-            && !mid.is_empty()
-            && !mid.contains('/')
-            && !mid.contains('\\')
-            && !mid.contains("..")
-            && AgentId::parse(aid).is_ok()
-        {
-            scoped_refs.insert((aid.to_string(), mid.to_string()));
-        }
-        search_from = start + end_offset;
-    }
-    if !scoped_refs.is_empty() {
-        let _ = std::fs::create_dir_all(&stage_dir);
-        for (aid_str, mid) in scoped_refs {
-            let Ok(aid) = AgentId::parse(&aid_str) else {
-                continue;
-            };
-            if let Ok(Some(bytes)) = load_scoped_media_bytes(store, &aid, &mid)
-                && !bytes.is_empty()
-                && std::fs::write(stage_dir.join(&mid), &bytes).is_ok()
-            {
-                let from = format!("{scoped_prefix}{aid_str}/{mid}");
-                let to = format!("{remote_media_prefix}/{mid}");
-                rewritten = rewritten.replace(&from, &to);
-            }
-        }
-    }
-
-    // 2. Legacy `<data_dir>/media/<file_name>` and `/var/lib/anyagents/media/<file_name>` refs.
-    let media_dir = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
-    let mut prefixes = Vec::new();
-    let dir_str = media_dir
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_string();
-    if !dir_str.is_empty() {
-        prefixes.push(format!("{dir_str}/"));
-    }
-    if dir_str != "/var/lib/anyagents/media" {
-        prefixes.push("/var/lib/anyagents/media/".to_string());
-    }
-    let mut legacy_names: BTreeSet<String> = BTreeSet::new();
-    for prefix in &prefixes {
-        let mut cursor = 0usize;
-        while let Some(rel_idx) = rewritten[cursor..].find(prefix.as_str()) {
-            let start = cursor + rel_idx + prefix.len();
-            let rest = &rewritten[start..];
-            let end_offset = rest
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ']' | ')' | '"' | '\'' | '<' | '>' | ',' | ';')
-                })
-                .unwrap_or(rest.len());
-            let fname = rest[..end_offset].trim();
-            if !fname.is_empty()
-                && !fname.contains('/')
-                && !fname.contains('\\')
-                && !fname.contains("..")
-            {
-                legacy_names.insert(fname.to_string());
-            }
-            cursor = start + end_offset;
-        }
-    }
-    if !legacy_names.is_empty() {
-        let _ = std::fs::create_dir_all(&stage_dir);
-        for fname in legacy_names {
-            let bytes_opt = store
-                .blob_store_with_key(MasterKey::from_env().ok().flatten())
-                .get_deployment_blob("media", &fname)
-                .ok()
-                .flatten()
-                .map(|b| b.content)
-                .or_else(|| std::fs::read(media_dir.join(&fname)).ok());
-            if let Some(bytes) = bytes_opt
-                && !bytes.is_empty()
-                && std::fs::write(stage_dir.join(&fname), &bytes).is_ok()
-            {
-                for prefix in &prefixes {
-                    let from = format!("{prefix}{fname}");
-                    let to = format!("{remote_media_prefix}/{fname}");
-                    rewritten = rewritten.replace(&from, &to);
-                }
-            }
-        }
-    }
-
-    rewritten
+async fn read_scoped_media_response(
+    state: AppState,
+    owner: AgentId,
+    media_id: String,
+) -> Result<impl IntoResponse, ApiError> {
+    let media_id = validate_media_segment(&media_id)?;
+    let content_type = media_content_type(&media_id);
+    let bytes = spawn_store(move || load_scoped_media_bytes(&state.store, &owner, &media_id))
+        .await?
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media file not found"))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    ))
 }
 
 #[cfg(test)]
@@ -1269,7 +1216,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn s3_media_persistence_authenticated_retrieval_and_sandbox_hydration() {
+    async fn s3_media_persistence_and_authenticated_retrieval() {
         let _env = crate::server::tests::env_lock();
         let _restore = EnvRestore::capture(&[
             S3_ENDPOINT_ENV,
@@ -1352,7 +1299,7 @@ mod tests {
         let got = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(got.as_ref(), img_bytes);
 
-        // Parent (ancestor) can read.
+        // The authenticated control router retains its existing ancestor policy.
         let resp = app
             .clone()
             .oneshot(request_as(
@@ -1368,6 +1315,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(got.as_ref(), img_bytes);
 
         // Unrelated non-admin agent is denied with 403.
         let resp = app
@@ -1385,27 +1334,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        // Sandbox hydration fetches from S3, stages into `<cfg_dir>/media/`, and rewrites prompt.
-        let cfg_dir = dir.path().join("sandbox-cfg");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let hydrated = hydrate_prompt_media_for_sandbox(
-            &store,
-            &cfg_dir,
-            "/home/user/agent-data/state",
-            &format!("Look at this photo:\n{note}"),
-        );
-        assert!(
-            hydrated.contains("/home/user/agent-data/state/media/"),
-            "hydrated prompt: {hydrated}"
-        );
-        assert!(!hydrated.contains("/v1/media/"), "rewrote ref: {hydrated}");
-        let staged_files: Vec<_> = std::fs::read_dir(cfg_dir.join("media"))
-            .unwrap()
-            .flatten()
-            .collect();
-        assert_eq!(staged_files.len(), 1);
-        assert_eq!(std::fs::read(staged_files[0].path()).unwrap(), img_bytes);
     }
 
     fn spawn_failing_s3_server(status_line: &'static str) -> String {
@@ -1517,48 +1445,33 @@ mod tests {
         let got = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(got.as_ref(), docx_bytes);
 
-        // 2. Quoted Telegram `.docx` refs inside `<quote>...</quote>` hydrate and rewrite cleanly.
-        let cfg_dir = dir.path().join("sandbox-quoted");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let quoted_prompt = format!(
-            "Please review this quoted document:\n<quote>[Media (document): /v1/media/{}/{media_id}]</quote>\nAlso inline: <quote>/v1/media/{}/{media_id}</quote>",
-            agent.id.as_str(),
-            agent.id.as_str(),
-        );
-        let hydrated = hydrate_prompt_media_for_sandbox(
+        // 2. Quoted references are rewritten only after the provider materializes the file.
+        use crate::sandbox_providers::providers::{
+            EnsureSandboxRequest, SandboxProvider, local::LocalHostProvider,
+        };
+        let provider = LocalHostProvider::with_root(dir.path().join("sandbox"));
+        let handle = provider
+            .ensure(&EnsureSandboxRequest::for_agent(agent.id.as_str()))
+            .await
+            .unwrap();
+        let quoted_prompt =
+            format!("Review <quote>[Media (document): {uri}]</quote> and <quote>{uri}</quote>");
+        let hydrated = super::super::sandbox_media::hydrate_prompt(
             &store,
-            &cfg_dir,
-            "/home/user/agent-data/state",
+            &agent.id,
+            &provider,
+            &handle,
             &quoted_prompt,
-        );
-        let expected_path = format!("/home/user/agent-data/state/media/{media_id}");
-        assert!(
-            hydrated.contains(&format!(
-                "<quote>[Media (document): {expected_path}]</quote>"
-            )),
-            "hydrated prompt: {hydrated}"
-        );
-        assert!(
-            hydrated.contains(&format!("<quote>{expected_path}</quote>")),
-            "hydrated prompt: {hydrated}"
-        );
-        assert!(!hydrated.contains("/v1/media/"), "rewrote ref: {hydrated}");
+        )
+        .await;
+        let expected_path = format!("{}/media/{media_id}", handle.state_dir);
         assert_eq!(
-            std::fs::read(cfg_dir.join("media").join(media_id)).unwrap(),
-            docx_bytes
+            hydrated,
+            format!(
+                "Review <quote>[Media (document): {expected_path}]</quote> and <quote>{expected_path}</quote>"
+            )
         );
-
-        // 3. Corrupted encrypted S3 payload still fails closed instead of falling back.
-        let (good_endpoint, s3_objects) = spawn_mock_s3("media-corrupt-test");
-        unsafe {
-            std::env::set_var(S3_ENDPOINT_ENV, &good_endpoint);
-            std::env::set_var(S3_BUCKET_ENV, "media-corrupt-test");
-        }
-        s3_objects.lock().unwrap().insert(
-            media_s3_key(agent.id.as_str(), media_id),
-            b"AAENC1corrupted-ciphertext-bytes".to_vec(),
-        );
-        assert!(load_scoped_media_bytes(&store, &agent.id, media_id).is_err());
+        assert_eq!(std::fs::read(expected_path).unwrap(), docx_bytes);
     }
 
     #[tokio::test]
@@ -1617,12 +1530,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
         let store = Arc::new(Store::open(&db_path).unwrap());
-        let off_host_a = store
+        let parent = store
             .create_agent(
-                NewAgent::new("sandbox-a", "claude-code")
+                NewAgent::new("sandbox-parent", "claude-code")
                     .with_runtime(anyagents_core::ExecutionRuntime::Sandbox { provider: None }),
             )
             .unwrap();
+        let mut owner = NewAgent::new("sandbox-a", "claude-code")
+            .with_runtime(anyagents_core::ExecutionRuntime::Sandbox { provider: None });
+        owner.parent_id = Some(parent.id.clone());
+        let off_host_a = store.create_agent(owner).unwrap();
         let off_host_b = store
             .create_agent(
                 NewAgent::new("sandbox-b", "claude-code")
@@ -1666,6 +1583,68 @@ mod tests {
 
         let state = make_test_state(Arc::clone(&store));
         let app = super::super::build_router(state.clone());
+        let parent_session = store.begin_remote_session(&parent.id, 60_000).unwrap();
+        let fallback = store.data_dir().join(anyagents_harness::media::MEDIA_DIR);
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(fallback.join("unscoped.png"), b"legacy bytes").unwrap();
+        let missing = format!("/v1/media/{}/unscoped.png", off_host_a.id);
+        // The owner uses the same Bearer token as POST /v1/media on both
+        // public listener configurations. Related agents are not media owners.
+        for public in [
+            super::super::build_public_router(state.clone()),
+            super::super::build_webhook_router(state.clone()),
+        ] {
+            for (uri, token, status) in [
+                (
+                    media_uri.as_str(),
+                    Some(sess_a.token.as_str()),
+                    StatusCode::OK,
+                ),
+                (
+                    media_uri.as_str(),
+                    Some(parent_session.token.as_str()),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    media_uri.as_str(),
+                    Some(sess_b.token.as_str()),
+                    StatusCode::FORBIDDEN,
+                ),
+                (media_uri.as_str(), None, StatusCode::UNAUTHORIZED),
+                (
+                    missing.as_str(),
+                    Some(sess_a.token.as_str()),
+                    StatusCode::NOT_FOUND,
+                ),
+            ] {
+                let mut request = Request::builder().uri(uri);
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = public
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                if status == StatusCode::OK {
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "private, no-store"
+                    );
+                    assert_eq!(
+                        response
+                            .into_body()
+                            .collect()
+                            .await
+                            .unwrap()
+                            .to_bytes()
+                            .as_ref(),
+                        img_bytes
+                    );
+                }
+            }
+        }
 
         // 1. `GET /v1/browser-profiles` with single `x-anyagents-agent` remote session token -> 200.
         let req = Request::builder()

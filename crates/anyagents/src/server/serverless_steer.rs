@@ -282,45 +282,36 @@ async fn steer_active_sandbox_turn(
         handle.state_dir.trim_end_matches('/'),
         active_turn.turn_id
     );
-    let state_dir_for_media = handle.state_dir.clone();
-    let store_env = Arc::clone(&store);
-    let aid_media = agent.id.clone();
-    let turn_id_for_envelopes = active_turn.turn_id.clone();
-    let envelopes = tokio::task::spawn_blocking(move || {
-        let cfg_dir = anyagents_core::agent_config_dir(store_env.data_dir(), &aid_media);
-        let mut out = Vec::with_capacity(eligible.len());
-        for msg in &eligible {
-            let (prompt, mut outbound) =
-                super::serverless_envelope::build_serverless_outbound_message(
-                    std::slice::from_ref(msg),
-                );
-            let hydrated = super::s3_media_profiles::hydrate_prompt_media_for_sandbox(
-                &store_env,
-                &cfg_dir,
-                &state_dir_for_media,
-                &prompt,
-            );
-            outbound.text = hydrated;
-            let env = SteerEnvelope {
-                turn_id: turn_id_for_envelopes.clone(),
-                message_id: msg.id.to_string(),
-                seq: msg.seq,
-                outbound,
-                submitted_at_ms: Some(now_ms()),
-            };
-            let fname = steer_filename(msg.seq, msg.id.as_str());
-            if let Ok(bytes) = serde_json::to_vec(&env) {
-                out.push((fname, bytes));
-            }
-        }
-        out
-    })
-    .await
-    .unwrap_or_default();
-
     static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
     let mut pushed = 0usize;
-    for (filename, bytes) in envelopes {
+    for msg in &eligible {
+        let (prompt, mut outbound) = super::serverless_envelope::build_serverless_outbound_message(
+            std::slice::from_ref(msg),
+        );
+        outbound.text = super::sandbox_media::hydrate_prompt(
+            &store,
+            &agent.id,
+            provider.as_ref(),
+            &handle,
+            &prompt,
+        )
+        .await;
+        let env = SteerEnvelope {
+            turn_id: active_turn.turn_id.clone(),
+            message_id: msg.id.to_string(),
+            seq: msg.seq,
+            outbound,
+            submitted_at_ms: Some(now_ms()),
+        };
+        let bytes = match serde_json::to_vec(&env) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return SteerPushOutcome::Refused {
+                    reason: format!("steer envelope serialization failed: {err}"),
+                };
+            }
+        };
+        let filename = steer_filename(msg.seq, msg.id.as_str());
         let nonce = format!("{}-{}", now_ms(), NONCE_SEQ.fetch_add(1, Ordering::Relaxed));
         let req = ExecRequest::argv([
             "/bin/sh".to_string(),

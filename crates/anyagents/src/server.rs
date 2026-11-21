@@ -58,6 +58,7 @@ mod roles;
 mod runtime;
 pub(crate) mod runtime_issues;
 pub(crate) mod s3_media_profiles;
+mod sandbox_media;
 mod sandbox_targets;
 mod schedules;
 pub(crate) mod secrets;
@@ -116,7 +117,7 @@ use types::{require_operator, spawn_store};
 /// The public listener (`[server] public_listen`): the only surface a network
 /// peer reaches once it is configured. It serves readiness, Telegram webhooks
 /// (each verified by its channel's secret token) and MCP for remote session
-/// tokens only, plus authenticated private media transfer. Other paths are
+/// tokens only, plus authenticated, self-scoped media transfer. Other paths are
 /// 404. Credential policy depends on the listener, never on a source address
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
@@ -137,6 +138,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .merge(timer_fire::router())
         .merge(knowledge::sandbox_router())
         .merge(private_media::router())
+        .merge(s3_media_profiles::public_media_router())
         .fallback(ops::public_not_found)
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
@@ -176,7 +178,7 @@ fn build_webhook_router(state: AppState) -> Router {
     let router = if expose_console {
         admin_ui::mount_admin_routes(mount_authenticated_api_routes(base))
     } else {
-        base
+        base.merge(s3_media_profiles::public_media_router())
     };
     router
         .with_state(state.clone())
