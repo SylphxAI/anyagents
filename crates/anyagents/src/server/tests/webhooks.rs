@@ -203,38 +203,47 @@ fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix(
     crate::remote::begin_session(&state.store, &cloud_agent).unwrap();
     let cloud_remote = crate::remote::session_token(&cloud_cfg).unwrap();
 
-    // Start a minimal mock upstream responses server and add gateway route.
-    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let upstream_addr = upstream.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for stream in upstream.incoming().take(2) {
-            let mut s = stream.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = std::io::Read::read(&mut s, &mut buf).unwrap();
-            let req_str = String::from_utf8_lossy(&buf[..n]);
-            assert!(req_str.contains("upstream-secret-token"), "{req_str}");
-            let body = r#"{"id":"resp_1","object":"response","status":"completed"}"#;
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = std::io::Write::write_all(&mut s, reply.as_bytes());
-        }
-    });
-    crate::gateway::ProviderImage::store(
-        dir.path(),
-        &sbx_agent,
-        &format!("http://{upstream_addr}/v1"),
-        "gpt-test",
-        "upstream-secret-token",
-    )
-    .unwrap();
-    let gw_token = crate::gateway::add_route(dir.path(), &sbx_agent)
-        .unwrap()
-        .unwrap();
-
     tokio::runtime::Runtime::new().unwrap().block_on(async {
+        // Parse and consume the complete request before replying. TCP may split
+        // headers or the body across reads, even on loopback.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(
+                |headers: axum::http::HeaderMap,
+                 axum::Json(payload): axum::Json<serde_json::Value>| async move {
+                    if headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer upstream-secret-token")
+                    {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                    if payload["model"] != "gpt-test" || payload["input"] != "hi" {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    Ok(axum::Json(serde_json::json!({
+                        "id": "resp_1", "object": "response", "status": "completed"
+                    })))
+                },
+            ),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream, upstream_app).await.unwrap();
+        });
+        crate::gateway::ProviderImage::store(
+            dir.path(),
+            &sbx_agent,
+            &format!("http://{upstream_addr}"),
+            "gpt-test",
+            "upstream-secret-token",
+        )
+        .unwrap();
+        let gw_token = crate::gateway::add_route(dir.path(), &sbx_agent)
+            .unwrap()
+            .unwrap();
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = build_webhook_router(state.clone());
@@ -288,6 +297,7 @@ fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix(
         }
 
         served.abort();
+        upstream_task.abort();
     });
 }
 
