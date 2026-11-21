@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-ingress"
+version = "0.1.0"
+source = "git+https://github.com/SylphxAI/agent-kit?rev=2dd25c1445140df00c443a49bb028fae5d0de305#2dd25c1445140df00c443a49bb028fae5d0de305"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "agent-memory"
 version = "0.1.0"
 source = "git+https://github.com/SylphxAI/agent-kit?tag=v0.1.0#6a2c2ea9050f4ee6a55faf656cee9fa517de20b0"
@@ -172,6 +183,7 @@ dependencies = [
 name = "anyagents"
 version = "0.1.9"
 dependencies = [
+ "agent-ingress",
  "agent-memory",
  "agent-tools",
  "anyagents-agent",
@@ -253,7 +265,9 @@ dependencies = [
 name = "anyagents-core"
 version = "0.1.9"
 dependencies = [
+ "agent-ingress",
  "anyagents-harness",
+ "async-trait",
  "chrono",
  "libc",
  "rusqlite",

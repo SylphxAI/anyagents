@@ -15,5 +15,7 @@ pub use channel::{
     reconcile_channel_groups, record_chat, request_or_bind_telegram_channel,
     sync_agent_telegram_bot_name,
 };
-pub(crate) use channel::{chat_admin, detach_archived_agent_from_telegram_groups, outbound_call};
+pub(crate) use channel::{
+    chat_admin, detach_archived_agent_from_telegram_groups, ingress_guard, outbound_call,
+};
 pub use poller::Poller;

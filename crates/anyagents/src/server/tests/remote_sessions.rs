@@ -45,6 +45,7 @@ fn remote_session_tokens_get_universal_mcp_surface() {
             "send",
             "report_bug",
             "inbox",
+            "ingress_guard",
             "conversation",
             "memory",
             "schedules",

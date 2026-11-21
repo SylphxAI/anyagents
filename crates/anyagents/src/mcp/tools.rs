@@ -8,11 +8,26 @@ mod knowledge_tool;
 mod memory_tool;
 use memory_tool::MemoryArgs;
 
+#[path = "ingress_tool.rs"]
+mod ingress_tool;
+
 #[path = "send_tool.rs"]
 mod send_tool;
 
 #[tool_router(vis = "pub(super)")]
 impl AgentMcp {
+    #[tool(
+        description = "Manage this agent's external ingress rules. Use the channel and numeric IDs from sender_awareness. Block a sender or known group, remove an exact block, or list rules. Protected senders bypass. A permanent group block may leave the chat; unblocking does not rejoin it."
+    )]
+    pub(super) async fn ingress_guard(
+        &self,
+        Parameters(args): Parameters<ingress_tool::Args>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        ingress_tool::call(self, args)
+            .await
+            .map(rmcp::handler::server::wrapper::Json)
+    }
+
     #[tool(
         description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`planner`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`). For Telegram chat administration, use `set_chat_title`, `set_chat_description`, or `set_chat_photo` with one `telegram:chat:<chat_id>` in `target` or `to`. The selected `bot` must have admin rights to change chat info. Supply `text` for title or description or `media: {kind: \"photo\", source: ...}` (local JPEG/PNG, direct public HTTP(S) image URL, or private `media://` reference) for photo. For a sandbox-local file, POST binary or multipart `file` to `$ANYAGENTS_API_URL/v1/media` with the remote MCP token as Bearer auth (read `$ANYAGENTS_MCP_TOKEN_FILE` if set), then use the returned `source` in `media.source`. Never pass a sandbox path to HTTP MCP."
     )]
@@ -1703,6 +1718,13 @@ impl AgentMcp {
             ));
         }
         match norm {
+            "ingress_guard" => {
+                ingress_tool::call(
+                    self,
+                    serde_json::from_value(args).map_err(|e| e.to_string())?,
+                )
+                .await
+            }
             "inbox" => {
                 let parsed: InboxArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `inbox` arguments: {e}"))?;
@@ -1781,9 +1803,7 @@ impl AgentMcp {
                 let res = self.interact(Parameters(parsed)).await?.0;
                 serde_json::to_value(res).map_err(|e| e.to_string())
             }
-            other => Err(format!(
-                "unknown AnyAgents tool `{other}`; expected one of `agents`, `send`, `inbox`, `conversation`, `memory`, `schedules`, `groups`"
-            )),
+            other => Err(format!("unknown AnyAgents tool {other}")),
         }
     }
 }

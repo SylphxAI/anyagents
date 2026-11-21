@@ -7,6 +7,8 @@ rust-version = "1.98"
 description = "Identifiers, address grammar, and the durable mailbox"
 
 [dependencies]
+agent-ingress.workspace = true
+async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 anyagents-harness = { path = "../anyagents-harness" }

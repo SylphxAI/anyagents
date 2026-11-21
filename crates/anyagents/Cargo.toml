@@ -24,6 +24,7 @@ anyagents-harness-codex = { path = "../anyagents-harness-codex" }
 anyagents-harness-opencode = { path = "../anyagents-harness-opencode" }
 anyagents-harness-spiron = { path = "../anyagents-harness-spiron" }
 anyagents-supervisor = { path = "../anyagents-supervisor" }
+agent-ingress.workspace = true
 agent-memory = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0", features = ["service"] }
 agent-tools = { git = "https://github.com/SylphxAI/agent-kit", tag = "v0.1.0" }
 async-trait = "0.1"

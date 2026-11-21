@@ -1124,6 +1124,7 @@ mod spawn_args_tests {
                 "send",
                 "report_bug",
                 "inbox",
+                "ingress_guard",
                 "conversation",
                 "memory",
                 "schedules",
