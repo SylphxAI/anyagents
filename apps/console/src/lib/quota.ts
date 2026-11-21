@@ -6,8 +6,8 @@
 //   "limited ↻1h · 5h: 0% left"           "$12.40 left ($88 / $100)"
 //   "active (12 models)"                  "73% left"
 
-export interface QuotaWindow {
-  /** Window label as reported (`5h`, `7d`, `opus`, `mo`, `wk`, `day`, `req`, ...). */
+export interface QuotaBucket {
+  /** Quota key (`5h`, `7d`, `opus`, `mo`, `wk`, `day`, `req`, ...). */
   label: string;
   /** Remaining capacity, 0..100. */
   left: number;
@@ -16,7 +16,10 @@ export interface QuotaWindow {
 }
 
 export interface UsageReading {
-  windows: QuotaWindow[];
+  /** Account-wide windows and unscoped limits. */
+  windows: QuotaBucket[];
+  /** Limits that only apply to a model family. */
+  modelPools: QuotaBucket[];
   /** The provider rejected the stored OAuth credential. */
   expired: boolean;
   /** The provider is rate limiting outside the reported windows. */
@@ -28,11 +31,12 @@ export interface UsageReading {
   balance?: string;
   /** Any other non-quota note, e.g. `active (12 models)`. */
   note?: string;
-  /** Lowest remaining percentage across windows, or null without windows. */
-  minLeft: number | null;
 }
 
-const EMPTY: UsageReading = { windows: [], expired: false, limited: false, minLeft: null };
+// Known model labels from provider readings. Other labels retain their window semantics.
+const MODEL_POOLS = new Set(['opus', 'sonnet', 'gemini']);
+const WINDOW_ALIASES = new Map([['weekly', '7d'], ['monthly', 'mo'], ['daily', 'day']]);
+const WINDOW_ORDER = ['5h', '7d', 'mo', 'wk', 'day', 'req', 'quota'];
 const WINDOW = /^([A-Za-z0-9][\w.\- ]{0,23}?)\s*:\s*(\d{1,3}(?:\.\d+)?)\s*%\s*(left|used|remaining)?\s*(?:↻\s*(\S+))?\s*(?:\(([^()]*)\))?\s*$/i;
 const BARE = /^(\d{1,3}(?:\.\d+)?)\s*%\s*(left|used|remaining)\s*(?:↻\s*(\S+))?\s*$/i;
 const BALANCE = /^\$\s?[\d,]+(?:\.\d+)?\s+left\b/i;
@@ -44,8 +48,8 @@ function clampPercent(raw: string, mode?: string) {
 
 export function parseUsage(usage?: string | null): UsageReading {
   let text = (usage ?? '').trim();
-  if (!text || text === '__NONE__') return { ...EMPTY, windows: [] };
-  const reading: UsageReading = { ...EMPTY, windows: [] };
+  const reading: UsageReading = { windows: [], modelPools: [], expired: false, limited: false };
+  if (!text || text === '__NONE__') return reading;
 
   const expired = /^oauth\s+expired\b\s*(?:[·:-]\s*)?/i.exec(text);
   if (expired) { reading.expired = true; text = text.slice(expired[0].length).trim(); }
@@ -70,7 +74,9 @@ export function parseUsage(usage?: string | null): UsageReading {
     const window = WINDOW.exec(part);
     if (window) {
       const [, label, count, mode, reset, detail] = window;
-      reading.windows.push({ label: label.trim().toLowerCase(), left: clampPercent(count, mode), ...(reset ? { reset } : {}) });
+      const key = label.trim().toLowerCase();
+      const buckets = MODEL_POOLS.has(key) ? reading.modelPools : reading.windows;
+      buckets.push({ label: WINDOW_ALIASES.get(key) ?? key, left: clampPercent(count, mode), ...(reset ? { reset } : {}) });
       if (detail && !reading.tier) reading.tier = detail.trim();
       continue;
     }
@@ -82,16 +88,24 @@ export function parseUsage(usage?: string | null): UsageReading {
     if (BALANCE.test(part)) { reading.balance = part; continue; }
     reading.note = reading.note ? reading.note + ' · ' + part : part;
   }
-  reading.minLeft = reading.windows.length ? Math.min(...reading.windows.map(window => window.left)) : null;
-  if (reading.limited && reading.minLeft === null) reading.minLeft = 0;
   return reading;
 }
 
-/** Friendly label for a quota window key. */
+/** Common account windows first, then other windows, then model pools. */
+export function compareQuotaLabels(a: string, b: string) {
+  const order = (label: string) => {
+    if (MODEL_POOLS.has(label)) return WINDOW_ORDER.length + 1;
+    const index = WINDOW_ORDER.indexOf(label);
+    return index === -1 ? WINDOW_ORDER.length : index;
+  };
+  return order(a) - order(b) || a.localeCompare(b);
+}
+
+/** Friendly label for a quota bucket key. */
 export function windowLabel(label: string) {
   const known: Record<string, string> = {
-    '5h': '5h', '7d': '7d', weekly: '7d', wk: 'Week', mo: 'Month', monthly: 'Month', day: 'Day', daily: 'Day',
-    req: 'Requests', quota: 'Quota', opus: 'Opus', sonnet: 'Sonnet',
+    '5h': '5h', '7d': '7d', wk: 'Week', mo: 'Month', day: 'Day',
+    req: 'Requests', quota: 'Quota', opus: 'Opus', sonnet: 'Sonnet', gemini: 'Gemini',
   };
   return known[label] ?? label.charAt(0).toUpperCase() + label.slice(1);
 }
