@@ -180,13 +180,20 @@ impl ExternalWebhookTimerBackend {
         &self,
         schedule_id: &str,
         fire_at_ms: i64,
+        intended_at_ms: i64,
         restoring: bool,
     ) -> Result<Option<String>, String> {
         let clean_id = schedule_id.trim();
         if clean_id.is_empty() {
             return Err("schedule_id cannot be empty".to_string());
         }
-        let run_id = deterministic_run_id(clean_id, fire_at_ms);
+        let run_id = if intended_at_ms == fire_at_ms {
+            deterministic_run_id(clean_id, fire_at_ms)
+        } else {
+            // Do not alias a delayed retry with a different tick due at the
+            // same delivery time.
+            deterministic_run_id(&format!("{clean_id}:slot:{intended_at_ms}"), fire_at_ms)
+        };
         let rfc3339 = format_fire_at_rfc3339_ms(fire_at_ms)?;
         let fire_url = self.fire_url(clean_id)?;
 
@@ -198,7 +205,7 @@ impl ExternalWebhookTimerBackend {
                     "input": {
                         "schedule_id": clean_id,
                         "fire_url": fire_url,
-                        "intended_at_ms": fire_at_ms,
+                        "intended_at_ms": intended_at_ms,
                     }
                 }),
             ),
@@ -210,7 +217,7 @@ impl ExternalWebhookTimerBackend {
                     "callback_url": fire_url,
                     "payload": {
                         "schedule_id": clean_id,
-                        "intended_at_ms": fire_at_ms,
+                        "intended_at_ms": intended_at_ms,
                     }
                 }),
             ),
@@ -304,7 +311,17 @@ impl TimerBackend for ExternalWebhookTimerBackend {
         schedule_id: &str,
         fire_at_ms: i64,
     ) -> Result<Option<String>, String> {
-        self.post_timer(schedule_id, fire_at_ms, false)
+        self.post_timer(schedule_id, fire_at_ms, fire_at_ms, false)
+    }
+
+    fn schedule_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        _expected_due: Option<i64>,
+        intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.post_timer(schedule_id, fire_at_ms, intended_at_ms, false)
     }
 
     fn restore_one_shot(
@@ -312,7 +329,16 @@ impl TimerBackend for ExternalWebhookTimerBackend {
         schedule_id: &str,
         fire_at_ms: i64,
     ) -> Result<Option<String>, String> {
-        self.post_timer(schedule_id, fire_at_ms, true)
+        self.post_timer(schedule_id, fire_at_ms, fire_at_ms, true)
+    }
+
+    fn restore_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.post_timer(schedule_id, fire_at_ms, intended_at_ms, true)
     }
 
     fn cancel(&self, _schedule_id: &str, external_run_id: Option<&str>) -> Result<(), String> {
@@ -488,18 +514,22 @@ mod tests {
             "https://coordinator.example.test",
         );
         let due = 1_800_000_000_000;
-        let result =
-            tokio::task::spawn_blocking(move || backend.restore_one_shot("test-schedule", due))
-                .await
-                .unwrap()
-                .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            backend.restore_slot("test-schedule", due, due - 1_000)
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             result.as_deref(),
-            Some(deterministic_run_id("test-schedule", due).as_str())
+            Some(deterministic_run_id("test-schedule:slot:1799999999000", due).as_str())
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
+        let body: Value = serde_json::from_slice(&requests[0].1).unwrap();
+        assert_eq!(body["scheduleTime"], "2027-01-15T08:00:00.000Z");
+        assert_eq!(body["input"]["intended_at_ms"], due - 1_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

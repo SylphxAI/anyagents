@@ -3,9 +3,11 @@
 
 pub mod external;
 pub mod local;
+mod rearm;
 
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyagents_core::{Agent, AgentSchedule, Incoming, Store};
 use anyagents_supervisor::HealthBoard;
@@ -48,6 +50,18 @@ pub trait TimerBackend: Send + Sync {
         fire_at_ms: i64,
     ) -> Result<Option<String>, String>;
 
+    /// Arm a delivery without changing the logical slot it is allowed to claim.
+    fn schedule_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        expected_due: Option<i64>,
+        intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        let _ = (expected_due, intended_at_ms);
+        self.schedule_one_shot(schedule_id, fire_at_ms)
+    }
+
     /// Restore a timer at startup. Remote adapters may retry transient failures
     /// with the same timer identity; local adapters need no retry policy.
     fn restore_one_shot(
@@ -56,6 +70,16 @@ pub trait TimerBackend: Send + Sync {
         fire_at_ms: i64,
     ) -> Result<Option<String>, String> {
         self.schedule_one_shot(schedule_id, fire_at_ms)
+    }
+
+    /// Restore a delivery with its original logical tick, even if it is overdue.
+    fn restore_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        _intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.restore_one_shot(schedule_id, fire_at_ms)
     }
 
     /// Cancel a pending trigger for `schedule_id`, using the persisted
@@ -183,7 +207,15 @@ pub struct FireResult {
     pub reason: Option<String>,
 }
 
+pub(crate) const RETRY_AFTER_SECS: i64 = 5;
+const LIFECYCLE_BUSY: &str = "lifecycle_busy";
+const REARM_FAILED: &str = "rearm_failed";
+
 impl FireResult {
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self.reason.as_deref(), Some(LIFECYCLE_BUSY | REARM_FAILED))
+    }
+
     fn skipped(schedule_id: &str, reason: &str) -> Self {
         Self {
             fired: false,
@@ -297,12 +329,17 @@ pub fn arm_schedule_timer_at(
     if sched.state != "active" {
         return Ok(None);
     }
-    let ext_id = backend.schedule_one_shot(&sched.id, fire_at_ms)?;
-    if let Err(err) = store.set_schedule_external_timer_id(&sched.id, ext_id.as_deref()) {
-        eprintln!(
-            "anyagents-timer: failed to persist external_timer_id for {}: {err}",
-            sched.id
-        );
+    let intended_at = sched.next_fire_at_ms.unwrap_or(fire_at_ms);
+    let ext_id =
+        backend.schedule_slot(&sched.id, fire_at_ms, sched.next_fire_at_ms, intended_at)?;
+    if let Some(ref receipt) = ext_id {
+        let retained = store
+            .set_schedule_external_timer_id_for_slot(&sched.id, sched.next_fire_at_ms, receipt)
+            .map_err(|err| format!("persist timer receipt: {err}"))?;
+        if !retained {
+            backend.cancel(&sched.id, Some(receipt))?;
+            return Ok(None);
+        }
     }
     Ok(ext_id)
 }
@@ -347,73 +384,128 @@ pub fn fire_schedule_by_id(
     intended_at_ms: Option<i64>,
     now: i64,
 ) -> Result<FireResult, String> {
-    let clean_id = schedule_id.trim();
-    if clean_id.is_empty() {
+    let start = Instant::now();
+    let schedule_id = schedule_id.trim();
+    let Some(sched) = active_schedule(store, schedule_id)? else {
         return Ok(FireResult::skipped(schedule_id, "not_found_or_inactive"));
-    }
-    let Some(sched) = store
-        .get_schedule(clean_id)
-        .map_err(|err| format!("schedule lookup failed: {err}"))?
-    else {
-        return Ok(FireResult::skipped(clean_id, "not_found_or_inactive"));
     };
-    if sched.state != "active" {
-        return Ok(FireResult::skipped(&sched.id, "not_found_or_inactive"));
+    if !matches!(sched.kind.as_str(), "at" | "every" | "watch") {
+        return Ok(FireResult::skipped(schedule_id, "unsupported_kind"));
     }
-
+    if is_stale(&sched, intended_at_ms) {
+        return Ok(repair_stale_delivery(store, timer_backend, &sched, now));
+    }
+    let lifecycle = match store.try_lock_agent_lifecycle(&sched.agent_id) {
+        Ok(guard) => guard,
+        Err(err) => {
+            let delay = RETRY_AFTER_SECS * 1_000;
+            // Align concurrent submissions to the same replacement while keeping
+            // at least one backoff interval between deliveries.
+            let retry_at = now
+                .saturating_sub(now.rem_euclid(delay))
+                .saturating_add(2 * delay);
+            let intended = sched.next_fire_at_ms.or(intended_at_ms).unwrap_or(now);
+            if let Err(arm_err) = rearm::arm_slot(
+                store,
+                timer_backend,
+                &sched.id,
+                sched.next_fire_at_ms,
+                retry_at,
+                intended,
+                now,
+            ) {
+                eprintln!("Schedule {schedule_id} retry could not be armed: {arm_err}");
+            }
+            if !matches!(err, anyagents_core::Error::AgentBusy) {
+                eprintln!("Schedule {schedule_id} lifecycle lock unavailable: {err}");
+            }
+            return Ok(FireResult::skipped(schedule_id, LIFECYCLE_BUSY));
+        }
+    };
+    // A competing delivery can advance the slot before we acquire the lock.
+    let Some(fresh) = active_schedule(store, schedule_id)? else {
+        return Ok(FireResult::skipped(schedule_id, "not_found_or_inactive"));
+    };
+    if fresh.next_fire_at_ms != sched.next_fire_at_ms || is_stale(&fresh, intended_at_ms) {
+        drop(lifecycle);
+        return Ok(repair_stale_delivery(store, timer_backend, &fresh, now));
+    }
+    let sched = fresh;
     let owner = match store.agent(&sched.agent_id) {
         Ok(agent)
-            if agent.state == "archived"
-                || crate::server::is_explicitly_archived(store.data_dir(), &agent) =>
+            if agent.state != "archived"
+                && !crate::server::is_explicitly_archived(store.data_dir(), &agent) =>
         {
-            let _ = store.cancel_schedule(None, &sched.id);
-            return Ok(FireResult::skipped(&sched.id, "not_found_or_inactive"));
+            agent
         }
-        Ok(agent) => agent,
-        Err(anyagents_core::Error::AgentNotFound(_)) => {
+        Ok(_) | Err(anyagents_core::Error::AgentNotFound(_)) => {
             let _ = store.cancel_schedule(None, &sched.id);
-            return Ok(FireResult::skipped(&sched.id, "not_found_or_inactive"));
+            return Ok(FireResult::skipped(schedule_id, "not_found_or_inactive"));
         }
         Err(err) => return Err(format!("owner lookup failed: {err}")),
     };
+    let slot_now = now.max(intended_at_ms.unwrap_or(now));
+    let mut result = match sched.kind.as_str() {
+        "at" => fire_one_shot_at(store, &owner, &sched, now),
+        "every" => fire_recurring_every(store, &owner, &sched, now, slot_now),
+        "watch" => fire_single_watch(store, health, &owner, &sched, now, slot_now),
+        _ => unreachable!("schedule kind is immutable"),
+    }?;
+    drop(lifecycle);
 
-    match sched.kind.as_str() {
-        "at" => fire_one_shot_at(store, &owner, &sched, intended_at_ms, now),
-        "every" => fire_recurring_every(store, timer_backend, &owner, &sched, intended_at_ms, now),
-        "watch" => fire_single_watch(store, health, timer_backend, &owner, &sched, now),
-        _ => Ok(FireResult::skipped(&sched.id, "unsupported_kind")),
+    if let Some(next_due) = result.next_run_ms
+        && !rearm::rearm_after_claim(
+            store,
+            timer_backend,
+            schedule_id,
+            next_due,
+            now.saturating_add(start.elapsed().as_millis() as i64),
+        )
+    {
+        // Keep `fired` intact: the wake is already durable and still needs dispatch.
+        result.reason = Some(REARM_FAILED.to_string());
     }
+    Ok(result)
+}
+
+fn active_schedule(store: &Store, id: &str) -> Result<Option<AgentSchedule>, String> {
+    store
+        .get_schedule(id)
+        .map(|row| row.filter(|sched| sched.state == "active"))
+        .map_err(|err| format!("schedule lookup failed: {err}"))
+}
+
+fn is_stale(sched: &AgentSchedule, intended_at_ms: Option<i64>) -> bool {
+    // Accept catch-up deliveries while rejecting callbacks for older slots.
+    matches!((intended_at_ms, sched.next_fire_at_ms), (Some(intended), Some(due)) if intended < due)
+}
+
+fn repair_stale_delivery(
+    store: &Store,
+    backend: &dyn TimerBackend,
+    sched: &AgentSchedule,
+    now: i64,
+) -> FireResult {
+    let mut result = FireResult::skipped(&sched.id, "stale_slot");
+    // A redelivery after a committed claim may repair its missing arm, but must
+    // never claim the new tick. Remote claims clear the previous slot's receipt.
+    if backend.is_remote()
+        && sched.external_timer_id.is_none()
+        && let Some(due) = sched.next_fire_at_ms
+        && !rearm::rearm_after_claim(store, backend, &sched.id, due, now)
+    {
+        result.reason = Some(REARM_FAILED.to_string());
+    }
+    result
 }
 
 fn fire_one_shot_at(
     store: &Store,
     owner: &Agent,
     sched: &AgentSchedule,
-    intended_at_ms: Option<i64>,
     now: i64,
 ) -> Result<FireResult, String> {
     let expected_due = sched.next_fire_at_ms;
-    // Reject triggers from earlier slots while allowing overdue catch-up triggers
-    // whose scheduled `intended_at_ms` is `>= expected_due`.
-    if let (Some(intended), Some(stored)) = (intended_at_ms, expected_due)
-        && intended < stored
-    {
-        return Ok(FireResult::skipped(&sched.id, "stale_slot"));
-    }
-
-    let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&owner.id) else {
-        return Ok(FireResult::skipped(&sched.id, "lifecycle_busy"));
-    };
-    let fresh_owner = store
-        .agent(&owner.id)
-        .map_err(|err| format!("owner reload failed: {err}"))?;
-    if fresh_owner.state == "archived"
-        || crate::server::is_explicitly_archived(store.data_dir(), &fresh_owner)
-    {
-        let _ = store.cancel_schedule(None, &sched.id);
-        return Ok(FireResult::skipped(&sched.id, "not_found_or_inactive"));
-    }
-
     let slot_ts = expected_due.unwrap_or(now);
     let source_key = format!("schedule:{}:{slot_ts}", sched.id);
     let delivered = store
@@ -425,7 +517,7 @@ fn fire_one_shot_at(
             Some(now),
             None,
             Some("fired"),
-            &fresh_owner.id,
+            &owner.id,
             Incoming {
                 text: sched.prompt.clone(),
                 sender: Some(format!("schedule:{}", sched.id)),
@@ -442,14 +534,13 @@ fn fire_one_shot_at(
     if !delivered {
         return Ok(FireResult::skipped(&sched.id, "already_claimed"));
     }
-    let _ = store.set_schedule_external_timer_id(&sched.id, None);
-    crate::create::poke_agent_wake_socket(store.data_dir(), &fresh_owner.id);
-    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &fresh_owner.id);
+    crate::create::poke_agent_wake_socket(store.data_dir(), &owner.id);
+    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &owner.id);
 
     Ok(FireResult {
         fired: true,
         schedule_id: sched.id.clone(),
-        agent_id: Some(fresh_owner.id.as_str().to_string()),
+        agent_id: Some(owner.id.as_str().to_string()),
         next_run_ms: None,
         reason: None,
     })
@@ -457,22 +548,15 @@ fn fire_one_shot_at(
 
 fn fire_recurring_every(
     store: &Store,
-    timer_backend: &dyn TimerBackend,
     owner: &Agent,
     sched: &AgentSchedule,
-    intended_at_ms: Option<i64>,
     now: i64,
+    slot_now: i64,
 ) -> Result<FireResult, String> {
     let expected_due = sched.next_fire_at_ms;
-    if let (Some(intended), Some(stored)) = (intended_at_ms, expected_due)
-        && intended < stored
-    {
-        return Ok(FireResult::skipped(&sched.id, "stale_slot"));
-    }
-
     let due = expected_due.unwrap_or(now);
     let interval = sched.interval_ms.unwrap_or(60_000).max(1);
-    let fire_ref_ms = now.max(due);
+    let fire_ref_ms = slot_now.max(due);
     let next_due = Store::next_recurring_fire_ms(
         &sched.id,
         sched.agent_id.as_str(),
@@ -507,7 +591,6 @@ fn fire_recurring_every(
         if !claimed {
             return Ok(FireResult::skipped(&sched.id, "already_claimed"));
         }
-        rearm_after_claim(store, timer_backend, &sched.id, next_due);
         return Ok(FireResult {
             fired: false,
             schedule_id: sched.id.clone(),
@@ -515,19 +598,6 @@ fn fire_recurring_every(
             next_run_ms: next_due,
             reason: Some("coalesced".to_string()),
         });
-    }
-
-    let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&owner.id) else {
-        return Ok(FireResult::skipped(&sched.id, "lifecycle_busy"));
-    };
-    let fresh_owner = store
-        .agent(&owner.id)
-        .map_err(|err| format!("owner reload failed: {err}"))?;
-    if fresh_owner.state == "archived"
-        || crate::server::is_explicitly_archived(store.data_dir(), &fresh_owner)
-    {
-        let _ = store.cancel_schedule(None, &sched.id);
-        return Ok(FireResult::skipped(&sched.id, "not_found_or_inactive"));
     }
 
     let source_key = format!("schedule:{}:{due}", sched.id);
@@ -540,7 +610,7 @@ fn fire_recurring_every(
             Some(now),
             None,
             Some("fired"),
-            &fresh_owner.id,
+            &owner.id,
             Incoming {
                 text: sched.prompt.clone(),
                 sender: Some(sender),
@@ -558,14 +628,13 @@ fn fire_recurring_every(
         return Ok(FireResult::skipped(&sched.id, "already_claimed"));
     }
 
-    crate::create::poke_agent_wake_socket(store.data_dir(), &fresh_owner.id);
-    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &fresh_owner.id);
-    rearm_after_claim(store, timer_backend, &sched.id, next_due);
+    crate::create::poke_agent_wake_socket(store.data_dir(), &owner.id);
+    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &owner.id);
 
     Ok(FireResult {
         fired: true,
         schedule_id: sched.id.clone(),
-        agent_id: Some(fresh_owner.id.as_str().to_string()),
+        agent_id: Some(owner.id.as_str().to_string()),
         next_run_ms: next_due,
         reason: None,
     })
@@ -574,26 +643,44 @@ fn fire_recurring_every(
 fn fire_single_watch(
     store: &Store,
     health: &HealthBoard,
-    timer_backend: &dyn TimerBackend,
     owner: &Agent,
     sched: &AgentSchedule,
     now: i64,
+    slot_now: i64,
 ) -> Result<FireResult, String> {
     let (eff_health, _) =
         crate::server::serverless_watches::effective_health_with_remote_turns(store, health, now);
-    let (fired, next_probe_ms) =
-        crate::schedule::evaluate_single_watch_schedule(store, &eff_health, sched, now);
-    let still_active = store
-        .get_schedule(&sched.id)
-        .ok()
-        .flatten()
-        .is_some_and(|s| s.state == "active");
-    let next_run_ms = if still_active {
-        next_probe_ms.filter(|&ts| ts < i64::MAX)
-    } else {
-        None
+    let (fired, next_probe_ms) = crate::schedule::evaluate_locked_watch_schedule(
+        store,
+        &eff_health,
+        owner,
+        sched,
+        now,
+        slot_now,
+    );
+    let next_run_ms = match next_probe_ms {
+        Some(next) if fired => {
+            // A non-terminal wake advances the probe in the mailbox claim.
+            active_schedule(store, &sched.id)?
+                .and_then(|row| (row.next_fire_at_ms == Some(next)).then_some(next))
+        }
+        Some(next) => {
+            let next = next.max(slot_now.saturating_add(1));
+            store
+                .claim_schedule_tick(
+                    &sched.id,
+                    sched.next_fire_at_ms,
+                    "active",
+                    Some(next),
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|err| format!("advance watch probe: {err}"))?
+                .then_some(next)
+        }
+        None => None,
     };
-    rearm_after_claim(store, timer_backend, &sched.id, next_run_ms);
     Ok(FireResult {
         fired,
         schedule_id: sched.id.clone(),
@@ -601,28 +688,6 @@ fn fire_single_watch(
         next_run_ms,
         reason: (!fired).then(|| "watch_pending".to_string()),
     })
-}
-
-fn rearm_after_claim(
-    store: &Store,
-    timer_backend: &dyn TimerBackend,
-    schedule_id: &str,
-    next_due: Option<i64>,
-) {
-    if let Some(next_ms) = next_due {
-        match timer_backend.schedule_one_shot(schedule_id, next_ms) {
-            Ok(ext_id) => {
-                let _ = store.set_schedule_external_timer_id(schedule_id, ext_id.as_deref());
-            }
-            Err(err) => {
-                eprintln!(
-                    "anyagents-timer: failed to re-arm schedule {schedule_id} at {next_ms}: {err}"
-                );
-            }
-        }
-    } else {
-        let _ = store.set_schedule_external_timer_id(schedule_id, None);
-    }
 }
 
 #[cfg(test)]
@@ -910,3 +975,6 @@ mod tests {
         assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod retry_tests;

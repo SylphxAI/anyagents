@@ -20,7 +20,7 @@
     "crates/anyagents/src/repo.rs": 2743,
     "crates/anyagents/src/sandbox_exec.rs": 3087,
     "crates/anyagents/src/sandbox_providers/sylphx.rs": 2471,
-    "crates/anyagents/src/schedule.rs": 2341,
+    "crates/anyagents/src/schedule.rs": 2136,
     "crates/anyagents/src/seat_tree.rs": 1938,
     "crates/anyagents/src/server/admin_auth.rs": 1572,
     "crates/anyagents/src/server/serverless.rs": 3338,

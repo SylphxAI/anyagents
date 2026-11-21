@@ -386,7 +386,7 @@ impl Store {
         })
     }
 
-    /// Attach a startup timer receipt only if the schedule still owns the slot
+    /// Attach a timer receipt only if the schedule still owns the slot
     /// that was read before contacting the scheduler.
     pub fn set_schedule_external_timer_id_for_slot(
         &self,
@@ -658,43 +658,33 @@ fn claim_schedule_tick_on(
     watch_baseline: Option<&str>,
     last_observed: Option<&str>,
 ) -> Result<bool, Error> {
-    let updated = match expected_next_fire_at_ms {
-        Some(expected) => conn.db_execute(
-            "UPDATE agent_schedules
-                 SET state = ?3,
-                     next_fire_at_ms = ?4,
-                     last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
-                     watch_baseline = COALESCE(?6, watch_baseline),
-                     last_observed = COALESCE(?7, last_observed)
-                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
-            &db_params![
-                id,
-                expected,
-                new_state,
-                new_next_fire_at_ms,
-                fired_at_ms,
-                watch_baseline,
-                last_observed
-            ],
-        )?,
-        None => conn.db_execute(
-            "UPDATE agent_schedules
-                 SET state = ?2,
-                     next_fire_at_ms = ?3,
-                     last_fired_at_ms = COALESCE(?4, last_fired_at_ms),
-                     watch_baseline = COALESCE(?5, watch_baseline),
-                     last_observed = COALESCE(?6, last_observed)
-                 WHERE id = ?1 AND state = 'active'",
-            &db_params![
-                id,
-                new_state,
-                new_next_fire_at_ms,
-                fired_at_ms,
-                watch_baseline,
-                last_observed
-            ],
-        )?,
+    let eq = if conn.backend() == DbBackend::Postgres {
+        "IS NOT DISTINCT FROM"
+    } else {
+        "IS"
     };
+    let updated = conn.db_execute(
+        &format!(
+            "UPDATE agent_schedules
+             SET state = ?3,
+                 next_fire_at_ms = ?4,
+                 last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
+                 watch_baseline = COALESCE(?6, watch_baseline),
+                 last_observed = COALESCE(?7, last_observed),
+                 external_timer_id = CASE WHEN ?3 = 'active' AND next_fire_at_ms {eq} ?4
+                     THEN external_timer_id ELSE NULL END
+             WHERE id = ?1 AND state = 'active' AND next_fire_at_ms {eq} ?2"
+        ),
+        &db_params![
+            id,
+            expected_next_fire_at_ms,
+            new_state,
+            new_next_fire_at_ms,
+            fired_at_ms,
+            watch_baseline,
+            last_observed
+        ],
+    )?;
     Ok(updated == 1)
 }
 

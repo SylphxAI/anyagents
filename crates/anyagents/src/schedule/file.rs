@@ -68,19 +68,28 @@ pub(super) fn evaluate(
     sched: &AgentSchedule,
     path: &str,
     now: i64,
+    locked_owner: Option<&anyagents_core::Agent>,
 ) -> (WatchEval, bool) {
     let pending =
         |observed: &str| WatchEval::pending(sched.watch_baseline.clone(), Some(observed.into()));
-    let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&sched.agent_id) else {
-        return (
-            WatchEval::pending(sched.watch_baseline.clone(), sched.last_observed.clone()),
-            false,
-        );
+    let (_lifecycle, loaded);
+    let agent = if let Some(owner) = locked_owner {
+        owner
+    } else {
+        let Ok(lock) = store.try_lock_agent_lifecycle(&sched.agent_id) else {
+            return (
+                WatchEval::pending(sched.watch_baseline.clone(), sched.last_observed.clone()),
+                false,
+            );
+        };
+        _lifecycle = lock;
+        let Ok(owner) = store.agent(&sched.agent_id) else {
+            return (pending("owner_unavailable"), false);
+        };
+        loaded = owner;
+        &loaded
     };
-    let Ok(agent) = store.agent(&sched.agent_id) else {
-        return (pending("owner_unavailable"), false);
-    };
-    match agent.runtime {
+    match &agent.runtime {
         ExecutionRuntime::Local if !sandbox_baseline(sched) => {
             let current = local_fingerprint(path);
             (compare(sched.watch_baseline.as_deref(), current), true)

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_core::{AgentId, constant_time_eq, now_ms, verify_hmac_sha256_signature};
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -456,7 +456,7 @@ async fn execute_admitted_fire(
     state: AppState,
     schedule_id: String,
     intended_at_ms: Option<i64>,
-) -> Result<Json<crate::timer::FireResult>, ApiError> {
+) -> Result<Response, ApiError> {
     if super::serverless_maintenance::is_system_timer_id(&schedule_id) {
         let result = super::serverless_maintenance::fire_system_timer(
             Arc::clone(&state.store),
@@ -465,7 +465,7 @@ async fn execute_admitted_fire(
         )
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-        return Ok(Json(result));
+        return Ok(Json(result).into_response());
     }
 
     let store = Arc::clone(&state.store);
@@ -497,7 +497,19 @@ async fn execute_admitted_fire(
         .await;
     }
 
-    Ok(Json(result))
+    if result.is_retryable() {
+        Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::RETRY_AFTER,
+                crate::timer::RETRY_AFTER_SECS.to_string(),
+            )],
+            Json(result),
+        )
+            .into_response())
+    } else {
+        Ok(Json(result).into_response())
+    }
 }
 
 /// `POST /v1/internal/fire/{id}`: authenticate via Ed25519 JWKS or shared token,
@@ -555,6 +567,10 @@ mod tests {
     }
 
     impl TimerBackend for RecordingTimerBackend {
+        fn is_remote(&self) -> bool {
+            true
+        }
+
         fn schedule_one_shot(
             &self,
             schedule_id: &str,
@@ -637,6 +653,84 @@ mod tests {
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
             timer_backend,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn internal_fire_busy_returns_retry_after_and_replays_are_idempotent() {
+        use crate::timer::retry_tests::due_schedule;
+
+        let _env = crate::server::tests::env_lock();
+        let _restore = EnvRestore::capture(&["ANYAGENTS_TIMER_TOKEN", "ANYAGENTS_SERVERLESS"]);
+        unsafe {
+            std::env::set_var("ANYAGENTS_TIMER_TOKEN", "test-token");
+            std::env::remove_var("ANYAGENTS_SERVERLESS");
+        }
+        for kind in ["at", "every", "watch"] {
+            let dir = crate::test_tempdir();
+            let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+            let owner = store
+                .create_agent(NewAgent::new("fixture", "test"))
+                .unwrap();
+            let due = now_ms() - 1;
+            let sched = due_schedule(&store, &owner, kind, due);
+            let recorder = Arc::new(RecordingTimerBackend::default());
+            let app = super::super::build_public_router(test_state(
+                Arc::clone(&store),
+                dir.path(),
+                Arc::clone(&recorder) as Arc<dyn TimerBackend>,
+            ));
+            let fire = |intended| {
+                app.clone().oneshot(
+                    Request::post("/v1/internal/fire")
+                        .header("x-anyagents-timer-token", "test-token")
+                        .body(Body::from(
+                            json!({"input": {"schedule_id": sched.id, "intended_at_ms": intended}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+            };
+            let decode = |response: Response| async move {
+                serde_json::from_slice::<Value>(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            };
+            let lock = store.try_lock_agent_lifecycle(&owner.id).unwrap();
+            let response = fire(due).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{kind}");
+            assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+            let body = decode(response).await;
+            assert_eq!(body["reason"], "lifecycle_busy");
+            assert_eq!(body["fired"], false);
+            assert_eq!(body["schedule_id"], sched.id);
+            assert_eq!(
+                store
+                    .get_schedule(&sched.id)
+                    .unwrap()
+                    .unwrap()
+                    .next_fire_at_ms,
+                sched.next_fire_at_ms
+            );
+            assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+            {
+                let submitted = recorder.scheduled.lock().unwrap();
+                assert_eq!(submitted.len(), 1);
+                assert_eq!(submitted[0].0, sched.id);
+                assert!(submitted[0].1 >= due + 5_000);
+            }
+            drop(lock);
+            let response = fire(due).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(decode(response).await["fired"], true, "{kind}");
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            store.mark_delivered_up_to(&owner.id, inbox[0].seq).unwrap();
+            let replay = fire(due).await.unwrap();
+            assert_eq!(replay.status(), StatusCode::OK);
+            assert_eq!(decode(replay).await["fired"], false);
+            assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1, "{kind}");
         }
     }
 
