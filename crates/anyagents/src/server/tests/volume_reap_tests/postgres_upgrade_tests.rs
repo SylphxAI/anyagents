@@ -90,7 +90,7 @@ fn seed(url: &str, baseline: i64) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_startup_repairs_archive_verdict_on_fresh_and_upgraded_databases() {
     let Ok(admin_url) = std::env::var("ANYAGENTS_ARCHIVE_UPGRADE_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL archive upgrade: dedicated test URL unset");
