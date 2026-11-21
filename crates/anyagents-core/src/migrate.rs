@@ -107,6 +107,7 @@ pub const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
         REPAIR_ARCHIVE_DISPOSITION,
         include_str!("../migrations/050_repair_archive_disposition.sql"),
     ),
+    (50, include_str!("../migrations/051_takeover_links.sql")),
 ];
 
 pub const SQLITE_LATEST_VERSION: i64 = SQLITE_MIGRATIONS[SQLITE_MIGRATIONS.len() - 1].0;

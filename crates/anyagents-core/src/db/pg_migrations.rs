@@ -56,6 +56,10 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         17,
         include_str!("../../migrations_pg/017_sandbox_takeover.sql"),
     ),
+    (
+        18,
+        include_str!("../../migrations_pg/018_takeover_links.sql"),
+    ),
 ];
 
 #[cfg(test)]

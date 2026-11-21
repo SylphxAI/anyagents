@@ -125,7 +125,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .merge(oidc_bearer::discovery_router())
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::public_router())
-        .merge(takeover_tunnel::router())
+        .merge(takeover_tunnel::router(false))
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route)
@@ -162,7 +162,7 @@ fn build_webhook_router(state: AppState) -> Router {
     .merge(oidc_bearer::discovery_router())
     .merge(channels_groups::webhook_router())
     .merge(webhooks_mcp::local_router())
-    .merge(takeover_tunnel::router())
+    .merge(takeover_tunnel::router(expose_console))
     .route(
         "/v1/internal/guest/events",
         post(serverless::guest_events_route)
@@ -212,7 +212,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/webhooks/healthz", get(ops::webhook_healthz))
         .merge(channels_groups::webhook_router())
         .merge(webhooks_mcp::local_router())
-        .merge(takeover_tunnel::router())
+        .merge(takeover_tunnel::router(true))
         .route(
             "/v1/internal/guest/events",
             post(serverless::guest_events_route)

@@ -39,7 +39,7 @@ use base64::Engine as _;
 use futures::{SinkExt, Stream, StreamExt};
 use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
 use crate::auth::{Principal, is_valid_takeover_session_id};
 
@@ -49,8 +49,12 @@ use super::types::AppState;
 
 mod guest_frames;
 mod lease;
+mod proxy;
+mod recovery;
+mod viewer;
 use guest_frames::{handle_guest_binary_frame, handle_guest_control_frame};
 use lease::{ENDED, EXPIRED, LeasePin, RegisterError};
+use proxy::{proxy_viewer_http, proxy_viewer_ws};
 
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 pub(crate) const DEFAULT_RECONNECT_GRACE: Duration = Duration::from_secs(15);
@@ -249,12 +253,16 @@ struct PendingWs {
 
 struct TakeoverSession {
     owner: TunnelOwner,
+    store: Weak<Store>,
+    created: Instant,
     token: String,
     public_origin: String,
     public_base_url: String,
     cookie_path: String,
     secure_cookie: bool,
     pin: Option<LeasePin>,
+    control: Mutex<bool>,
+    returned: watch::Sender<bool>,
     conn: RwLock<TunnelConnState>,
     reconnect_notify: Notify,
     next_req_id: AtomicU64,
@@ -380,6 +388,9 @@ impl TakeoverRegistry {
             if !constant_time_eq(existing.token.as_bytes(), token.as_bytes()) {
                 return Err(("UNAUTHORIZED", "takeover token mismatch on reconnect", 4401));
             }
+            if *existing.returned.borrow() {
+                return Err(ENDED);
+            }
             if let Some(pin) = &existing.pin {
                 pin.check().await?;
             }
@@ -400,15 +411,21 @@ impl TakeoverRegistry {
                 4429,
             ));
         }
-        let pin = LeasePin::register(store, &owner, session_id, &token, reconnect).await?;
+        let pin =
+            LeasePin::register(Arc::clone(&store), &owner, session_id, &token, reconnect).await?;
+        recovery::remember_link(&store, &owner, session_id, &token, pin.as_ref()).await;
         let entry = Arc::new(TakeoverSession {
             owner,
+            store: Arc::downgrade(&store),
+            created: Instant::now(),
             token,
             public_origin: public.origin,
             public_base_url: public.base_url,
             cookie_path: public.cookie_path,
             secure_cookie: public.secure,
             pin,
+            control: Mutex::new(false),
+            returned: watch::channel(false).0,
             conn: RwLock::new(TunnelConnState {
                 generation: 1,
                 tx: Some(tx),
@@ -450,6 +467,9 @@ impl TakeoverRegistry {
         conn.tx = None;
         conn.disconnected_at = None;
         entry.reconnect_notify.notify_waiters();
+        if matches!(entry.owner, TunnelOwner::Agent(_)) {
+            recovery::end_link(entry.store.upgrade(), session_id, &entry.token).await;
+        }
         sessions.remove(session_id);
     }
 }
@@ -504,12 +524,17 @@ fn install_test_registry(store: &Arc<Store>, registry: Arc<TakeoverRegistry>) {
 
 /// Mount both the authenticated guest reverse-tunnel endpoint and the public
 /// token-authenticated takeover viewer routes.
-pub(super) fn router() -> Router<AppState> {
+pub(super) fn router(console_available: bool) -> Router<AppState> {
     Router::new()
         .route("/v1/takeover/{session_id}/tunnel", get(tunnel_ws_route))
         .route("/takeover/{session_id}", any(viewer_no_slash_route))
         .route("/takeover/{session_id}/", any(viewer_root_route))
         .route("/takeover/{session_id}/{*rest}", any(viewer_subpath_route))
+        .merge(recovery::router())
+        .merge(viewer::router())
+        .layer(axum::Extension(recovery::ConsoleAvailable(
+            console_available,
+        )))
 }
 
 #[derive(Clone, Debug)]
@@ -755,10 +780,15 @@ async fn run_guest_tunnel(
         }
     };
     tokio::pin!(expiry);
+    let mut returned = entry.returned.subscribe();
     let mut unregistered = false;
     let mut terminal = None;
     loop {
         tokio::select! {
+            _ = async { drop(returned.wait_for(|value| *value).await); } => {
+                unregistered = true;
+                break;
+            }
             _ = &mut expiry => {
                 terminal = Some(EXPIRED);
                 break;
@@ -941,11 +971,17 @@ async fn resolve_and_auth_viewer(
     let session = registry.get_active(session_id).await.ok_or(not_found)?;
     let auth = authenticate_viewer(session_id, &session.token, headers, uri)
         .ok_or((StatusCode::UNAUTHORIZED, "valid takeover token required"))?;
+    if *session.returned.borrow() {
+        return Err(not_found);
+    }
     if let Some(pin) = &session.pin {
         match pin.check().await {
             Ok(()) => {}
             Err(EXPIRED) => return Err((StatusCode::GONE, "takeover lease expired")),
-            Err(ENDED) => return Err(not_found),
+            Err(ENDED) => {
+                recovery::end_link(session.store.upgrade(), session_id, &session.token).await;
+                return Err(not_found);
+            }
             Err(_) => {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -968,7 +1004,18 @@ async fn viewer_no_slash_route(
     let (_, session, mint_cookie) =
         match resolve_and_auth_viewer(&state, &session_id, req.headers(), req.uri()).await {
             Ok(v) => v,
-            Err((st, msg)) => return json_error_response(st, msg),
+            Err(error) => {
+                return recovery::viewer_error(
+                    &state,
+                    &session_id,
+                    req.method(),
+                    req.headers(),
+                    req.uri(),
+                    error,
+                    req.extensions().get().copied().unwrap_or_default(),
+                )
+                .await;
+            }
         };
     let mut location = session.cookie_path.clone();
     if let Some(q) = req.uri().query().filter(|q| !q.is_empty()) {
@@ -1064,6 +1111,18 @@ async fn handle_viewer_request(
     let (registry, session, mint_cookie) =
         match resolve_and_auth_viewer(&state, &session_id, &parts.headers, &parts.uri).await {
             Ok(v) => v,
+            Err(error) if subpath == "/" => {
+                return recovery::viewer_error(
+                    &state,
+                    &session_id,
+                    &parts.method,
+                    &parts.headers,
+                    &parts.uri,
+                    error,
+                    parts.extensions.get().copied().unwrap_or_default(),
+                )
+                .await;
+            }
             Err((st, msg)) => return json_error_response(st, msg),
         };
     if !check_viewer_origin(&parts.headers, &session) {
@@ -1072,13 +1131,32 @@ async fn handle_viewer_request(
             "cross-origin takeover request denied",
         );
     }
+    let root_document = parts.method == axum::http::Method::GET
+        && subpath == "/"
+        && matches!(session.owner, TunnelOwner::Agent(_));
+    // Keep ownership changes ordered with the Coordinator handback action;
+    // never hold this lock for a streaming RFB or SSE request.
+    let _control = if parts.method == axum::http::Method::POST
+        && matches!(subpath.as_str(), "/take" | "/release")
+    {
+        let guard = session.control.lock().await;
+        if *guard {
+            return recovery::no_store(json_error_response(
+                StatusCode::GONE,
+                "desktop handed back",
+            ));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let query = parts.uri.query().map(str::to_string);
     let headers = filter_viewer_request_headers(&parts.headers);
     if let Ok(ws_upgrade) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         return proxy_viewer_ws(
             ws_upgrade,
             registry,
-            session,
+            session.clone(),
             subpath,
             query,
             headers,
@@ -1091,7 +1169,7 @@ async fn handle_viewer_request(
         .flatten();
     let response = proxy_viewer_http(
         registry,
-        session,
+        session.clone(),
         parts.method.as_str().to_string(),
         subpath,
         query,
@@ -1100,955 +1178,14 @@ async fn handle_viewer_request(
         mint_cookie,
     )
     .await;
+    let response = if root_document {
+        viewer::add_controls(response).await
+    } else {
+        response
+    };
     // Dropping the event body on shutdown also cancels the guest request.
     Stopping::close_event_stream(response, stop_events)
 }
 
-fn try_send_control(tunnel_tx: &mpsc::Sender<OutboundTunnelMsg>, frame: &ControlFrame) {
-    if let Ok(msg) = OutboundTunnelMsg::control(frame) {
-        let _ = tunnel_tx.try_send(msg);
-    }
-}
-
-async fn send_control_or_err(
-    tunnel_tx: &mpsc::Sender<OutboundTunnelMsg>,
-    frame: &ControlFrame,
-) -> Result<(), (StatusCode, &'static str)> {
-    let msg = OutboundTunnelMsg::control(frame)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed encoding frame"))?;
-    tunnel_tx
-        .send(msg)
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "takeover tunnel disconnected"))
-}
-
-async fn proxy_viewer_ws(
-    mut ws_upgrade: WebSocketUpgrade,
-    registry: Arc<TakeoverRegistry>,
-    session: Arc<TakeoverSession>,
-    path: String,
-    query: Option<String>,
-    headers: Vec<(String, String)>,
-    mint_cookie: Option<HeaderValue>,
-) -> Response {
-    let (generation, tunnel_tx) = match session.wait_for_tunnel(registry.grace_window).await {
-        Ok(pair) => pair,
-        Err(status) => return json_error_response(status, "takeover tunnel is unavailable"),
-    };
-    let protocols: Vec<String> = ws_upgrade
-        .requested_protocols()
-        .filter_map(|v| v.to_str().ok().map(str::trim).filter(|s| !s.is_empty()))
-        .map(str::to_string)
-        .collect();
-    let stream_id = session.next_ws_id.fetch_add(1, Ordering::Relaxed);
-    let (opened_tx, opened_rx) = oneshot::channel();
-    let (viewer_tx, viewer_rx) = mpsc::channel(VIEWER_WS_QUEUE);
-    session.inflight_ws.lock().await.insert(
-        stream_id,
-        PendingWs {
-            generation,
-            opened_tx: Some(opened_tx),
-            viewer_tx,
-        },
-    );
-
-    let open = ControlFrame::WsOpen {
-        id: stream_id,
-        path,
-        query,
-        protocols,
-        headers,
-    };
-    if let Err((st, msg)) = send_control_or_err(&tunnel_tx, &open).await {
-        session.inflight_ws.lock().await.remove(&stream_id);
-        return json_error_response(st, msg);
-    }
-    let opened = match tokio::time::timeout(WS_OPEN_TIMEOUT, opened_rx).await {
-        Ok(Ok(res)) if res.ok => res,
-        Ok(Ok(res)) => {
-            session.inflight_ws.lock().await.remove(&stream_id);
-            let msg = res.error.unwrap_or_else(|| "upstream ws rejected".into());
-            return json_error_response(StatusCode::BAD_GATEWAY, &msg);
-        }
-        Ok(Err(_)) => {
-            session.inflight_ws.lock().await.remove(&stream_id);
-            return json_error_response(StatusCode::BAD_GATEWAY, "tunnel closed during ws open");
-        }
-        Err(_) => {
-            session.inflight_ws.lock().await.remove(&stream_id);
-            try_send_control(
-                &tunnel_tx,
-                &ControlFrame::WsClose {
-                    id: stream_id,
-                    code: None,
-                    reason: None,
-                },
-            );
-            return json_error_response(StatusCode::GATEWAY_TIMEOUT, "upstream ws open timed out");
-        }
-    };
-    if let Some(proto) = opened.protocol
-        && let Ok(val) = HeaderValue::from_str(&proto)
-    {
-        ws_upgrade.set_selected_protocol(val);
-    }
-
-    let keepalive = registry.keepalive_interval;
-    let (fail_session, fail_tx) = (Arc::clone(&session), tunnel_tx.clone());
-    let mut resp = ws_upgrade
-        .max_message_size(MAX_TUNNEL_FRAME_BYTES)
-        .max_frame_size(MAX_HTTP_RESP_BYTES)
-        .on_failed_upgrade(move |_| {
-            tokio::spawn(async move {
-                fail_session.inflight_ws.lock().await.remove(&stream_id);
-                try_send_control(
-                    &fail_tx,
-                    &ControlFrame::WsClose {
-                        id: stream_id,
-                        code: None,
-                        reason: None,
-                    },
-                );
-            });
-        })
-        .on_upgrade(move |sock| {
-            pump_viewer_ws(sock, session, tunnel_tx, stream_id, viewer_rx, keepalive)
-        });
-    if let Some(cookie) = mint_cookie {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
-    }
-    resp
-}
-
-async fn pump_viewer_ws(
-    socket: WebSocket,
-    session: Arc<TakeoverSession>,
-    tunnel_tx: mpsc::Sender<OutboundTunnelMsg>,
-    stream_id: u64,
-    mut viewer_rx: mpsc::Receiver<ViewerWsMsg>,
-    keepalive_interval: Duration,
-) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let mut ping = tokio::time::interval_at(
-        tokio::time::Instant::now() + keepalive_interval,
-        keepalive_interval,
-    );
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = ping.tick() => {
-                if ws_tx.send(Message::Ping(Bytes::from_static(b"keepalive"))).await.is_err() { break; }
-            }
-            from_guest = viewer_rx.recv() => match from_guest {
-                Some(ViewerWsMsg::Binary(b)) => if ws_tx.send(Message::Binary(b)).await.is_err() { break; },
-                Some(ViewerWsMsg::Text(t)) => if ws_tx.send(Message::Text(t.into())).await.is_err() { break; },
-                Some(ViewerWsMsg::Close(cf)) => { let _ = ws_tx.send(Message::Close(cf)).await; break; }
-                None => { let _ = ws_tx.send(Message::Close(None)).await; break; }
-            },
-            from_viewer = ws_rx.next() => match from_viewer {
-                Some(Ok(Message::Binary(b))) => {
-                    if b.len() > MAX_HTTP_RESP_BYTES || tunnel_tx.send(OutboundTunnelMsg::ws_binary(stream_id, &b)).await.is_err() { break; }
-                }
-                Some(Ok(Message::Text(t))) => {
-                    let frame = ControlFrame::WsText { id: stream_id, text: t.to_string() };
-                    if t.len() > MAX_HTTP_RESP_BYTES || send_control_or_err(&tunnel_tx, &frame).await.is_err() { break; }
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(cf))) => {
-                    let (code, reason) = cf.map(|c| (Some(c.code), Some(c.reason.to_string()))).unwrap_or((None, None));
-                    try_send_control(&tunnel_tx, &ControlFrame::WsClose { id: stream_id, code, reason });
-                    break;
-                }
-                Some(Err(_)) | None => {
-                    try_send_control(&tunnel_tx, &ControlFrame::WsClose { id: stream_id, code: None, reason: None });
-                    break;
-                }
-            }
-        }
-    }
-    session.inflight_ws.lock().await.remove(&stream_id);
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn proxy_viewer_http(
-    registry: Arc<TakeoverRegistry>,
-    session: Arc<TakeoverSession>,
-    method: String,
-    path: String,
-    query: Option<String>,
-    headers: Vec<(String, String)>,
-    body: Body,
-    mint_cookie: Option<HeaderValue>,
-) -> Response {
-    let Ok(collected) = http_body_util::Limited::new(body, MAX_HTTP_REQ_BODY_BYTES)
-        .collect()
-        .await
-    else {
-        return json_error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body exceeds 16 MiB limit",
-        );
-    };
-    let body_bytes = collected.to_bytes();
-    let (generation, tunnel_tx) = match session.wait_for_tunnel(registry.grace_window).await {
-        Ok(pair) => pair,
-        Err(status) => return json_error_response(status, "takeover tunnel is unavailable"),
-    };
-
-    let req_id = session.next_req_id.fetch_add(1, Ordering::Relaxed);
-    let (head_tx, head_rx) = oneshot::channel();
-    let (body_tx, body_rx) = mpsc::channel(HTTP_CHUNK_QUEUE);
-    session.inflight_http.lock().await.insert(
-        req_id,
-        PendingHttp {
-            generation,
-            head_tx: Some(head_tx),
-            body_tx,
-            is_sse: false,
-            bytes_received: 0,
-        },
-    );
-
-    let req = ControlFrame::HttpRequest {
-        id: req_id,
-        method,
-        path,
-        query,
-        headers,
-        body_b64: if body_bytes.is_empty() {
-            String::new()
-        } else {
-            base64::engine::general_purpose::STANDARD.encode(&body_bytes)
-        },
-    };
-    if let Err((st, msg)) = send_control_or_err(&tunnel_tx, &req).await {
-        session.inflight_http.lock().await.remove(&req_id);
-        return json_error_response(st, msg);
-    }
-
-    let head = match tokio::time::timeout(HTTP_HEAD_TIMEOUT, head_rx).await {
-        Ok(Ok(head)) => head,
-        Ok(Err(_)) => {
-            session.inflight_http.lock().await.remove(&req_id);
-            return json_error_response(
-                StatusCode::BAD_GATEWAY,
-                "tunnel closed before upstream response",
-            );
-        }
-        Err(_) => {
-            session.inflight_http.lock().await.remove(&req_id);
-            try_send_control(&tunnel_tx, &ControlFrame::HttpCancel { id: req_id });
-            return json_error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream takeover response timed out",
-            );
-        }
-    };
-
-    let mut is_sse = false;
-    let mut rb = Response::builder()
-        .status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
-    for (k, v) in head.headers {
-        let lower = k.to_ascii_lowercase();
-        if is_hop_by_hop(&lower) || (!head.done && lower == "content-length") {
-            continue;
-        }
-        is_sse |=
-            lower == "content-type" && v.to_ascii_lowercase().starts_with("text/event-stream");
-        if let (Ok(n), Ok(val)) = (
-            HeaderName::from_bytes(lower.as_bytes()),
-            HeaderValue::from_str(&v),
-        ) {
-            rb = rb.header(n, val);
-        }
-    }
-    if is_sse {
-        rb = rb.header("x-accel-buffering", "no");
-    }
-    let response_body = if head.done {
-        session.inflight_http.lock().await.remove(&req_id);
-        Body::empty()
-    } else {
-        Body::from_stream(TunneledHttpBody {
-            rx: body_rx,
-            session: Arc::clone(&session),
-            tunnel_tx,
-            req_id,
-            finished: false,
-        })
-    };
-    let mut resp = rb
-        .body(response_body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    if let Some(cookie) = mint_cookie {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
-    }
-    resp
-}
-
-struct TunneledHttpBody {
-    rx: mpsc::Receiver<Result<Bytes, String>>,
-    session: Arc<TakeoverSession>,
-    tunnel_tx: mpsc::Sender<OutboundTunnelMsg>,
-    req_id: u64,
-    finished: bool,
-}
-
-impl Stream for TunneledHttpBody {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
-            Poll::Ready(Some(Err(err))) => {
-                self.finished = true;
-                Poll::Ready(Some(Err(std::io::Error::other(err))))
-            }
-            Poll::Ready(None) => {
-                self.finished = true;
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for TunneledHttpBody {
-    fn drop(&mut self) {
-        if !self.finished {
-            try_send_control(
-                &self.tunnel_tx,
-                &ControlFrame::HttpCancel { id: self.req_id },
-            );
-            let (session, req_id) = (Arc::clone(&self.session), self.req_id);
-            tokio::spawn(async move {
-                session.inflight_http.lock().await.remove(&req_id);
-            });
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use anyagents_core::{ExecutionRuntime, NewAgent};
-    use anyagents_installer::{CommandRunner, InstallError, LineSink};
-    use anyagents_supervisor::HealthBoard;
-    use tokio_tungstenite::tungstenite::Message as ClientWsMsg;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-
-    struct NoopRunner;
-    impl CommandRunner for NoopRunner {
-        fn run(
-            &mut self,
-            _: &str,
-            _: &[String],
-            _: &std::path::Path,
-            _: &[(&str, &str)],
-            _: &mut dyn LineSink,
-        ) -> Result<(), InstallError> {
-            Ok(())
-        }
-    }
-
-    struct TestFixture {
-        _dir: tempfile::TempDir,
-        addr: std::net::SocketAddr,
-        agent_a_token: String,
-        agent_b_token: String,
-        server_task: tokio::task::JoinHandle<()>,
-        stopping: tokio::sync::watch::Sender<bool>,
-    }
-
-    impl Drop for TestFixture {
-        fn drop(&mut self) {
-            self.server_task.abort();
-        }
-    }
-
-    async fn start_fixture(grace: Duration, keepalive: Duration) -> TestFixture {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        let a = store
-            .create_agent(
-                NewAgent::new("agent-a", "claude-code")
-                    .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
-            )
-            .unwrap();
-        let b = store
-            .create_agent(
-                NewAgent::new("agent-b", "claude-code")
-                    .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
-            )
-            .unwrap();
-        let tok_a = store.begin_remote_session(&a.id, 60_000).unwrap().token;
-        let tok_b = store.begin_remote_session(&b.id, 60_000).unwrap().token;
-        let reg = Arc::new(TakeoverRegistry::with_tunables(grace, keepalive));
-        install_test_registry(&store, reg);
-
-        let state = AppState {
-            store,
-            health: HealthBoard::default(),
-            sign_in: Arc::new(StdMutex::new(NoopRunner)),
-            auth: crate::auth::Mode::Confined {
-                operator_digest: Some(crate::auth::operator_digest("op-test-secret")),
-            },
-            identity: Arc::new(crate::identity::ServingIdentity::capture()),
-            profiles: Default::default(),
-            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
-        };
-        use crate::server::{bootstrap, in_flight};
-        let (stopping, _) = tokio::sync::watch::channel(false);
-        let app = in_flight::listener(crate::server::build_public_router(state), &stopping);
-        let stop = bootstrap::stopped(&stopping);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(stop)
-                .await
-                .unwrap();
-        });
-        TestFixture {
-            _dir: dir,
-            addr,
-            agent_a_token: tok_a,
-            agent_b_token: tok_b,
-            server_task,
-            stopping,
-        }
-    }
-
-    async fn dial_guest(
-        addr: std::net::SocketAddr,
-        session_id: &str,
-        agent_token: &str,
-    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
-    {
-        let url = format!("ws://{addr}/v1/takeover/{session_id}/tunnel");
-        let mut req = url.into_client_request().unwrap();
-        req.headers_mut().insert(
-            crate::operator::AGENT_HEADER,
-            HeaderValue::from_str(agent_token).unwrap(),
-        );
-        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        ws
-    }
-
-    async fn http_call(
-        addr: std::net::SocketAddr,
-        method: &str,
-        path_and_query: &str,
-        headers: &[(&str, &str)],
-        body: &str,
-    ) -> (u16, HeaderMap, Vec<u8>) {
-        use hyper_util::rt::TokioIo;
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        let mut builder = hyper::Request::builder()
-            .method(method)
-            .uri(path_and_query)
-            .header("host", addr.to_string());
-        for (k, v) in headers {
-            builder = builder.header(*k, *v);
-        }
-        let req = builder
-            .body(http_body_util::Full::new(Bytes::from(
-                body.as_bytes().to_vec(),
-            )))
-            .unwrap();
-        let resp = sender.send_request(req).await.unwrap();
-        let status = resp.status().as_u16();
-        let resp_headers = resp.headers().clone();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec();
-        (status, resp_headers, bytes)
-    }
-
-    fn spawn_mock_guest_pump(
-        ws: tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        generation_tag: &'static str,
-    ) -> (oneshot::Sender<bool>, tokio::task::JoinHandle<()>) {
-        let (stop_tx, mut stop_rx) = oneshot::channel::<bool>();
-        let handle = tokio::spawn(async move {
-            let (mut tx, mut rx) = ws.split();
-            loop {
-                tokio::select! {
-                    stop_clean = &mut stop_rx => {
-                        if stop_clean.unwrap_or(false) {
-                            let txt = serde_json::to_string(&ControlFrame::Unregister).unwrap();
-                            let _ = tx.send(ClientWsMsg::Text(txt.into())).await;
-                        }
-                        let _ = tx.close().await;
-                        break;
-                    }
-                    msg = rx.next() => match msg {
-                        Some(Ok(ClientWsMsg::Text(txt))) => {
-                            let Ok(frame) = serde_json::from_str::<ControlFrame>(&txt) else { continue; };
-                            match frame {
-                                ControlFrame::HttpRequest { id, path, .. } => {
-                                    let body = format!("ok:{generation_tag}:{path}");
-                                    let head = ControlFrame::HttpResponseHead {
-                                        id,
-                                        status: 200,
-                                        headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
-                                        done: false,
-                                    };
-                                    tx.send(ClientWsMsg::Text(serde_json::to_string(&head).unwrap().into())).await.unwrap();
-                                    let chunk = encode_binary_frame(BIN_TAG_HTTP_CHUNK, id, body.as_bytes());
-                                    tx.send(ClientWsMsg::Binary(chunk)).await.unwrap();
-                                    let end = ControlFrame::HttpResponseEnd { id, error: None };
-                                    tx.send(ClientWsMsg::Text(serde_json::to_string(&end).unwrap().into())).await.unwrap();
-                                }
-                                ControlFrame::WsOpen { id, protocols, .. } => {
-                                    let chosen = protocols.into_iter().find(|p| p == "binary");
-                                    let opened = ControlFrame::WsOpened { id, ok: true, protocol: chosen, error: None };
-                                    tx.send(ClientWsMsg::Text(serde_json::to_string(&opened).unwrap().into())).await.unwrap();
-                                    let banner = encode_binary_frame(BIN_TAG_WS_DATA, id, b"RFB 003.008\n");
-                                    tx.send(ClientWsMsg::Binary(banner)).await.unwrap();
-                                }
-                                ControlFrame::WsText { id, text } => {
-                                    let reply = ControlFrame::WsText { id, text: format!("echo:{generation_tag}:{text}") };
-                                    tx.send(ClientWsMsg::Text(serde_json::to_string(&reply).unwrap().into())).await.unwrap();
-                                }
-                                _ => {}
-                            }
-                        }
-                        Some(Ok(ClientWsMsg::Binary(raw))) => {
-                            if let Some((BIN_TAG_WS_DATA, id, payload)) = decode_binary_frame(&raw) {
-                                let mut echoed = b"bin:".to_vec();
-                                echoed.extend_from_slice(&payload);
-                                let frame = encode_binary_frame(BIN_TAG_WS_DATA, id, &echoed);
-                                tx.send(ClientWsMsg::Binary(frame)).await.unwrap();
-                            }
-                        }
-                        Some(Ok(ClientWsMsg::Ping(p))) => { let _ = tx.send(ClientWsMsg::Pong(p)).await; }
-                        Some(Ok(ClientWsMsg::Pong(_))) => {}
-                        _ => break,
-                    }
-                }
-            }
-        });
-        (stop_tx, handle)
-    }
-
-    #[tokio::test]
-    async fn takeover_events_end_cleanly_on_shutdown_and_cancel_the_guest_subscription() {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            use hyper_util::rt::TokioIo;
-            let mut fx = start_fixture(Duration::from_secs(5), Duration::from_secs(25)).await;
-            let session_id = "tk_shutdown_test";
-            let token = "event-stream-fixture-token";
-            let mut guest = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
-            let register = ControlFrame::Register {
-                token: token.into(),
-                reconnect: false,
-                agent_id: None,
-                local_origin: None,
-            };
-            async fn next_control(
-                guest: &mut tokio_tungstenite::WebSocketStream<
-                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                >,
-            ) -> ControlFrame {
-                loop {
-                    if let ClientWsMsg::Text(text) = guest.next().await.unwrap().unwrap() {
-                        return serde_json::from_str(&text).unwrap();
-                    }
-                }
-            }
-            guest.send(ClientWsMsg::Text(serde_json::to_string(&register).unwrap().into())).await.unwrap();
-            assert!(matches!(next_control(&mut guest).await, ControlFrame::Registered { .. }));
-
-            let socket = tokio::net::TcpStream::connect(fx.addr).await.unwrap();
-            let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket)).await.unwrap();
-            tokio::spawn(async move { conn.await.unwrap() });
-            let request = hyper::Request::get(format!("/takeover/{session_id}/events?token={token}"))
-                .header(header::HOST, fx.addr.to_string())
-                .body(http_body_util::Empty::<Bytes>::new()).unwrap();
-            let request = tokio::spawn(async move { client.send_request(request).await.unwrap() });
-            let ControlFrame::HttpRequest { id, path, .. } = next_control(&mut guest).await else {
-                panic!("expected proxy request");
-            };
-            assert_eq!(path, "/events");
-            let head = ControlFrame::HttpResponseHead {
-                id,
-                status: 200,
-                headers: vec![("content-type".into(), "text/event-stream; charset=utf-8".into())],
-                done: false,
-            };
-            guest.send(ClientWsMsg::Text(serde_json::to_string(&head).unwrap().into())).await.unwrap();
-            let event = b"data: ready\n\n";
-            guest.send(ClientWsMsg::Binary(encode_binary_frame(BIN_TAG_HTTP_CHUNK, id, event))).await.unwrap();
-            let mut response = request.await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let first = response.body_mut().frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(first.as_ref(), event);
-
-            // The upstream intentionally never sends HttpResponseEnd.
-            fx.stopping.send_replace(true);
-            assert!(response.into_body().collect().await.unwrap().to_bytes().is_empty());
-            assert!(matches!(next_control(&mut guest).await, ControlFrame::HttpCancel { id: canceled } if canceled == id));
-            (&mut fx.server_task).await.unwrap();
-        }).await.expect("open SSE stream prevented shutdown");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)]
-    async fn takeover_tunnel_auth_cookie_ws_relay_hijack_reconnect_and_teardown() {
-        let _env = crate::server::tests::env_lock();
-        let prev_pub = std::env::var_os("ANYAGENTS_PUBLIC_URL");
-        unsafe {
-            std::env::remove_var("ANYAGENTS_PUBLIC_URL");
-        }
-        let fx = start_fixture(Duration::from_secs(5), Duration::from_secs(25)).await;
-        let session_id = "tk_e2e_session_01";
-        let takeover_token = "tok_secret_takeover_987654321";
-
-        // 1. Unknown session returns 404.
-        let (st, _, _) = http_call(fx.addr, "GET", "/takeover/tk_missing/?token=x", &[], "").await;
-        assert_eq!(st, 404);
-
-        // 2. Register guest tunnel as agent A.
-        let mut guest_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
-        let reg = serde_json::to_string(&ControlFrame::Register {
-            token: takeover_token.into(),
-            reconnect: false,
-            agent_id: None,
-            local_origin: Some("http://127.0.0.1:6080".into()),
-        })
-        .unwrap();
-        guest_ws.send(ClientWsMsg::Text(reg.into())).await.unwrap();
-        let ack_txt = match guest_ws.next().await.unwrap().unwrap() {
-            ClientWsMsg::Text(t) => t,
-            other => panic!("expected Registered text frame, got {other:?}"),
-        };
-        let ControlFrame::Registered {
-            public_base_url,
-            public_url,
-            session_id: ack_sid,
-            ttl_ms: None,
-        } = serde_json::from_str(&ack_txt).unwrap()
-        else {
-            panic!("expected Registered frame: {ack_txt}");
-        };
-        assert_eq!(ack_sid, session_id);
-        assert_eq!(
-            public_base_url,
-            format!("http://{}/takeover/{session_id}/", fx.addr)
-        );
-        assert_eq!(
-            public_url,
-            format!(
-                "http://{}/takeover/{session_id}/?token={takeover_token}",
-                fx.addr
-            )
-        );
-        let (stop_g1, task_g1) = spawn_mock_guest_pump(guest_ws, "gen1");
-
-        // 3. Missing or invalid token fails closed with 401.
-        let (st, _, _) =
-            http_call(fx.addr, "GET", &format!("/takeover/{session_id}/"), &[], "").await;
-        assert_eq!(st, 401);
-        let (st, _, _) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/?token=wrong_token"),
-            &[],
-            "",
-        )
-        .await;
-        assert_eq!(st, 401);
-
-        // 4. No trailing slash redirects 302 to `/takeover/{id}/?token=...` and mints cookie.
-        let (st, hdrs, _) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}?token={takeover_token}"),
-            &[],
-            "",
-        )
-        .await;
-        assert_eq!(st, 302);
-        assert_eq!(
-            hdrs.get(header::LOCATION).unwrap().to_str().unwrap(),
-            format!("/takeover/{session_id}/?token={takeover_token}")
-        );
-
-        // 5. Valid `?token=` fetches HTML over tunnel and mints scoped HttpOnly cookie.
-        let (st, hdrs, body) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/?token={takeover_token}"),
-            &[],
-            "",
-        )
-        .await;
-        assert_eq!(st, 200);
-        assert_eq!(String::from_utf8(body).unwrap(), "ok:gen1:/");
-        let set_cookie = hdrs
-            .get(header::SET_COOKIE)
-            .expect("Set-Cookie minted")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            set_cookie.contains(&format!("anyagents_takeover_{session_id}={takeover_token}"))
-                && set_cookie.contains(&format!("Path=/takeover/{session_id}/"))
-                && set_cookie.contains("HttpOnly")
-                && set_cookie.contains("SameSite=Lax"),
-            "{set_cookie}"
-        );
-        let cookie_pair = set_cookie.split(';').next().unwrap();
-
-        // 6. Sub-resource request authenticated solely by scoped cookie (no query token) succeeds.
-        let (st, _, body) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/app.js"),
-            &[("cookie", cookie_pair)],
-            "",
-        )
-        .await;
-        assert_eq!(st, 200);
-        assert_eq!(String::from_utf8(body).unwrap(), "ok:gen1:/app.js");
-
-        // 7. Cross-origin request is rejected with 403.
-        let (st, _, _) = http_call(
-            fx.addr,
-            "POST",
-            &format!("/takeover/{session_id}/take"),
-            &[("cookie", cookie_pair), ("origin", "https://evil.example")],
-            "",
-        )
-        .await;
-        assert_eq!(st, 403);
-
-        // 8. Viewer WebSocket upgrade (cookie auth + `binary` subprotocol) relays binary & text frames.
-        let mut viewer_req = format!("ws://{}/takeover/{session_id}/ws", fx.addr)
-            .into_client_request()
-            .unwrap();
-        viewer_req
-            .headers_mut()
-            .insert(header::COOKIE, HeaderValue::from_str(cookie_pair).unwrap());
-        viewer_req.headers_mut().insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("binary"),
-        );
-        let (mut viewer_ws, ws_resp) = tokio_tungstenite::connect_async(viewer_req).await.unwrap();
-        assert_eq!(
-            ws_resp
-                .headers()
-                .get(header::SEC_WEBSOCKET_PROTOCOL)
-                .and_then(|v| v.to_str().ok()),
-            Some("binary")
-        );
-        assert_eq!(
-            viewer_ws
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_data()
-                .as_ref(),
-            b"RFB 003.008\n"
-        );
-        viewer_ws
-            .send(ClientWsMsg::Binary(Bytes::from_static(b"\x04key")))
-            .await
-            .unwrap();
-        assert_eq!(
-            viewer_ws
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_data()
-                .as_ref(),
-            b"bin:\x04key"
-        );
-        viewer_ws
-            .send(ClientWsMsg::Text("hello-ws".into()))
-            .await
-            .unwrap();
-        assert_eq!(
-            viewer_ws
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_text()
-                .unwrap(),
-            "echo:gen1:hello-ws"
-        );
-        let _ = viewer_ws.close(None).await;
-
-        // 9. Hijack attempt by agent B (even knowing the takeover token) fails closed.
-        let mut attacker_ws = dial_guest(fx.addr, session_id, &fx.agent_b_token).await;
-        let hijack_reg = serde_json::to_string(&ControlFrame::Register {
-            token: takeover_token.into(),
-            reconnect: false,
-            agent_id: None,
-            local_origin: None,
-        })
-        .unwrap();
-        attacker_ws
-            .send(ClientWsMsg::Text(hijack_reg.into()))
-            .await
-            .unwrap();
-        let err_txt = attacker_ws
-            .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        let ControlFrame::Error { code, .. } = serde_json::from_str(&err_txt).unwrap() else {
-            panic!("expected Error frame: {err_txt}");
-        };
-        assert_eq!(code, "FORBIDDEN");
-
-        // 10. Same agent A with wrong takeover token fails closed on reconnect.
-        let mut wrong_tok_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
-        let bad_reg = serde_json::to_string(&ControlFrame::Register {
-            token: "wrong_tok".into(),
-            reconnect: false,
-            agent_id: None,
-            local_origin: None,
-        })
-        .unwrap();
-        wrong_tok_ws
-            .send(ClientWsMsg::Text(bad_reg.into()))
-            .await
-            .unwrap();
-        let err_txt = wrong_tok_ws
-            .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        let ControlFrame::Error { code, .. } = serde_json::from_str(&err_txt).unwrap() else {
-            panic!("expected Error frame: {err_txt}");
-        };
-        assert_eq!(code, "UNAUTHORIZED");
-
-        // 11. Unexpected tunnel drop enters grace window; agent A re-attaches with same id + token.
-        let _ = stop_g1.send(false);
-        let _ = task_g1.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let mut guest_ws2 = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
-        let reg2 = serde_json::to_string(&ControlFrame::Register {
-            token: takeover_token.into(),
-            reconnect: true,
-            agent_id: None,
-            local_origin: None,
-        })
-        .unwrap();
-        guest_ws2
-            .send(ClientWsMsg::Text(reg2.into()))
-            .await
-            .unwrap();
-        let ack2 = guest_ws2
-            .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        assert!(matches!(
-            serde_json::from_str::<ControlFrame>(&ack2).unwrap(),
-            ControlFrame::Registered { .. }
-        ));
-        let (stop_g2, task_g2) = spawn_mock_guest_pump(guest_ws2, "gen2");
-
-        let (st, _, body) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/state"),
-            &[("cookie", cookie_pair)],
-            "",
-        )
-        .await;
-        assert_eq!(st, 200);
-        assert_eq!(String::from_utf8(body).unwrap(), "ok:gen2:/state");
-
-        // 12. Explicit Unregister tears down the session immediately (404).
-        let _ = stop_g2.send(true);
-        let _ = task_g2.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let (st, _, _) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/?token={takeover_token}"),
-            &[],
-            "",
-        )
-        .await;
-        assert_eq!(st, 404);
-
-        if let Some(v) = prev_pub {
-            unsafe {
-                std::env::set_var("ANYAGENTS_PUBLIC_URL", v);
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)]
-    async fn tunnel_sends_keepalive_pings_and_evicts_after_grace_window() {
-        let _env = crate::server::tests::env_lock();
-        let fx = start_fixture(Duration::from_millis(250), Duration::from_millis(80)).await;
-        let session_id = "tk_keepalive_grace";
-        let token = "tok_keepalive_123456";
-
-        let mut guest_ws = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
-        let reg = serde_json::to_string(&ControlFrame::Register {
-            token: token.into(),
-            reconnect: false,
-            agent_id: None,
-            local_origin: None,
-        })
-        .unwrap();
-        guest_ws.send(ClientWsMsg::Text(reg.into())).await.unwrap();
-        let _ = guest_ws.next().await.unwrap().unwrap();
-
-        let ping_seen = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(Ok(msg)) = guest_ws.next().await {
-                if matches!(msg, ClientWsMsg::Ping(_)) {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .unwrap();
-        assert!(ping_seen, "expected keepalive Ping frame on guest tunnel");
-
-        drop(guest_ws);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let (st, _, _) = http_call(
-            fx.addr,
-            "GET",
-            &format!("/takeover/{session_id}/?token={token}"),
-            &[],
-            "",
-        )
-        .await;
-        assert_eq!(st, 404);
-    }
-}
+mod tests;
