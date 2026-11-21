@@ -8,6 +8,7 @@ pub const UNIVERSAL_MCP_TOOLS: &[&str] = &[
     "send",
     "report_bug",
     "inbox",
+    "ingress_guard",
     "conversation",
     "memory",
     "schedules",

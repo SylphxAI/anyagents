@@ -636,6 +636,7 @@ async fn mcp_tools_use_the_server_socket() {
             "send",
             "report_bug",
             "inbox",
+            "ingress_guard",
             "conversation",
             "memory",
             "schedules",

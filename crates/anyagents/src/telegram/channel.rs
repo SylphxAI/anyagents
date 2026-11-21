@@ -12,6 +12,8 @@
 
 #[path = "channel/chat_admin.rs"]
 pub(crate) mod chat_admin;
+#[path = "channel/ingress_guard.rs"]
+pub(crate) mod ingress_guard;
 #[path = "channel/transport.rs"]
 mod transport;
 
@@ -22,9 +24,9 @@ use transport::{api_error, call_api, call_api_multipart};
 use anyagents_channel_telegram::{
     BotCall, CallerAllowlist, ManagedBotEvent, MediaAttachment, Memory, Poll, Routed, bot_identity,
     delete_message, deliver_to_mailbox, edit_message_text, file_path_of, format_checklist_markdown,
-    get_file, get_managed_bot_token, get_me, managed_bot_token_of, pin_chat_message,
-    replace_managed_bot_token, send_checklist, send_location, send_media_ref, send_message,
-    send_poll, sent_message_id, set_message_reaction, stop_poll, unpin_chat_message,
+    get_file, get_managed_bot_token, get_me, incoming_message, managed_bot_token_of,
+    pin_chat_message, replace_managed_bot_token, send_checklist, send_location, send_media_ref,
+    send_message, send_poll, sent_message_id, set_message_reaction, stop_poll, unpin_chat_message,
 };
 use anyagents_core::{Channel, CredentialStore, Store, StoreCredentialStore};
 
@@ -724,7 +726,7 @@ pub fn receive_webhook(
     channel_id: &str,
     secret_header: Option<&str>,
     payload: &serde_json::Value,
-) -> Result<(), WebhookError> {
+) -> Result<Vec<anyagents_core::AgentId>, WebhookError> {
     let channel = store
         .list_channels()
         .map_err(|err| WebhookError::Store(err.to_string()))?
@@ -766,7 +768,7 @@ pub fn receive_webhook(
         &body,
         "getUpdates",
     )
-    .map_err(|err| WebhookError::BadRequest(err.to_string()))
+    .map_err(|err| WebhookError::Store(err.to_string()))
 }
 
 fn poll_channel(
@@ -824,6 +826,7 @@ fn poll_channel(
         &body,
         "getUpdates",
     )
+    .map(|_| ())
 }
 
 fn caller_allowlist(channel: &Channel) -> CallerAllowlist {
@@ -840,13 +843,13 @@ fn ingest_updates(
     memory: &mut Memory,
     body: &str,
     method: &str,
-) -> Result<(), anyagents_core::Error> {
+) -> Result<Vec<anyagents_core::AgentId>, anyagents_core::Error> {
     let Some(channel) = store
         .list_channels()?
         .into_iter()
         .find(|c| c.id == channel.id)
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     {
         let fresh_mem = Memory::try_from_state(&channel.state)?;
@@ -880,13 +883,16 @@ fn ingest_updates(
             memory.offset = poll.offset.max(memory.offset);
             save_channel_memory_merged(store, &channel.id, memory, &[])?;
         }
-        return Ok(());
+        return Ok(Vec::new());
     }
     let own_bots = known_bot_identities(store, memory.bot.as_deref())?;
+    let authority = ingress_guard::Authority::load()?;
+    let mut delivered = std::collections::HashSet::new();
     let mut grew = false;
     let mut removed_chats: Vec<i64> = Vec::new();
     let mut removed_pending: Vec<String> = Vec::new();
     for mut one in routed {
+        let mut sender = None;
         // This bot answers in the chat its update came from, so a post it makes
         // there reaches the other agents on that chat.
         if let Routed::ToAgent { inbound, .. } = &mut one {
@@ -973,6 +979,17 @@ fn ingest_updates(
             {
                 continue;
             }
+            sender = ingress_guard::admit(
+                store,
+                agent_id,
+                &authority,
+                inbound.sender_id,
+                inbound.chat_id,
+                ingress_guard::chat_type(&inbound.chat_type),
+            )?;
+            if sender.is_none() && !is_group {
+                continue;
+            }
             if !inbound.media.is_empty() {
                 let downloaded =
                     download_inbound_media(store, token, &channel.id, agent_id, &inbound.media);
@@ -1012,59 +1029,48 @@ fn ingest_updates(
             update_id,
             chat_id,
             chat_type,
+            sender_id,
             joined,
             ..
         } = &one
         {
             invalidate_membership_cache(*chat_id);
-            if *joined {
+            let (text, source) = if *joined {
                 removed_chats.retain(|&id| id != *chat_id);
                 memory.attach_typed(agent_id.as_str(), *chat_id, chat_type.as_deref());
-                store.receive(
-                    agent_id,
-                    anyagents_core::Incoming {
-                        text: format!("[Added to group chat {chat_id}]"),
-                        sender: Some(format!("telegram:chat:{chat_id}")),
-                        source_time_ms: None,
-                        source_key: Some(format!(
-                            "tg-member-in:{}:{}:{}",
-                            chat_id, agent_id, update_id
-                        )),
-                        reply_to: Some(format!("telegram:chat:{chat_id}")),
-                        quote: None,
-                        origin: Some(anyagents_core::Origin {
-                            chat_id: Some(*chat_id),
-                            thread_id: None,
-                            message_id: None,
-                        }),
-                        received_at_ms: None,
-                    },
-                )?;
+                (format!("[Added to group chat {chat_id}]"), "tg-member-in")
             } else {
                 memory.chats.retain(|link| link.chat_id != *chat_id);
                 removed_chats.push(*chat_id);
-                store.receive(
-                    agent_id,
-                    anyagents_core::Incoming {
-                        text: format!("[Removed from group chat {chat_id}]"),
-                        sender: Some(format!("telegram:chat:{chat_id}")),
-                        source_time_ms: None,
-                        source_key: Some(format!(
-                            "tg-member-out:{}:{}:{}",
-                            chat_id, agent_id, update_id
-                        )),
-                        reply_to: None,
-                        quote: None,
-                        origin: Some(anyagents_core::Origin {
-                            chat_id: Some(*chat_id),
-                            thread_id: None,
-                            message_id: None,
-                        }),
-                        received_at_ms: None,
-                    },
-                )?;
+                (
+                    format!("[Removed from group chat {chat_id}]"),
+                    "tg-member-out",
+                )
+            };
+            if let Some(identity) = ingress_guard::admit(
+                store,
+                agent_id,
+                &authority,
+                *sender_id,
+                *chat_id,
+                ingress_guard::chat_type(chat_type.as_deref().unwrap_or_default()),
+            )? {
+                let mut incoming = anyagents_core::Incoming::new(text);
+                incoming.sender = sender_id
+                    .map(|id| format!("telegram:user:{id}:"))
+                    .or_else(|| Some(format!("telegram:chat:{chat_id}")));
+                incoming.source_key = Some(format!("{source}:{chat_id}:{agent_id}:{update_id}"));
+                incoming.reply_to = Some(format!("telegram:chat:{chat_id}"));
+                incoming.origin = Some(anyagents_core::Origin {
+                    chat_id: Some(*chat_id),
+                    thread_id: None,
+                    message_id: None,
+                });
+                store.receive_external(agent_id, incoming, &identity)?;
+                delivered.insert(agent_id.clone());
             }
             grew = true;
+            continue;
         }
         if let Routed::ManagedBot { event, .. } = &one {
             handle_managed_bot_event(
@@ -1079,12 +1085,20 @@ fn ingest_updates(
             grew = true;
             continue;
         }
-        let peers = peer_ids(store, &poll, &one, agent_id.as_str())?;
-        deliver_to_mailbox(store, &one, &peers)?;
-        if let Routed::ToAgent { inbound, .. } = &one
-            && (inbound.chat_type == "group" || inbound.chat_type == "supergroup")
-        {
-            relay_inbound_to_group_peers(store, agent_id, inbound)?;
+        if let Routed::ToAgent { inbound, .. } = &one {
+            if let Some(identity) = sender {
+                store.receive_external(agent_id, incoming_message(inbound), &identity)?;
+                delivered.insert(agent_id.clone());
+            }
+            if matches!(inbound.chat_type.as_str(), "group" | "supergroup") {
+                delivered.extend(relay_inbound_to_group_peers(
+                    store, agent_id, inbound, &authority,
+                )?);
+            }
+        } else {
+            let peers = peer_ids(store, &poll, &one, agent_id.as_str())?;
+            deliver_to_mailbox(store, &one, &peers)?;
+            delivered.extend(peers.into_iter().map(|(agent, _)| agent));
         }
     }
     // The offset and the chats are saved only once the updates are stored, so a
@@ -1099,7 +1113,7 @@ fn ingest_updates(
             &removed_pending,
         )?;
     }
-    Ok(())
+    Ok(delivered.into_iter().collect())
 }
 
 fn known_bot_identities(
@@ -1406,31 +1420,33 @@ fn relay_inbound_to_group_peers(
     store: &Store,
     receiver_id: &anyagents_core::AgentId,
     inbound: &anyagents_channel_telegram::Inbound,
-) -> Result<(), anyagents_core::Error> {
+    authority: &ingress_guard::Authority,
+) -> Result<Vec<anyagents_core::AgentId>, anyagents_core::Error> {
+    let mut delivered = Vec::new();
     for peer in telegram_chat_agents(store, inbound.chat_id, Some(inbound.sender_id))? {
         if &peer.id == receiver_id || peer.state == "archived" || peer.state == "paused" {
             continue;
         }
-        let incoming = anyagents_core::Incoming {
-            text: inbound.text.clone(),
-            sender: anyagents_channel_telegram::telegram_sender(inbound),
-            source_time_ms: Some(inbound.source_time_s * 1000),
-            source_key: Some(format!(
-                "tg-in:{}:{}:{}",
-                inbound.chat_id, receiver_id, inbound.message_id
-            )),
-            reply_to: Some(anyagents_channel_telegram::reply_target(inbound)),
-            quote: inbound.quote.clone(),
-            origin: Some(anyagents_core::Origin {
-                chat_id: Some(inbound.chat_id),
-                thread_id: inbound.thread_id,
-                message_id: Some(inbound.message_id),
-            }),
-            received_at_ms: None,
+        let Some(identity) = ingress_guard::admit(
+            store,
+            &peer.id,
+            authority,
+            inbound.sender_id,
+            inbound.chat_id,
+            ingress_guard::chat_type(&inbound.chat_type),
+        )?
+        else {
+            continue;
         };
-        store.receive(&peer.id, incoming)?;
+        let mut incoming = incoming_message(inbound);
+        incoming.source_key = Some(format!(
+            "tg-in:{}:{}:{}",
+            inbound.chat_id, receiver_id, inbound.message_id
+        ));
+        store.receive_external(&peer.id, incoming, &identity)?;
+        delivered.push(peer.id);
     }
-    Ok(())
+    Ok(delivered)
 }
 
 /// Whether this bot is in the chat, asked of Telegram at cold start. A chat

@@ -113,7 +113,7 @@ fn secret_aad(name: &str) -> String {
     format!("deployment_secrets:v1:{name}")
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -123,7 +123,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn hex_decode(input: &str) -> Result<Vec<u8>, Error> {
+pub(crate) fn hex_decode(input: &str) -> Result<Vec<u8>, Error> {
     let bytes = input.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return Err(Error::Message(

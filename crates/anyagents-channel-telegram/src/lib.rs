@@ -134,6 +134,7 @@ pub enum Routed {
         agent: String,
         chat_id: i64,
         chat_type: Option<String>,
+        sender_id: Option<i64>,
         joined: bool,
     },
     /// A subordinate bot managed by this bot was created or had its token updated (Bot API 9.6+).
@@ -1172,6 +1173,7 @@ impl Poll {
                     agent: agent.to_string(),
                     chat_id: member.chat.id,
                     chat_type: Some(member.chat.kind.clone()),
+                    sender_id: user,
                     joined,
                 });
                 continue;
@@ -2705,7 +2707,7 @@ pub fn deliver_to_mailbox(
         Routed::Membership { .. } | Routed::ManagedBot { .. } => Ok(()),
         Routed::ToAgent { agent, inbound } => {
             let agent_id = anyagents_core::AgentId::parse(agent)?;
-            store.receive(&agent_id, incoming_from(inbound))?;
+            store.receive(&agent_id, incoming_message(inbound))?;
             Ok(())
         }
         Routed::EchoToPeers {
@@ -2739,7 +2741,7 @@ pub fn deliver_to_mailbox(
 
 /// The mailbox row for one inbound message: the reply target is the message
 /// itself, so a bare reply goes to the chat and, in a forum, to its topic.
-fn incoming_from(inbound: &Inbound) -> anyagents_core::Incoming {
+pub fn incoming_message(inbound: &Inbound) -> anyagents_core::Incoming {
     anyagents_core::Incoming {
         text: inbound.text.clone(),
         sender: telegram_sender(inbound),

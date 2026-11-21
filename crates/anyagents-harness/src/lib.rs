@@ -93,6 +93,11 @@ pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
     }
     out.push_str(&open_tag);
     out.push('\n');
+    if let Some(header) = context.sender_awareness.as_deref() {
+        out.push_str("<sender_context>\n");
+        out.push_str(header);
+        out.push_str("\n</sender_context>\n");
+    }
     if let Some(q) = quoted_xml {
         out.push_str(&q);
         out.push('\n');
@@ -179,6 +184,9 @@ pub struct Context {
     /// Structural relationship of the sender to the recipient (`parent`, `sibling`, `child`, `peer`, `external_user`, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_rel: Option<String>,
+    /// Canonical sender awareness from authenticated channel metadata, not the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_awareness: Option<String>,
     /// The recipient agent (`agent:<name>`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,

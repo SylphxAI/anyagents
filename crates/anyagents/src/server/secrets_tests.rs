@@ -91,6 +91,75 @@ async fn send_json(
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn sandbox_target_api_is_operator_only_and_keeps_billing_secrets_off_read_surfaces() {
+    let _env = crate::server::tests::env_lock();
+    let _restore = EnvRestore::capture(&[MASTER_KEY_ENV]);
+    // SAFETY: shared test environment lock is held.
+    unsafe { std::env::set_var(MASTER_KEY_ENV, TEST_MASTER_KEY) };
+    let (dir, store, app) = make_confined_app();
+    let agent = store
+        .create_agent(NewAgent::new("fixture", "codex"))
+        .unwrap();
+    let capability = store.issue_capability(&agent.id).unwrap();
+    let operator = Some((crate::operator::HEADER, TEST_OPERATOR_TOKEN));
+    let agent_auth = Some((crate::operator::AGENT_HEADER, capability.as_str()));
+    let token = "fixture-billing-bearer";
+    let credential_path = "/v1/sandbox-credentials/example";
+    let target_path = "/v1/agents/fixture/sandbox-target";
+    let credential = json!({"token": token, "parent": "orgs/sample/projects/sample/envs/test"});
+    for (method, path, body) in [
+        ("PUT", credential_path, Some(credential.clone())),
+        ("DELETE", credential_path, None),
+        (
+            "PUT",
+            "/v1/sandbox-profiles/example",
+            Some(json!({"credential":"example"})),
+        ),
+        ("PUT", target_path, Some(json!({"credential":"example"}))),
+        ("GET", target_path, None),
+    ] {
+        let (status, raw, _) = send_json(&app, method, path, agent_auth, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {raw}");
+        assert!(!raw.contains(token));
+    }
+    for (path, body) in [
+        (credential_path, credential),
+        (
+            "/v1/sandbox-profiles/example",
+            json!({"credential":"example"}),
+        ),
+        (target_path, json!({"profile":"example"})),
+    ] {
+        let (status, raw, _) = send_json(&app, "PUT", path, operator, Some(body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{path}: {raw}");
+        assert!(raw.is_empty());
+    }
+    let (status, raw, body) = send_json(&app, "GET", target_path, operator, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"credential":"example", "source":"profile"}));
+    assert!(!raw.contains(token));
+    let (status, raw, _) = send_json(&app, "GET", "/v1/agents/fixture", operator, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!raw.contains(token));
+    for name in ["state.db", "state.db-wal"] {
+        if let Ok(bytes) = std::fs::read(dir.path().join(name)) {
+            assert!(
+                !bytes
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes())
+            );
+        }
+    }
+    assert!(
+        store
+            .resolve_agent_secret_env(&agent.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn write_only_secret_crud_encryption_at_rest_and_admin_access() {
     let _env = crate::server::tests::env_lock();
     let _restore = EnvRestore::capture(&[MASTER_KEY_ENV]);

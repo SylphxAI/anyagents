@@ -184,6 +184,7 @@ pub(crate) fn mount_admin_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/admin/api/tick", post(trigger_tick_route))
         .merge(super::versions::router())
         .merge(super::runtime_issues::admin_router())
+        .merge(super::ingress_blocks::admin_router())
 }
 
 #[cfg(test)]

@@ -769,7 +769,7 @@ pub(crate) fn renew_binding_lease(store: &Store, binding: &SandboxBinding) -> bo
     }
     if binding.provider != "legacy_http"
         && binding.provider != "local"
-        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), binding)
+        && let Ok(reg) = resolve_registry_for_binding(store, binding)
         && reg.active_kind() != ProviderKind::Local
         && let Some(existing_handle) = sandbox_handle_from_binding(binding)
     {

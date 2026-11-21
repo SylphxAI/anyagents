@@ -710,3 +710,129 @@ fn webhook_and_poll_apply_the_same_caller_policy_before_binding_or_delivery() {
     assert_eq!(inbox.len(), 2, "{inbox:?}");
     assert!(store.inbox(&peer.id, None).unwrap().is_empty());
 }
+
+#[test]
+fn ingress_blocks_drop_before_mailbox_wake_and_preserve_allowed_group_relay() {
+    use agent_ingress::{
+        BlockMatch, BlockScope, IngressBlockRule, IngressBlockStore, SenderRelationship,
+        ValidatedBlockRule,
+    };
+    use anyagents_core::{IngressBlocks, Wake, now_ms};
+
+    let _lock = telegram::tests::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup(dir.path());
+    let ada = store.agent_by_name("ada").unwrap();
+    let bea = store.agent_by_name("bea").unwrap();
+    let channel = store
+        .list_channels()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.agents.contains(&ada.id))
+        .unwrap();
+    let secret = telegram::webhook_secret("777:synthetic-token", channel.id.as_str());
+    let webhook = |seq, user, chat, kind| {
+        telegram::receive_webhook(
+            &store,
+            dir.path(),
+            channel.id.as_str(),
+            Some(&secret),
+            &json!({"update_id": seq, "message": {
+                "message_id": seq, "from":{"id":user, "first_name":"Visitor"},
+                "chat":{"id":chat,"type":kind}, "date":1, "text":"Hello"
+            }}),
+        )
+        .unwrap()
+    };
+    let put = |scope, rule_id: &str| {
+        let target = BlockMatch {
+            channel: "telegram".into(),
+            scope,
+        };
+        let rule = ValidatedBlockRule::new(
+            IngressBlockRule {
+                rule_id: rule_id.into(),
+                target: target.clone(),
+                reason: None,
+                blocked_by: "operator".into(),
+                created_at_ms: now_ms(),
+                expires_at_ms: None,
+            },
+            &target,
+            SenderRelationship::Stranger,
+        )
+        .unwrap();
+        futures::executor::block_on(IngressBlocks::new(&store, &ada.id).block(rule)).unwrap();
+    };
+    put(
+        BlockScope::Sender {
+            sender_id: "42".into(),
+        },
+        "sender",
+    );
+    put(
+        BlockScope::Chat {
+            chat_id: "-1007".into(),
+        },
+        "group",
+    );
+
+    let wakes = store.subscribe();
+    assert!(webhook(1, 42, 42, "private").is_empty());
+    assert!(wakes.try_recv().is_err());
+    assert_eq!(webhook(2, 43, -1007, "supergroup"), vec![bea.id.clone()]);
+    assert_eq!(
+        wakes.try_recv().unwrap(),
+        Wake::Mail {
+            agent_id: bea.id.clone()
+        }
+    );
+    assert!(wakes.try_recv().is_err());
+    assert!(store.inbox(&ada.id, None).unwrap().is_empty());
+    let delivered = store.inbox(&bea.id, None).unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].text, "Hello");
+    assert_eq!(
+        delivered[0].context.sender_awareness.as_deref(),
+        Some(
+            r#"sender_awareness: {"relationship":"stranger","channel":"telegram","sender_id":"43","chat_id":"-1007","chat_type":"group"}"#
+        ),
+    );
+    assert_eq!(webhook(3, 43, 43, "private"), vec![ada.id.clone()]);
+    assert_eq!(wakes.try_recv().unwrap(), Wake::Mail { agent_id: ada.id });
+}
+
+#[test]
+fn leave_chat_calls_telegram_only_for_an_exclusive_permanent_group_block() {
+    use telegram::ingress_guard::{Authority, LeaveResult, leave_group};
+
+    let _lock = telegram::tests::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup(dir.path());
+    let ada = store.agent_by_name("ada").unwrap();
+    let authority = Authority::default();
+    assert!(matches!(
+        leave_group(&store, &ada.id, &authority, -1007, true),
+        LeaveResult::Skipped { .. }
+    ));
+    let body = json!({"ok":true,"result":true}).to_string();
+    let (address, task) = fake_wire_at(
+        Some(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )),
+        Some("leaveChat"),
+    );
+    unsafe { std::env::set_var("ANYAGENTS_TELEGRAM_API", address) };
+    let outcome = leave_group(&store, &ada.id, &authority, -1007, false);
+    unsafe { std::env::remove_var("ANYAGENTS_TELEGRAM_API") };
+    assert!(matches!(
+        outcome,
+        LeaveResult::Attempted {
+            left: 1,
+            already_absent: 0,
+            failed: 0
+        }
+    ));
+    assert_eq!(task.join().unwrap(), json!({"chat_id": -1007}));
+}

@@ -42,6 +42,7 @@ pub(super) struct IngressHistory {
     /// to, capped at the 16 the lookup reads. One or none makes the reaction
     /// targeted rather than passive.
     reaction_chat_agents: Option<usize>,
+    sender_awareness: Option<String>,
 }
 
 #[cfg(test)]
@@ -68,6 +69,25 @@ impl Store {
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
         self.receive_with_admission(agent_id, incoming, false, |_| Ok(true))
             .map(|outcome| outcome.expect("unconditional message admission"))
+    }
+
+    /// Receive authenticated channel input with host-resolved sender context.
+    /// The coordinator must run channel admission before calling this method.
+    pub fn receive_external(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        identity: &agent_ingress::SenderIdentity,
+    ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_turn_admission(
+            agent_id,
+            incoming,
+            false,
+            |_| Ok(true),
+            None,
+            Some(identity),
+        )
+        .map(|outcome| outcome.expect("unconditional external admission"))
     }
 
     /// What ingress reads from the stored conversation history, read on a
@@ -121,6 +141,7 @@ impl Store {
             reacted_to,
             edited_from,
             reaction_chat_agents,
+            sender_awareness: None,
         }
     }
 
@@ -131,7 +152,7 @@ impl Store {
         wake_created: bool,
         admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
-        self.receive_with_turn_admission(agent_id, incoming, wake_created, admit, None)
+        self.receive_with_turn_admission(agent_id, incoming, wake_created, admit, None, None)
     }
 
     /// For a mounted stdio tool call, bind a newly committed delivery to the
@@ -150,6 +171,7 @@ impl Store {
             false,
             |_| Ok(true),
             Some((sender, token)),
+            None,
         )
         .map(|outcome| outcome.expect("unconditional turn send admission"))
     }
@@ -161,11 +183,14 @@ impl Store {
         wake_created: bool,
         admit: impl FnOnce(&dyn DbExec) -> Result<bool, Error>,
         turn: Option<(&AgentId, &str)>,
+        identity: Option<&agent_ingress::SenderIdentity>,
     ) -> Result<Option<ReceiveOutcome>, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
-        let history = self.ingress_history(&mut incoming, source_key.as_deref(), agent_id);
+        let mut history = self.ingress_history(&mut incoming, source_key.as_deref(), agent_id);
+        history.sender_awareness =
+            identity.map(agent_ingress::SenderIdentity::format_awareness_header);
         // Stored bodies a channel retry merged a fuller copy into.
         let mut merged = Vec::new();
         let tx_outcome = self.write_tx(|tx| {
@@ -502,6 +527,7 @@ impl Store {
             sender_name: None,
             sender_role,
             sender_rel,
+            sender_awareness: history.sender_awareness,
             recipient,
             channel: incoming
                 .sender

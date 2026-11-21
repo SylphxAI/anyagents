@@ -229,7 +229,7 @@ async fn steer_active_sandbox_turn(
                 if let Some(ref wd) = meta_workdir {
                     handle.workdir = wd.clone();
                 }
-                let provider = resolve_registry_for_binding(Some(store_r.data_dir()), &binding)
+                let provider = resolve_registry_for_binding(&store_r, &binding)
                     .ok()
                     .map(|reg| reg.active());
                 return Ok(Some((provider, handle)));

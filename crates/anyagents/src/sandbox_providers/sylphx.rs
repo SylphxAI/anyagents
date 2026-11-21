@@ -3,6 +3,8 @@
 
 use super::image_version::{LeaseVersion, configured_sylphx_image, desired_ref};
 
+mod client_security;
+
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -433,8 +435,10 @@ impl SylphxLease {
 }
 
 /// Persisted per-agent Sylphx Sandboxes v1 lease + persistent volume record (`sandbox-sylphx.json`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SylphxLeaseConfig {
+    #[serde(skip)]
+    pub(crate) scoped: bool,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -481,6 +485,9 @@ impl SylphxLeaseConfig {
 
     /// Atomically persist `<config_dir>/sandbox-sylphx.json` and sync `<config_dir>/sandbox.json`.
     pub fn save_to_config_dir(&self, config_dir: &Path) -> Result<(), String> {
+        if self.scoped {
+            return Err("a scoped sandbox lease cannot be written to a compatibility file".into());
+        }
         std::fs::create_dir_all(config_dir)
             .map_err(|err| format!("cannot create {}: {err}", config_dir.display()))?;
         let state_path = config_dir.join(SYLPHX_STATE_FILE);
@@ -534,7 +541,9 @@ impl SylphxLeaseConfig {
 
     /// Build a client configured for this lease's endpoint and bearer token.
     pub fn client(&self) -> SylphxSandboxClient {
-        SylphxSandboxClient::new(self.endpoint.clone(), self.token.clone())
+        let mut client = SylphxSandboxClient::new(self.endpoint.clone(), self.token.clone());
+        client.scoped = self.scoped;
+        client
     }
 
     /// Persistent agent state directory inside the mounted volume.
@@ -606,8 +615,9 @@ impl EnvdSignal {
 }
 
 /// Native HTTP/Connect-RPC client for Sylphx Sandboxes v1.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SylphxSandboxClient {
+    pub(crate) scoped: bool,
     pub endpoint: String,
     pub token: Option<String>,
 }
@@ -616,31 +626,12 @@ impl SylphxSandboxClient {
     /// Create a client targeting `endpoint` (e.g. `https://api.sylphx.com`) with optional bearer token.
     pub fn new(endpoint: impl Into<String>, token: Option<String>) -> Self {
         Self {
+            scoped: false,
             endpoint: normalize_api_base(&endpoint.into()),
             token: token
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),
         }
-    }
-
-    fn rest_agent(&self, timeout_ms: u64) -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_millis(timeout_ms.max(1_000))))
-            .http_status_as_error(false)
-            .build()
-            .new_agent()
-    }
-
-    fn stream_agent(&self) -> ureq::Agent {
-        // Long-lived turns via envd streaming must never be aborted at 120s/300s.
-        ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .timeout_global(None)
-            .timeout_recv_body(None)
-            .timeout_send_body(None)
-            .http_status_as_error(false)
-            .build()
-            .new_agent()
     }
 
     fn v1_resource_url(&self, resource: &str) -> String {
@@ -663,7 +654,7 @@ impl SylphxSandboxClient {
         }
     }
 
-    fn request_json(
+    pub(super) fn request_json(
         &self,
         method: &str,
         url: &str,
@@ -702,11 +693,16 @@ impl SylphxSandboxClient {
         .map_err(|err| format!("Sylphx sandbox request `{method} {url}` failed: {err}"))?;
 
         let status = resp.status().as_u16();
-        let raw = resp
+        let mut raw = resp
             .into_body()
             .read_to_string()
             .map_err(|err| format!("Sylphx sandbox response read failed ({url}): {err}"))?;
-        let val = if raw.trim().is_empty() {
+        if self.scoped
+            && let Some(token) = &self.token
+        {
+            raw = raw.replace(token, "[redacted]");
+        }
+        let val = if (self.scoped && !(200..300).contains(&status)) || raw.trim().is_empty() {
             serde_json::json!({})
         } else {
             serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({ "raw": raw }))
@@ -1273,6 +1269,7 @@ impl SylphxSandboxClient {
             .unwrap_or_else(|| lease.resource_name.clone());
 
         let state = SylphxLeaseConfig {
+            scoped: self.scoped,
             endpoint: self.endpoint.clone(),
             token: self.token.clone().or_else(|| provider.token.clone()),
             parent: provider.parent.clone(),
@@ -1370,8 +1367,16 @@ impl SylphxSandboxClient {
                 compact_error_body(&val)
             ));
         };
-        let stdout = decode_output_stream(&val, &["stdout_base64", "stdoutBase64"], "stdout")?;
-        let stderr = decode_output_stream(&val, &["stderr_base64", "stderrBase64"], "stderr")?;
+        let stdout = self.redact(decode_output_stream(
+            &val,
+            &["stdout_base64", "stdoutBase64"],
+            "stdout",
+        )?);
+        let stderr = self.redact(decode_output_stream(
+            &val,
+            &["stderr_base64", "stderrBase64"],
+            "stderr",
+        )?);
         let exit_code = val
             .get("exit_code")
             .or_else(|| val.get("exitCode"))
@@ -1562,7 +1567,7 @@ impl SylphxSandboxClient {
             .post(&url)
             .header("content-type", "application/connect+json")
             .header("connect-protocol-version", "1");
-        if let Some(tok) = envd_token.or(self.token.as_deref()) {
+        if let Some(tok) = self.envd_auth(&url, envd_token)? {
             req = req
                 .header("authorization", &format!("Bearer {tok}"))
                 .header("x-access-token", tok);
@@ -1580,7 +1585,9 @@ impl SylphxSandboxClient {
         let mut reader = resp.into_body().into_reader();
         if !(200..300).contains(&status) {
             let mut err_buf = String::new();
-            let _ = reader.read_to_string(&mut err_buf);
+            if !self.scoped {
+                let _ = reader.read_to_string(&mut err_buf);
+            }
             return Err(format!(
                 "envd `process.Process/Start` returned HTTP {status}: {err_buf}"
             ));
@@ -1594,7 +1601,7 @@ impl SylphxSandboxClient {
             for line in body.lines().filter(|l| !l.trim().is_empty()) {
                 let val: serde_json::Value = serde_json::from_str(line)
                     .map_err(|err| format!("invalid envd JSON line: {err}"))?;
-                if let Some(ev) = parse_envd_event(&val) {
+                if let Some(ev) = parse_envd_event(&val).map(|event| self.redact_event(event)) {
                     if let EnvdProcessEvent::End { exit_code, .. } = &ev {
                         last_exit = *exit_code;
                     }
@@ -1617,11 +1624,11 @@ impl SylphxSandboxClient {
                         .get("message")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown envd stream error");
-                    return Err(format!("envd Connect-RPC trailer error: {msg}"));
+                    return Err(self.redact(format!("envd Connect-RPC trailer error: {msg}")));
                 }
                 break;
             }
-            if let Some(ev) = parse_envd_event(&val) {
+            if let Some(ev) = parse_envd_event(&val).map(|event| self.redact_event(event)) {
                 if let EnvdProcessEvent::End {
                     exit_code, error, ..
                 } = &ev
@@ -1691,7 +1698,7 @@ impl SylphxSandboxClient {
             .post(url)
             .header("content-type", "application/json")
             .header("connect-protocol-version", "1");
-        if let Some(tok) = envd_token.or(self.token.as_deref()) {
+        if let Some(tok) = self.envd_auth(url, envd_token)? {
             req = req
                 .header("authorization", &format!("Bearer {tok}"))
                 .header("x-access-token", tok);
@@ -1701,7 +1708,11 @@ impl SylphxSandboxClient {
             .map_err(|err| format!("envd `process.Process/{op_name}` failed: {err}"))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
-            let raw = resp.into_body().read_to_string().unwrap_or_default();
+            let raw = if self.scoped {
+                String::new()
+            } else {
+                resp.into_body().read_to_string().unwrap_or_default()
+            };
             return Err(format!(
                 "envd `process.Process/{op_name}` returned HTTP {status}: {raw}"
             ));
@@ -1711,7 +1722,7 @@ impl SylphxSandboxClient {
 }
 
 /// Remote [`WorkspaceBackend`] backed by a native Sylphx Sandboxes v1 lease & persistent volume.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SylphxSandboxWorkspace {
     pub config: SylphxLeaseConfig,
 }
