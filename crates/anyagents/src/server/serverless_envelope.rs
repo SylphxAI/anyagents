@@ -438,8 +438,8 @@ pub(crate) fn build_detached_guest_turn_argv(
     argv
 }
 
-/// Ensure a remote sandbox lease for `agent` (resolving code-tier shape/volume
-/// overrides for repo-backed agents), hydrate durable config/secrets/memory/media,
+/// Ensure a remote sandbox lease for `agent` with the appropriate workload tier,
+/// hydrate durable config/secrets/memory/media,
 /// and sync the agent bundle archive into the sandbox.
 ///
 /// Returns `Err((Some(handle), msg))` if preparation or tar sync fails after
@@ -465,7 +465,9 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
             crate::sandbox_exec::read_synced_repo_spec(&cfg_dir).is_some(),
             None,
             None,
-        );
+            std::env::vars(),
+        )
+        .map_err(|e| (None, e.to_string()))?;
         let ensured = crate::sandbox_exec::ensure_sandbox_with_provider(
             &store,
             Arc::clone(&provider),

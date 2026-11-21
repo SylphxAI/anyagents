@@ -78,6 +78,8 @@ ANYAGENTS_SANDBOX_MOUNT_PATH=/home/user/agent-data
 ANYAGENTS_SANDBOX_WORKDIR=/home/user/agent-data/workspace
 ```
 
+`ANYAGENTS_SANDBOX_BROWSER_SHAPE` is an optional compute shape for agents with browser profile grants. On a new lease it takes precedence over `ANYAGENTS_SANDBOX_CODE_SHAPE`, then the deployment default (`ANYAGENTS_SANDBOX_SHAPE` or the provider default). Existing leases are not resized. Browser profile grants do not change volume sizing or the compute tier for agents without grants.
+
 Provider-specific variables:
 - **Sylphx**: `ANYAGENTS_SYLPHX_PARENT` (`orgs/{o}/projects/{p}/envs/{e}`), `ANYAGENTS_SANDBOX_ENDPOINT` (default `https://api.sylphx.com`), `ANYAGENTS_SANDBOX_TOKEN` / `SYLPHX_API_KEY`.
 - **E2B**: `E2B_API_KEY`, `E2B_API_URL` (default `https://api.e2b.app`), `E2B_DOMAIN` (default `e2b.app`), `E2B_TEMPLATE`.
