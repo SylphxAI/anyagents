@@ -12,8 +12,7 @@ name: ci
 # `runs-on` names GitHub-hosted labels only.
 #
 # `ci-ok` is the one required check. It runs no repository code - it reads the
-# other jobs' results and writes a summary - so it stays on the reserved gate
-# pool and a superseded run cannot hold its concurrency group.
+# other jobs' results on a separate runner.
 
 on:
   pull_request:
@@ -28,9 +27,9 @@ permissions:
   contents: read
 
 # A newer push replaces its pull request's run; a merge-group or trunk run is
-# never cancelled.
+# never superseded. Give trunk/queue runs independent concurrency slots.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -40,11 +39,8 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
 
 jobs:
-  # Compute crate-graph path-scoping from Cargo.toml and run fast policy and
-  # module-size ratchet checks on every run. Docs/markdown/AGENTS.md/
-  # tools-only PRs skip heavy Rust and macOS jobs; leaf-crate-only PRs scope
-  # clippy/tests to touched crates + Cargo reverse dependents; core/coordinator
-  # and non-diff runs (push/main, manual) execute the full workspace suite.
+  # Plan from the actual PR merge commit or merge-group candidate and run the
+  # policy checks even when no other lane is scheduled.
   changes:
     if: github.event.repository.private == false
     runs-on: ubuntu-latest
@@ -55,8 +51,8 @@ jobs:
       cargo_pkg_args: ${{ steps.scope.outputs.cargo_pkg_args }}
       cargo_doc_args: ${{ steps.scope.outputs.cargo_doc_args }}
       run_macos: ${{ steps.scope.outputs.run_macos }}
-      run_host_acceptance: ${{ steps.scope.outputs.run_host_acceptance }}
-      run_npm: ${{ steps.scope.outputs.run_npm }}
+      run_console: ${{ steps.scope.outputs.run_console }}
+      linux_matrix: ${{ steps.scope.outputs.linux_matrix }}
       needs_fake_opencode: ${{ steps.scope.outputs.needs_fake_opencode }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -68,23 +64,9 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: |
-          set -euo pipefail
-          case "$EVENT" in
-            pull_request | merge_group)
-              if [ -n "$BASE" ] && git diff --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/scope.txt"; then
-                echo "$(wc -l < "$RUNNER_TEMP/scope.txt") changed paths" >&2
-                python3 tools/ci_scope.py --event "$EVENT" --paths-file "$RUNNER_TEMP/scope.txt" --github-output "$GITHUB_OUTPUT"
-              else
-                # A diff that cannot be computed runs the full workspace rather than skipping.
-                echo "git diff unavailable; falling back to full workspace" >&2
-                python3 tools/ci_scope.py --event "$EVENT" --diff-failed --github-output "$GITHUB_OUTPUT"
-              fi
-              ;;
-            *)
-              python3 tools/ci_scope.py --event "$EVENT" --github-output "$GITHUB_OUTPUT"
-              ;;
-          esac
+        run: python3 tools/ci_scope.py --event "$EVENT" --base "$BASE" --head "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+      - name: Open-source purity
+        run: python3 tools/ci_scope.py --check-purity
       - name: Module size ratchet
         run: python3 tools/module_size_scan.py
       - name: Tooling tests
@@ -97,13 +79,45 @@ jobs:
         if: steps.scope.outputs.run_npm == 'true'
         run: npm test
 
-  # The Linux lane: format, clippy, crate-scoped or workspace tests, plus host
-  # acceptance lanes when host/core/coordinator crates are affected.
-  test:
+  console:
     needs: changes
-    if: github.event.repository.private == false && needs.changes.outputs.rust_scope != 'none'
+    if: github.event.repository.private == false && needs.changes.outputs.run_console == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Verify checked-in embedding inputs
+        run: python3 tools/ci_scope.py --check-console-assets
+      - name: Build console (including the package's TypeScript and unit checks)
+        working-directory: apps/console
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Require reproducible embedded assets
+        run: |
+          set -euo pipefail
+          assets=crates/anyagents/src/server/console
+          git diff --exit-code HEAD -- "$assets"
+          test -z "$(git ls-files --others -- "$assets")"
+
+  # Compile only the Cargo package set required by each lane. The slow
+  # identity integration binary gets its own runner; the rest of the
+  # coordinator suite stays on one runner and automatically includes new tests.
+  linux:
+    needs: changes
+    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.linux_matrix) }}
+    name: linux (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: 'on'
@@ -121,7 +135,7 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.19.0
-      - name: Configure linker and nextest
+      - name: Configure linker
         run: |
           set -euo pipefail
           sysroot="$(rustc --print sysroot 2>/dev/null || true)"
@@ -132,6 +146,10 @@ jobs:
             chmod 0755 "$linker_wrapper"
             echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$linker_wrapper" >> "$GITHUB_ENV"
           fi
+      - name: Install nextest
+        if: matrix.lane == 'crates' || matrix.lane == 'coordinator' || matrix.lane == 'identity'
+        run: |
+          set -euo pipefail
           nextest_tgz="$RUNNER_TEMP/cargo-nextest.tar.gz"
           curl -fsSL -o "$nextest_tgz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz"
           printf '%s  %s\n' "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f" "$nextest_tgz" | sha256sum -c -
@@ -141,46 +159,52 @@ jobs:
           cargo nextest --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: sccache
+          # Restore the existing Linux dependency cache across all shards;
+          # only the main crate shard writes it to avoid per-shard duplication.
+          shared-key: sccache-test
+          save-if: ${{ github.event_name == 'push' && matrix.lane == 'crates' }}
       - name: Format
+        if: matrix.lane == 'lint'
         run: cargo fmt --all -- --check
       - name: Clippy
+        if: matrix.lane == 'lint'
         env:
-          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
+          CARGO_PKG_ARGS: ${{ matrix.packages }}
         run: |
           set -euo pipefail
           read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
           cargo clippy "${pkg_args[@]}" --all-targets --locked -- -D warnings
       - name: Build harness helper binary
-        if: needs.changes.outputs.needs_fake_opencode == 'true' && needs.changes.outputs.run_host_acceptance != 'true'
+        if: matrix.lane == 'crates' && needs.changes.outputs.needs_fake_opencode == 'true'
         run: cargo build -p anyagents-harness-opencode --bin fake_opencode --locked
-      - name: Build harness helper and runtime binaries
-        if: needs.changes.outputs.run_host_acceptance == 'true'
-        env:
-          NEEDS_FAKE_OPENCODE: ${{ needs.changes.outputs.needs_fake_opencode }}
+      - name: Build runtime binary
+        if: matrix.lane == 'host'
         run: |
           set -euo pipefail
-          build_args=(-p anyagents --bin anyagents)
-          if [ "$NEEDS_FAKE_OPENCODE" = "true" ]; then
-            build_args+=(-p anyagents-harness-opencode --bin fake_opencode)
-          fi
-          cargo build "${build_args[@]}" --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
+          cargo build -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/prod-build.json"
           binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/prod-build.json")
           echo "ANYAGENTS_PROD_BIN=$binary" >> "$GITHUB_ENV"
       - name: Test
+        if: matrix.lane == 'crates' || matrix.lane == 'coordinator' || matrix.lane == 'identity'
         env:
-          CARGO_PKG_ARGS: ${{ needs.changes.outputs.cargo_pkg_args }}
-          CARGO_DOC_ARGS: ${{ needs.changes.outputs.cargo_doc_args }}
+          CARGO_PKG_ARGS: ${{ matrix.packages }}
+          CARGO_DOC_ARGS: ${{ matrix.docs }}
+          LANE: ${{ matrix.lane }}
         run: |
           set -euo pipefail
           read -r -a pkg_args <<< "$CARGO_PKG_ARGS"
-          cargo nextest run "${pkg_args[@]}" --locked --no-fail-fast
+          test_args=()
+          case "$LANE" in
+            coordinator) test_args=(-E 'not binary_id(=anyagents::identity)') ;;
+            identity) test_args=(--test identity) ;;
+          esac
+          cargo nextest run "${pkg_args[@]}" "${test_args[@]}" --locked --no-fail-fast
           if [ -n "$CARGO_DOC_ARGS" ]; then
             read -r -a doc_args <<< "$CARGO_DOC_ARGS"
             cargo test --doc "${doc_args[@]}" --locked
           fi
       - name: Locate anyagents test binary
-        if: needs.changes.outputs.run_host_acceptance == 'true'
+        if: matrix.lane == 'host'
         run: |
           set -euo pipefail
           cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/unit-test-build.json"
@@ -190,7 +214,7 @@ jobs:
       # Same public Linux sudo lane as the cross-seat repository acceptance.
       # This is required: missing privilege, identity change or setpriv fails.
       - name: Host memory managed-UID admission
-        if: needs.changes.outputs.run_host_acceptance == 'true'
+        if: matrix.lane == 'host'
         run: |
           set -euo pipefail
           # RUNNER_TEMP is below the runner's private home, inaccessible to the
@@ -198,14 +222,14 @@ jobs:
           # the script verifies ancestry and never changes existing ancestors.
           sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$ANYAGENTS_PROD_BIN" --vendor-test-binary "$ANYAGENTS_UNIT_TEST_BIN" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
       - name: Host memory managed-UID receipt
-        if: always() && needs.changes.outputs.run_host_acceptance == 'true'
+        if: always() && matrix.lane == 'host'
         run: |
           if [ -f "$RUNNER_TEMP/host-memory-seat-receipt.json" ]; then
             cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
           fi
 
       - name: Privileged config ACL acceptance
-        if: needs.changes.outputs.run_host_acceptance == 'true'
+        if: matrix.lane == 'host'
         run: |
           set -euo pipefail
           test_name=seat_tree::privileged_config_tests::privileged_config_acl_cross_uid
@@ -219,7 +243,7 @@ jobs:
           grep -Fx 'A2A_PRIVATE_MEDIA_CROSS_UID_EXECUTED' "$RUNNER_TEMP/a2a-media-test.log"
 
       - name: Cross-seat repositories
-        if: needs.changes.outputs.run_host_acceptance == 'true'
+        if: matrix.lane == 'host'
         run: |
           set -euo pipefail
           # Two seat uids, each committing and pushing in its own repository
@@ -290,14 +314,41 @@ jobs:
             cargo test --doc "${doc_args[@]}" --locked
           fi
 
-  # The required check name. Skipped lanes pass; a failed or cancelled lane
-  # fails. It reads results only and runs no repository code.
+  # GitHub treats a skipped required check as green. This gate always issues a
+  # verdict, including when a prerequisite is cancelled, and checks that each
+  # skip exactly matches the completed plan. Do not check out candidate code.
   ci-ok:
-    if: always() && !cancelled() && github.event.repository.private == false
-    needs: [changes, test, macos]
+    if: always() && github.event.repository.private == false
+    needs: [changes, console, linux, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: SylphxAI/.github/.github/actions/needs-pass@b33f1acf5ac75cd568268d46ae00b0132e1ad67a # main
-        with:
-          needs: ${{ toJSON(needs) }}
+      - name: Verify required results against the plan
+        if: always()
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ['NEEDS'])
+          plan = needs['changes']
+          checks = {'console': 'run_console', 'linux': 'code', 'macos': 'run_macos'}
+          errors = []
+          if plan['result'] != 'success':
+              errors.append(f"changes: expected success, got {plan['result']}")
+          for job, flag in checks.items():
+              enabled = plan['outputs'].get(flag)
+              actual = needs[job]['result']
+              if enabled not in ('true', 'false'):
+                  errors.append(f"{job}: missing or invalid plan output {flag}")
+                  continue
+              expected = 'success' if enabled == 'true' else 'skipped'
+              print(f'{job}: expected {expected}, got {actual}')
+              if actual != expected:
+                  errors.append(f'{job}: expected {expected}, got {actual}')
+          if errors:
+              sys.exit('\n'.join(errors))
+          PY
