@@ -112,6 +112,7 @@ mod registry;
 mod remote_sessions;
 mod retired_search;
 mod runtime;
+mod runtime_issues;
 #[cfg(test)]
 #[path = "store/runtime_tests.rs"]
 mod runtime_tests;
@@ -162,6 +163,9 @@ pub use runtime::{
     AgentRuntime, BackfillReport, Fault, FaultKind, ProcessIdentity, QUOTA_ESTIMATE_MS, QuotaBlock,
     QuotaReset, QuotaSource, RecoveryOffer, RuntimeChange, RuntimeHeartbeat, RuntimeState,
     SessionLease, Turn, TurnOutcome, TurnState,
+};
+pub use runtime_issues::{
+    RuntimeComponent, RuntimeIssue, RuntimeIssueReport, RuntimeIssueSource, RuntimeIssueStatus,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 pub use turn_events::AgentTurnSnapshot;

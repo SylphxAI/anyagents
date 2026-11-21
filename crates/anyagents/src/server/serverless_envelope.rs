@@ -479,7 +479,16 @@ pub(crate) async fn ensure_and_prepare_sandbox_for_turn(
             Some(&remote_workdir),
             &lease_env,
         )
-        .map_err(|e| (None, e))?;
+        .map_err(|e| {
+            super::runtime_issues::capture(
+                Arc::clone(&store),
+                Some(agent.id.clone()),
+                anyagents_core::RuntimeComponent::Sandbox,
+                "Sandbox provisioning failed",
+                "Coordinator could not establish a sandbox lease",
+            );
+            (None, e)
+        })?;
 
         let prep: Result<String, String> = (|| {
             let _ =

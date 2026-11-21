@@ -25,6 +25,12 @@ pub(super) async fn send(
         args.to = vec![word.to_string()];
         args.reply_to = None;
     }
+    // The operator REST/CLI contract is preserved; neither MCP transport uses it.
+    if args.to.iter().any(|target| is_operator_address(target))
+        || (args.to.is_empty() && args.reply_to.as_deref().is_some_and(is_operator_address))
+    {
+        return Err("send cannot address the operator inbox. Use report_bug for genuine AnyAgents, sandbox, or harness runtime bugs. Send task blockers, missing permissions, and operational requests to your parent or an ops peer.".into());
+    }
     let inferred_interact = args
         .action
         .as_deref()
@@ -87,6 +93,10 @@ pub(super) async fn send(
     Ok(rmcp::handler::server::wrapper::Json(send_turn_result(
         response, closing,
     )?))
+}
+
+fn is_operator_address(address: &str) -> bool {
+    matches!(anyagents_core::Address::parse(address.trim()), Ok(anyagents_core::Address::Agent(name)) if name.eq_ignore_ascii_case("operator"))
 }
 
 fn interaction_request(args: SendArgs, action: String) -> Result<InteractRequest, String> {

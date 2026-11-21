@@ -634,6 +634,7 @@ async fn mcp_tools_use_the_server_socket() {
         [
             "agents",
             "send",
+            "report_bug",
             "inbox",
             "conversation",
             "memory",
@@ -643,7 +644,7 @@ async fn mcp_tools_use_the_server_socket() {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>(),
-        "expected universal 7-tool MCP surface on stdio session, got {names:?}"
+        "expected universal MCP surface on stdio session, got {names:?}"
     );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);

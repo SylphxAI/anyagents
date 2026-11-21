@@ -262,7 +262,22 @@ pub(super) async fn send(
             ..body.clone()
         };
         let key = send_key(&key_body);
-        send_sync(&state.store, &actor, body, plan, key)
+        let sender_id = plan.sender_id.clone();
+        let mailbox_only = plan
+            .targets
+            .iter()
+            .all(|target| matches!(target, Target::Agent(_) | Target::Room(_)));
+        send_sync(&state.store, &actor, body, plan, key).inspect_err(|err| {
+            if mailbox_only && err.status.is_server_error() {
+                super::runtime_issues::capture(
+                    Arc::clone(&state.store),
+                    sender_id,
+                    anyagents_core::RuntimeComponent::Coordinator,
+                    "Mailbox delivery failed",
+                    "Coordinator could not complete internal mailbox delivery",
+                );
+            }
+        })
     })
     .await?;
     if serverless::is_serverless_mode() {
