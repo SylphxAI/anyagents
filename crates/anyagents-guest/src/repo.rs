@@ -1,8 +1,12 @@
-use std::io::Read as _;
+use std::fs;
+use std::io::{self, Read as _};
 use std::net::ToSocketAddrs as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "repo/staging.rs"]
+mod staging;
 
 const DEFAULT_GIT_CLONE_TIMEOUT_SECS: u64 = 120;
 const DNS_WAIT_MAX_ATTEMPTS: usize = 5;
@@ -163,6 +167,20 @@ fn configure_git_command(
     gh_token: Option<&str>,
 ) -> Result<std::process::Command, String> {
     let mut cmd = spawn_command(git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
+    // Never let ambient repository selectors redirect staging operations.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_QUARANTINE_PATH",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        cmd.env_remove(key);
+    }
     for (k, v) in git_credential_env_pairs(repo, gh_token) {
         cmd.env(k, v);
     }
@@ -480,14 +498,11 @@ struct CloneContext<'a> {
     timeout: Duration,
 }
 
-fn prepare_clean_clone_dir(work_dir: &Path) {
-    if work_dir.exists() && !work_dir.join(".git").exists() {
-        let _ = std::fs::remove_dir_all(work_dir);
+fn clear_failed_attempt(checkout: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(checkout) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result.map_err(|error| format!("cannot clear staged checkout: {error}")),
     }
-    if let Some(parent) = work_dir.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::create_dir_all(work_dir);
 }
 
 fn run_clone_attempt(
@@ -508,7 +523,7 @@ fn run_clone_attempt(
         if let Some(b) = branch {
             cmd.arg("--branch").arg(b);
         }
-        cmd.arg(ctx.repo).arg(ctx.work_dir);
+        cmd.arg("--").arg(ctx.repo).arg(ctx.work_dir);
         let out = run_git_with_timeout(&mut cmd, ctx.timeout)?;
         if out.status.success() {
             return Ok(out);
@@ -516,13 +531,13 @@ fn run_clone_attempt(
         let stderr = String::from_utf8_lossy(&out.stderr);
         if ctx.shallow && use_filter && is_filter_unsupported_error(&stderr) {
             use_filter = false;
-            prepare_clean_clone_dir(ctx.work_dir);
+            clear_failed_attempt(ctx.work_dir)?;
             continue;
         }
         if is_transient_dns_error(&stderr) && dns_retries < MAX_DNS_CLONE_RETRIES {
             dns_retries += 1;
             std::thread::sleep(Duration::from_secs((dns_retries as u64) * 2));
-            prepare_clean_clone_dir(ctx.work_dir);
+            clear_failed_attempt(ctx.work_dir)?;
             continue;
         }
         return Ok(out);
@@ -535,28 +550,87 @@ fn format_clone_error(repo: &str, detail: &str, gh_token: Option<&str>) -> Strin
     format!("repo clone failed for {safe_repo}: {safe_detail}")
 }
 
-/// Ensure the repository described by `spec` is checked out inside `work_dir`
-/// when no `.git` metadata exists yet.
+/// Bootstrap only an empty workspace. An existing checkout remains user-owned,
+/// regardless of the requested branch or base.
 pub(crate) fn ensure_repo_checked_out(
     work_dir: &Path,
+    state_dir: &Path,
     spec: &GuestRepoSpec,
     git_override: Option<&Path>,
 ) -> Result<(), String> {
     let raw_repo = spec.repo.trim();
-    if raw_repo.is_empty() || work_dir.join(".git").exists() {
+    if raw_repo.is_empty() {
         return Ok(());
     }
     let repo = normalize_repo_url(raw_repo);
+    let token = resolve_github_token(work_dir);
+    let error = |detail: &str| format_clone_error(&repo, detail, token.as_deref());
+    let fs_error = |err: io::Error| error(&err.to_string());
+    fs::create_dir_all(work_dir).map_err(fs_error)?;
+    let work_dir = &fs::canonicalize(work_dir).map_err(fs_error)?;
+    fs::create_dir_all(state_dir).map_err(fs_error)?;
     let git_bin = match git_override {
         Some(p) => p.to_path_buf(),
         None => anyagents_toolchain::tool("git", "anyagents-guest.repo")
             .map(|r| r.path)
             .unwrap_or_else(|_| PathBuf::from("/usr/bin/git")),
     };
-    let gh_token = resolve_github_token(work_dir);
-    let state_dir = resolve_default_state_dir(None);
-    ensure_gh_auth_setup_git(&state_dir, gh_token.as_deref());
+    let slot = staging::Slot::lock(state_dir).map_err(fs_error)?;
+    let previous = slot.load(work_dir).map_err(fs_error)?;
+    match fs::symlink_metadata(work_dir.join(".git")) {
+        Ok(_) => {
+            // Resolve the local .git explicitly; never accept an enclosing repo
+            // as proof that a legacy partial clone is ready.
+            verify_head(&git_bin, work_dir, &repo, token.as_deref(), None).map_err(|e| {
+                error(&format!(
+                    "existing Git metadata is unusable; contents preserved: {e}"
+                ))
+            })?;
+            if let Some(attempt) = previous {
+                slot.cleanup(work_dir, &attempt).map_err(fs_error)?;
+            }
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fs_error(e)),
+    }
+    if let Some(attempt) = previous {
+        if attempt.is_installing() {
+            attempt.resume_install(work_dir).map_err(fs_error)?;
+            return slot.cleanup(work_dir, &attempt).map_err(fs_error);
+        }
+        slot.cleanup(work_dir, &attempt).map_err(fs_error)?;
+    }
+    staging::require_empty(work_dir, None).map_err(fs_error)?;
+    ensure_gh_auth_setup_git(state_dir, token.as_deref());
+    let in_place = staging::needs_in_place(work_dir).map_err(fs_error)?;
+    let mut attempt = slot.begin(work_dir, in_place).map_err(fs_error)?;
+    let checkout = attempt.checkout(work_dir);
+    let ctx = CloneContext {
+        git_bin: &git_bin,
+        // Keep the historical relative-local-remote resolution and never run
+        // clone from a directory it can unlink during a failed attempt.
+        clone_cwd: work_dir.parent().unwrap_or(work_dir),
+        work_dir: &checkout,
+        repo: &repo,
+        gh_token: token.as_deref(),
+        shallow: std::env::var("ANYAGENTS_GIT_CLONE_FULL").ok().as_deref() != Some("1"),
+        timeout: clone_timeout(),
+    };
+    let result = stage_checkout(&ctx, spec)
+        .and_then(|()| attempt.publish(&slot, work_dir).map_err(|e| e.to_string()));
+    if result.is_ok() || !attempt.is_installing() {
+        slot.cleanup(work_dir, &attempt).map_err(fs_error)?;
+    }
+    result.map_err(|detail| error(&detail))?;
+    // The sandbox may launch with the old, empty workspace directory as CWD.
+    if std::env::current_dir().is_err() {
+        std::env::set_current_dir(work_dir).map_err(fs_error)?;
+    }
+    Ok(())
+}
 
+fn stage_checkout(ctx: &CloneContext<'_>, spec: &GuestRepoSpec) -> Result<(), String> {
     let wanted_branch = spec
         .branch
         .as_deref()
@@ -568,109 +642,106 @@ pub(crate) fn ensure_repo_checked_out(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // Always run `git clone` from the parent directory (or `/`), never from `work_dir`
-    // itself: when a first `git clone --branch <missing>` fails or cleans up `work_dir`,
-    // inheriting `work_dir` as CWD unlinks the child's CWD inode and causes the fallback
-    // clone to abort with `fatal: Unable to read current working directory`.
-    let clone_cwd = work_dir
-        .parent()
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| Path::new("/"));
-
-    let timeout = clone_timeout();
-    let shallow = std::env::var("ANYAGENTS_GIT_CLONE_FULL").ok().as_deref() != Some("1");
-    let http_host = extract_http_repo_host(&repo);
+    let http_host = extract_http_repo_host(ctx.repo);
     if let Some(ref host) = http_host {
         let _ = wait_for_dns_host(host);
     }
-    let use_filter = shallow
+    let use_filter = ctx.shallow
         && http_host.is_some()
         && std::env::var("ANYAGENTS_GIT_CLONE_NO_FILTER")
             .ok()
             .as_deref()
             != Some("1");
-    let ctx = CloneContext {
-        git_bin: &git_bin,
-        clone_cwd,
-        work_dir,
-        repo: &repo,
-        gh_token: gh_token.as_deref(),
-        shallow,
-        timeout,
-    };
-    let out = run_clone_attempt(&ctx, wanted_branch.or(base_branch), use_filter)
-        .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
-    let mut create_local_branch: Option<&str> = None;
+    let requested = wanted_branch.or(base_branch);
+    let out = run_clone_attempt(ctx, requested, use_filter)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if let Some(branch) = wanted_branch
-            && is_missing_remote_branch_error(&stderr)
-        {
-            prepare_clean_clone_dir(work_dir);
-            let fb_out = run_clone_attempt(&ctx, base_branch, use_filter)
-                .map_err(|e| format_clone_error(&repo, &e, gh_token.as_deref()))?;
-            if !fb_out.status.success() {
-                return Err(format_clone_error(
-                    &repo,
-                    &String::from_utf8_lossy(&fb_out.stderr),
-                    gh_token.as_deref(),
-                ));
-            }
-            create_local_branch = Some(branch);
+        let Some(branch) = wanted_branch.filter(|_| is_missing_remote_branch_error(&stderr)) else {
+            return Err(stderr.into_owned());
+        };
+        clear_failed_attempt(ctx.work_dir)?;
+        let fallback = run_clone_attempt(ctx, base_branch, use_filter)?;
+        require_git_success(fallback)?;
+        verify_head(
+            ctx.git_bin,
+            ctx.work_dir,
+            ctx.repo,
+            ctx.gh_token,
+            base_branch,
+        )?;
+        checked_git_output(
+            ctx.git_bin,
+            ctx.work_dir,
+            ctx.repo,
+            ctx.gh_token,
+            &["checkout", "-b", branch],
+        )?;
+    }
+    verify_head(ctx.git_bin, ctx.work_dir, ctx.repo, ctx.gh_token, requested)
+}
+
+fn require_git_success(out: Output) -> Result<Output, String> {
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn checked_git_output(
+    git: &Path,
+    cwd: &Path,
+    repo: &str,
+    token: Option<&str>,
+    args: &[&str],
+) -> Result<Output, String> {
+    let out = configure_git_command(git, repo, token)?
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("could not run git {}: {err}", args[0]))?;
+    require_git_success(out).map_err(|err| format!("git {}: {err}", args.join(" ")))
+}
+
+fn verify_head(
+    git: &Path,
+    cwd: &Path,
+    repo: &str,
+    token: Option<&str>,
+    requested: Option<&str>,
+) -> Result<(), String> {
+    let run = |args: &[&str]| checked_git_output(git, cwd, repo, token, args);
+    run(&["rev-parse", "--resolve-git-dir", ".git"])?;
+    let head = run(&["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if let Some(name) = requested {
+        let symbolic = configure_git_command(git, repo, token)?
+            .current_dir(cwd)
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .output()
+            .map_err(|err| err.to_string())?;
+        let matches = if symbolic.status.success() {
+            symbolic.stdout.strip_suffix(b"\n") == Some(format!("refs/heads/{name}").as_bytes())
+        } else if symbolic.status.code() == Some(1) {
+            // Git clone --branch also accepts a tag (detached HEAD).
+            let tag = format!("refs/tags/{name}^{{commit}}");
+            run(&["rev-parse", "--verify", "--end-of-options", &tag])?.stdout == head.stdout
         } else {
-            return Err(format_clone_error(&repo, &stderr, gh_token.as_deref()));
-        }
-    }
-    // If our own process CWD was unlinked when `work_dir` was recreated during clone,
-    // re-anchor it to the freshly cloned `work_dir` so downstream commands inherit a valid CWD.
-    if std::env::current_dir().is_err() {
-        let _ = std::env::set_current_dir(work_dir);
-    }
-    if let Some(branch) = create_local_branch {
-        let mut co = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
-        co.current_dir(work_dir).args(["checkout", "-B", branch]);
-        let co_out = co.output().map_err(|e| {
-            format_clone_error(
-                &repo,
-                &format!("git checkout -B `{branch}`: {e}"),
-                gh_token.as_deref(),
-            )
-        })?;
-        if !co_out.status.success() {
-            return Err(format_clone_error(
-                &repo,
-                &format!(
-                    "git checkout -B `{branch}`: {}",
-                    String::from_utf8_lossy(&co_out.stderr).trim()
-                ),
-                gh_token.as_deref(),
+            return Err(format!(
+                "could not read staged branch: {}",
+                String::from_utf8_lossy(&symbolic.stderr)
             ));
-        }
-    } else if let Some(base) = base_branch
-        && wanted_branch.is_none()
-    {
-        let mut co = spawn_command(&git_bin, &[]).map_err(|e| format!("git spawn: {e}"))?;
-        co.current_dir(work_dir).args(["checkout", base]);
-        let co_out = co.output().map_err(|e| {
-            format_clone_error(
-                &repo,
-                &format!("git checkout `{base}`: {e}"),
-                gh_token.as_deref(),
-            )
-        })?;
-        if !co_out.status.success() {
-            return Err(format_clone_error(
-                &repo,
-                &format!(
-                    "git checkout `{base}`: {}",
-                    String::from_utf8_lossy(&co_out.stderr).trim()
-                ),
-                gh_token.as_deref(),
-            ));
+        };
+        if !matches {
+            return Err(format!("staged HEAD does not match requested ref {name}"));
         }
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "repo/checkout_tests.rs"]
+mod checkout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -789,7 +860,7 @@ mod tests {
             branch: Some("main".to_string()),
             base: None,
         };
-        let err = ensure_repo_checked_out(&work, &spec, Some(&fake_git))
+        let err = ensure_repo_checked_out(&work, &dir.path().join("state"), &spec, Some(&fake_git))
             .expect_err("auth failure must fail closed immediately");
         assert!(
             err.starts_with("repo clone failed for https://github.com/Org/PrivateRepo.git:"),
@@ -797,61 +868,6 @@ mod tests {
         );
         assert!(!err.contains(&leak_token), "token must be redacted: {err}");
         assert!(err.contains("[REDACTED]"), "{err}");
-    }
-
-    #[test]
-    fn ensure_repo_checked_out_creates_local_branch_when_remote_branch_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let origin = dir.path().join("origin.git");
-        let seed = dir.path().join("seed");
-        let work = dir.path().join("workspace");
-        let run_git = |cwd: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .current_dir(cwd)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.com")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.com")
-                .output()
-                .expect("git invocation");
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        std::fs::create_dir_all(&origin).unwrap();
-        std::fs::create_dir_all(&seed).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-        run_git(&origin, &["init", "--bare", "--initial-branch=main"]);
-        run_git(&seed, &["init", "--initial-branch=main"]);
-        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
-        run_git(&seed, &["add", "README.md"]);
-        run_git(&seed, &["commit", "-m", "init"]);
-        run_git(
-            &seed,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
-        run_git(&seed, &["push", "-u", "origin", "main"]);
-
-        let spec = GuestRepoSpec {
-            repo: origin.to_str().unwrap().to_string(),
-            branch: Some("agent/fresh-local-branch".to_string()),
-            base: Some("main".to_string()),
-        };
-        ensure_repo_checked_out(&work, &spec, Some(Path::new("git")))
-            .expect("missing remote branch should fall back to base and create local branch");
-        assert_eq!(
-            run_git(&work, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "agent/fresh-local-branch"
-        );
-        assert_eq!(
-            std::fs::read_to_string(work.join("README.md")).unwrap(),
-            "hello\n"
-        );
     }
 
     #[test]
