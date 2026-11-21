@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { createEffect, createSignal, onCleanup, untrack } from 'solid-js';
 
 export type RequestOptions = {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -6,6 +6,10 @@ export type RequestOptions = {
   signal?: AbortSignal;
   accept?: string;
 };
+
+export class HttpError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
 
 export async function request(path: string, options: RequestOptions = {}): Promise<Response> {
   const { method = 'GET', body, signal, accept = 'application/json' } = options;
@@ -18,7 +22,7 @@ export async function request(path: string, options: RequestOptions = {}): Promi
   if (!response.ok) {
     const error = await response.json().catch(() => null) as { error?: unknown; message?: unknown } | null;
     const message = error?.error ?? error?.message;
-    throw new Error(typeof message === 'string' ? message : 'HTTP ' + response.status);
+    throw new HttpError(typeof message === 'string' ? message : 'Request failed (HTTP ' + response.status + ')', response.status);
   }
   return response;
 }
@@ -29,33 +33,63 @@ export async function api<T = unknown>(path: string, options?: RequestOptions): 
   return (text ? JSON.parse(text) : null) as T;
 }
 
+/** True when the coordinator does not serve this endpoint yet (older build). */
+export function isUnavailable(error: unknown) {
+  return error instanceof HttpError && [404, 405, 501].includes(error.status);
+}
+
+/** Resolves to `null` when the endpoint does not exist on this coordinator. */
+export async function optional<T>(path: string, options?: RequestOptions): Promise<T | null> {
+  try { return await api<T>(path, options); } catch (error) { if (isUnavailable(error)) return null; throw error; }
+}
+
 export function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong. Try again.';
 }
 
-export function agentPath(id: string) { return '/v1/agents/' + encodeURIComponent(id); }
+export function agentPath(name: string) { return '/v1/agents/' + encodeURIComponent(name); }
 
-export function useResource<T>(load: (signal: AbortSignal) => Promise<T>, interval = 0) {
-  const [snapshot, setSnapshot] = useState<{ load: typeof load; data?: T; error?: string; updated?: number }>({ load });
-  const [revision, setRevision] = useState(0);
-  const refresh = useCallback(() => setRevision(value => value + 1), []);
-  useEffect(() => {
+export interface Resource<T> {
+  data: () => T | undefined;
+  error: () => string | undefined;
+  updated: () => number | undefined;
+  loading: () => boolean;
+  refresh: () => void;
+}
+
+/**
+ * Loads (and optionally polls) a JSON resource. `key` is tracked: when it
+ * changes the previous data is dropped and the loader runs again. The loader
+ * itself is untracked, so it may read any signal at call time.
+ */
+export function createPoll<T>(load: (signal: AbortSignal) => Promise<T>, options: { interval?: number; key?: () => unknown } = {}): Resource<T> {
+  const [state, setState] = createSignal<{ data?: T; error?: string; updated?: number }>({});
+  const [revision, setRevision] = createSignal(0);
+  let lastKey: unknown = Symbol('initial');
+  createEffect(() => {
+    const key = options.key?.();
+    revision();
+    if (key !== lastKey) { lastKey = key; setState({}); }
     const controller = new AbortController();
     let timer: number | undefined;
-    async function update() {
+    const update = async () => {
       try {
-        const data = await load(controller.signal);
-        if (!controller.signal.aborted) setSnapshot({ load, data, updated: Date.now() });
+        const data = await untrack(() => load(controller.signal));
+        if (!controller.signal.aborted) setState({ data, updated: Date.now() });
       } catch (error) {
-        if (!controller.signal.aborted) setSnapshot(previous => ({
-          ...(previous.load === load ? previous : { load }), error: errorMessage(error),
-        }));
+        if (!controller.signal.aborted) setState(previous => ({ ...previous, error: errorMessage(error) }));
       } finally {
-        if (interval && !controller.signal.aborted) timer = window.setTimeout(update, interval);
+        if (options.interval && !controller.signal.aborted) timer = window.setTimeout(update, document.hidden ? options.interval * 3 : options.interval);
       }
-    }
+    };
     void update();
-    return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [load, interval, revision]);
-  return { ...(snapshot.load === load ? snapshot : { load, data: undefined, error: undefined, updated: undefined }), refresh };
+    onCleanup(() => { controller.abort(); window.clearTimeout(timer); });
+  });
+  return {
+    data: () => state().data,
+    error: () => state().error,
+    updated: () => state().updated,
+    loading: () => state().data === undefined && !state().error,
+    refresh: () => setRevision(value => value + 1),
+  };
 }

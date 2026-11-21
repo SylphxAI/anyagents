@@ -1,133 +1,177 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowRight, Bot, ChartNoAxesCombined, Command, KeyRound, Layers, LogOut, Network, Plus, Search, Timer, WalletCards } from 'lucide-react';
-import { api, errorMessage, useResource } from './api';
-import { AgentAction } from './fleet/AgentAction';
-import type { FleetAction } from './fleet/AgentAction';
-import { Fleet } from './fleet/Fleet';
-import type { Agent, Overview, Session } from './types';
-import { Dialog, Dot, Empty, Mark, Problem, ThemeButton, useTheme } from './ui';
-import { AutomationsView } from './views/AutomationsView';
-import { ChannelsView } from './views/ChannelsView';
-import { ProfilesView } from './views/ProfilesView';
-import { GrantDialog, SecretsView } from './views/SecretsView';
-import { UsageView } from './views/UsageView';
+import { For, Match, Show, Switch, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
+import { Dynamic } from 'solid-js/web';
+import { Activity, LogOut, Menu, Search, X } from 'lucide-solid';
+import { api, createPoll, errorMessage, optional } from './api';
+import { AgentDialogs } from './agents/AgentDialogs';
+import { ConnectDialog } from './accounts/ConnectDialog';
+import { groupProfiles } from './lib/providers';
+import { agentStatus } from './lib/status';
+import { buildForest } from './lib/tree';
+import { NAV } from './nav';
+import { pageHref, parseRoute } from './route';
+import { ConsoleContext } from './state';
+import type { AgentAction, ConnectRequest, ConsoleState, Fleet } from './state';
+import { runtimeIssues } from './lib/issues';
+import type { Agent, Overview, Page, Profile, Session, VersionsReport } from './types';
+import { Palette } from './ui/Palette';
+import { Dot, Kbd, Mark, Problem, ThemeToggle } from './ui/primitives';
+import { OverviewPage } from './pages/OverviewPage';
+import { AgentsPage } from './pages/AgentsPage';
+import { AccountsPage } from './pages/AccountsPage';
+import { KnowledgePage } from './pages/KnowledgePage';
+import { VersionsPage } from './pages/VersionsPage';
+import { SystemIssuesPage } from './pages/SystemIssuesPage';
+import { SettingsPage } from './pages/SettingsPage';
 
-const tabs = [
-  { id: 'fleet', label: 'Fleet', icon: Layers }, { id: 'profiles', label: 'Profiles & Quota', icon: WalletCards },
-  { id: 'usage', label: 'Usage', icon: ChartNoAxesCombined }, { id: 'automations', label: 'Automations', icon: Timer },
-  { id: 'channels', label: 'Channels & Groups', icon: Network }, { id: 'secrets', label: 'Secrets', icon: KeyRound },
-] as const;
-type Tab = typeof tabs[number]['id'];
-function route() {
-  const [section, raw] = window.location.hash.slice(1).split('/');
-  const tab: Tab = tabs.find(tab => tab.id === section || (section === 'schedules' && tab.id === 'automations'))?.id ?? 'fleet';
-  let id: string | undefined;
-  try { id = raw ? decodeURIComponent(raw) : undefined; } catch { /* Ignore a malformed link. */ }
-  return { tab, id };
-}
-const loadRoster = (signal: AbortSignal) => api<{ agents: Agent[] }>('/v1/agents?state=all', { signal });
-const loadOverview = (signal: AbortSignal) => api<Overview>('/admin/api/overview', { signal });
-const loadSession = (signal: AbortSignal) => api<Session>('/admin/auth/me', { signal });
 const noAgents: Agent[] = [];
-const fleetLink = (id?: string) => '#fleet' + (id ? '/' + encodeURIComponent(id) : '');
 
 export function App() {
-  const [location, setLocation] = useState(route);
-  const theme = useTheme();
-  const roster = useResource(loadRoster, 5000);
-  const overview = useResource(loadOverview, 5000);
-  const session = useResource(loadSession, 30000);
-  const [palette, setPalette] = useState(false);
-  const [action, setAction] = useState<FleetAction>();
-  const [grant, setGrant] = useState<Agent>();
-  const [grantVersion, setGrantVersion] = useState(0);
-  const [revision, setRevision] = useState(0);
-  const [signoutError, setSignoutError] = useState('');
-  const [expired, setExpired] = useState(false);
-  const [signingOut, setSigningOut] = useState(false);
-  const agents = roster.data?.agents ?? noAgents;
-  const selected = agents.find(agent => agent.id === location.id || agent.name === location.id);
-  useEffect(() => {
-    const onHash = () => setLocation(route());
-    const onExpired = () => setExpired(true);
-    function onKey(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !document.querySelector('dialog[open]')) { event.preventDefault(); setPalette(true); }
-    }
-    window.addEventListener('hashchange', onHash); window.addEventListener('session-expired', onExpired); window.addEventListener('keydown', onKey);
-    return () => { window.removeEventListener('hashchange', onHash); window.removeEventListener('session-expired', onExpired); window.removeEventListener('keydown', onKey); };
-  }, []);
-  const select = (id?: string) => { window.location.hash = fleetLink(id); };
-  const updated = () => { roster.refresh(); overview.refresh(); setRevision(value => value + 1); };
-  const grantsUpdated = () => { updated(); setGrantVersion(value => value + 1); };
-  async function logout() {
-    setSigningOut(true); setSignoutError('');
-    try { await api('/admin/auth/logout', { method: 'POST' }); window.location.assign('/'); }
-    catch (cause) { setSignoutError(errorMessage(cause)); setSigningOut(false); }
-  }
-  const unhealthy = Boolean(roster.error || overview.error);
-  const who = session.data?.name || session.data?.email || (session.data?.mode === 'local_trusted' ? 'Local operator' : 'Operator');
-  return <>
-    <a className="skip-link" href="#console-content" onClick={event => { event.preventDefault(); document.querySelector<HTMLElement>('#console-content')?.focus(); }}>Skip to content</a>
-    <header className="topbar"><div className="topbar-inner">
-      <a href="#fleet" className="brand"><Mark /><strong>AnyAgents</strong></a>
-      <nav aria-label="Control plane">{tabs.map(({ id, label, icon: Icon }) => <a key={id} href={'#' + id} aria-current={id === location.tab ? 'page' : undefined}><Icon size={15} />{label}</a>)}</nav>
-      <div className="topbar-tools"><button className="command-trigger" aria-label="Command palette" onClick={() => setPalette(true)}><Search size={16} /><span>Search</span><kbd><Command size={11} />K</kbd></button>
-        <ThemeButton {...theme} />{session.data?.mode === 'oidc' && <button className="icon-button" title="Sign out" aria-label="Sign out" disabled={signingOut} onClick={() => void logout()}><LogOut size={16} /></button>}
-      </div>
-    </div></header>
-    <main className="workspace" id="console-content" tabIndex={-1}>
-      <div className="context-bar"><span><Activity size={14} /> Coordinator <i /> {session.data?.serverless ? 'Serverless' : 'Control plane'}</span><span><Dot tone={unhealthy ? 'errored' : roster.updated ? 'working' : 'idle'} />{unhealthy ? 'Poll failed' : roster.updated ? 'Live · 5s' : 'Connecting'}<i /><span className="operator" title={session.data?.email}>{who}</span></span></div>
-      {(expired || signoutError || session.error || roster.error || overview.error) && <Problem retry={!expired ? () => { updated(); session.refresh(); } : undefined}>{expired ? <>Your session ended. <a href="/">Sign in again</a>.</> : (signoutError || session.error || roster.error || overview.error)}</Problem>}
-      {location.tab === 'fleet' && <Fleet agents={agents} overview={overview.data} selected={selected} select={select} open={setAction} grants={setGrant} refreshVersion={revision} />}
-      {location.tab === 'profiles' && <ProfilesView />}
-      {location.tab === 'usage' && <UsageView />}
-      {location.tab === 'automations' && <AutomationsView agents={agents} overview={overview.data} />}
-      {location.tab === 'channels' && <ChannelsView />}
-      {location.tab === 'secrets' && <SecretsView agents={agents} openGrants={setGrant} grantVersion={grantVersion} />}
-    </main>
-    {palette && <Palette agents={agents} selected={selected} close={() => setPalette(false)} select={select} act={setAction} grants={setGrant} />}
-    {action && <AgentAction action={action} close={() => setAction(undefined)} updated={updated} spawned={select} />}
-    {grant && <GrantDialog agent={grant} close={() => setGrant(undefined)} updated={grantsUpdated} />}
-  </>;
-}
+  const [route, setRoute] = createSignal(parseRoute());
+  const roster = createPoll(signal => api<{ agents: Agent[] }>('/v1/agents?state=all', { signal }), { interval: 5000 });
+  const overview = createPoll(signal => api<Overview>('/admin/api/overview', { signal }), { interval: 5000 });
+  const session = createPoll(signal => api<Session>('/admin/auth/me', { signal }), { interval: 30000 });
+  const versions = createPoll(signal => optional<VersionsReport>('/admin/api/versions', { signal }), { interval: 30000 });
+  const issues = createPoll(async signal => {
+    const payload = await optional<unknown>('/admin/api/runtime-issues', { signal });
+    return payload === null ? null : runtimeIssues(payload);
+  }, { interval: 30000 });
+  let wantFresh = false;
+  const profiles = createPoll(signal => {
+    const fresh = wantFresh; wantFresh = false;
+    return api<Profile[]>('/v1/profiles' + (fresh ? '?fresh=1' : ''), { signal });
+  }, { interval: 60000 });
+  const [palette, setPalette] = createSignal(false);
+  const [drawer, setDrawer] = createSignal(false);
+  const [action, setAction] = createSignal<AgentAction>();
+  const [connect, setConnect] = createSignal<ConnectRequest>();
+  const [revision, setRevision] = createSignal(0);
+  const [expired, setExpired] = createSignal(false);
+  const [signoutError, setSignoutError] = createSignal('');
 
-type CommandItem = { id: string; title: string; detail: string; icon: React.ElementType; run: () => void };
-function fuzzy(query: string, target: string) {
-  const text = target.toLowerCase();
-  let rank = 0;
-  for (const token of query.toLowerCase().trim().split(/\s+/)) {
-    const match = text.indexOf(token);
-    if (match >= 0) { rank += match; continue; }
-    let cursor = 0;
-    for (const char of token) { const position = text.indexOf(char, cursor); if (position < 0) return Infinity; cursor = position + 1; }
-    rank += 100 + cursor;
+  onMount(() => {
+    const onHash = () => {
+      setRoute(parseRoute());
+      setDrawer(false);
+      setConnect(undefined);
+      setAction(undefined);
+      setPalette(false);
+    };
+    const onExpired = () => setExpired(true);
+    const onKey = (event: KeyboardEvent) => {
+      if (document.querySelector('dialog[open]')) return;
+      const target = event.target as HTMLElement | null;
+      const typing = target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+      if (((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') || (event.key === '/' && !typing)) {
+        event.preventDefault(); setPalette(true);
+      }
+    };
+    window.addEventListener('hashchange', onHash); window.addEventListener('session-expired', onExpired); window.addEventListener('keydown', onKey);
+    onCleanup(() => { window.removeEventListener('hashchange', onHash); window.removeEventListener('session-expired', onExpired); window.removeEventListener('keydown', onKey); });
+  });
+
+  const fleet = createMemo<Fleet>(() => {
+    const agents = roster.data()?.agents ?? noAgents;
+    const live = agents.filter(agent => agent.state !== 'archived');
+    return {
+      agents, live, forest: buildForest(agents),
+      working: live.filter(agent => agentStatus(agent) === 'working'),
+      errored: live.filter(agent => agentStatus(agent) === 'errored'),
+      archived: agents.length - live.length,
+    };
+  });
+  const groups = createMemo(() => groupProfiles(profiles.data() ?? []));
+  const accounts = createMemo(() => groups().flatMap(group => group.accounts));
+
+  const refreshAll = () => { roster.refresh(); overview.refresh(); versions.refresh(); issues.refresh(); setRevision(value => value + 1); };
+  const state: ConsoleState = {
+    session, roster, overview, profiles, versions, issues, fleet, groups, accounts, revision, refreshAll,
+    refreshProfiles: (fresh = false) => { wantFresh = fresh; profiles.refresh(); },
+    act: next => setAction(() => next), connect: request => setConnect(request ?? {}), openPalette: () => setPalette(true),
+  };
+
+  const badges = createMemo(() => {
+    const expiredAccounts = accounts().filter(account => account.status === 'expired').length;
+    const outdated = (versions.data()?.agents ?? []).filter(agent => agent.upgrade_status === 'outdated_idle').length;
+    const result: Partial<Record<Page, { count: number; tone: 'bad' | 'warn' | 'muted'; label: string }[]>> = {
+      agents: [
+        ...(fleet().working.length ? [{ count: fleet().working.length, tone: 'muted' as const, label: ' working' }] : []),
+        ...(fleet().errored.length ? [{ count: fleet().errored.length, tone: 'bad' as const, label: ' errored' }] : []),
+      ],
+      accounts: expiredAccounts ? [{ count: expiredAccounts, tone: 'bad', label: ' expired' }] : [],
+      versions: outdated ? [{ count: outdated, tone: 'warn', label: ' outdated' }] : [],
+    };
+    return result;
+  });
+  const unhealthy = () => Boolean(roster.error() || overview.error());
+  const who = () => session.data()?.name || session.data()?.email || (session.data()?.mode === 'local_trusted' ? 'Local operator' : 'Operator');
+  const current = () => NAV.find(item => item.page === route().page)!;
+
+  async function logout() {
+    setSignoutError('');
+    try { await api('/admin/auth/logout', { method: 'POST' }); window.location.assign('/'); }
+    catch (cause) { setSignoutError(errorMessage(cause)); }
   }
-  return rank;
-}
-function Palette({ agents, selected, close, select, act, grants }: { agents: Agent[]; selected?: Agent; close: () => void; select: (id: string) => void; act: (action: FleetAction) => void; grants: (agent: Agent) => void }) {
-  const [query, setQuery] = useState('');
-  const [position, setPosition] = useState(0);
-  const active = useRef<HTMLButtonElement>(null);
-  const items = useMemo(() => {
-    const commands: CommandItem[] = [...tabs.map(({ id, label, icon }) => ({ id, title: label, detail: 'Navigate', icon, run: () => { window.location.hash = '#' + id; } })),
-      { id: 'spawn', title: 'Spawn agent', detail: 'Action', icon: Plus, run: () => act({ kind: 'spawn' }) },
-      ...agents.map(agent => ({ id: agent.id, title: agent.name, detail: agent.harness || 'Agent', icon: Bot, run: () => select(agent.id) }))];
-    if (selected && selected.state !== 'archived') {
-      commands.push({ id: 'child', title: 'Spawn child', detail: selected.name, icon: Plus, run: () => act({ kind: 'spawn', parent: selected }) },
-        { id: 'runtime', title: 'Switch runtime', detail: selected.name, icon: Activity, run: () => act({ kind: 'runtime', agent: selected }) },
-        { id: 'grants', title: 'Manage secret grants', detail: selected.name, icon: KeyRound, run: () => grants(selected) });
-    }
-    return commands.map(item => ({ item, rank: fuzzy(query, item.title + ' ' + item.detail) })).filter(({ rank }) => Number.isFinite(rank)).sort((a, b) => a.rank - b.rank).map(({ item }) => item);
-  }, [agents, query, selected, select, act, grants]);
-  const index = Math.min(position, items.length - 1);
-  useEffect(() => { active.current?.scrollIntoView({ block: 'nearest' }); }, [index]);
-  function run(item: CommandItem) { close(); item.run(); }
-  return <Dialog title="Command palette" close={close} className="palette"><div className="palette-body">
-    <label className="tree-search"><Search size={18} /><input autoFocus placeholder="Find an agent or command…" aria-label="Find an agent or command" value={query} onChange={event => { setPosition(0); setQuery(event.target.value); }} onKeyDown={event => {
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setPosition(items.length ? (index + items.length + (event.key === 'ArrowDown' ? 1 : -1)) % items.length : 0); }
-      if (event.key === 'Enter' && items[index]) { event.preventDefault(); run(items[index]); }
-    }} /></label>
-    <div className="command-results">{items.length ? items.map((item, itemIndex) => <button ref={index === itemIndex ? active : undefined} className="command-result" data-active={index === itemIndex} key={item.id} onClick={() => run(item)}><item.icon size={16} /><strong>{item.title}</strong><span>{item.detail}</span><ArrowRight size={15} /></button>) : <Empty>No matching commands.</Empty>}</div>
-    <div className="palette-hint"><span><kbd>↑</kbd> <kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>Esc</kbd> Close</span></div>
-  </div></Dialog>;
+
+  return <ConsoleContext.Provider value={state}>
+    <a class="skip-link" href="#main" onClick={event => { event.preventDefault(); document.getElementById('main')?.focus(); }}>Skip to content</a>
+    <div class={'app' + (drawer() ? ' drawer-open' : '')}>
+      <aside class="sidebar" aria-label="Primary">
+        <div class="sidebar-brand">
+          <a href="#overview" class="brand"><Mark /><span>AnyAgents</span></a>
+          <button type="button" class="btn icon ghost sm drawer-close" aria-label="Close navigation" onClick={() => setDrawer(false)}><X size={15} /></button>
+        </div>
+        <nav class="nav" aria-label="Console">
+          <For each={NAV}>{item => <a href={pageHref(item.page)} class="nav-item" aria-current={route().page === item.page ? 'page' : undefined}>
+            <Dynamic component={item.icon} size={15} aria-hidden="true" /><span class="nav-label">{item.label}</span>
+            <For each={badges()[item.page] ?? []}>{badge => <span class={'nav-badge num ' + badge.tone} aria-label={badge.count + badge.label}>{badge.count}</span>}</For>
+          </a>}</For>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="coordinator-status" title={unhealthy() ? 'The last poll failed' : 'Polling every 5 seconds'}>
+            <Dot tone={unhealthy() ? 'bad' : roster.updated() ? 'ok' : 'muted'} pulse={!unhealthy() && Boolean(roster.updated())} />
+            <span>{unhealthy() ? 'Connection issue' : roster.updated() ? 'Live' : 'Connecting…'}</span>
+            <span class="subtle">{session.data()?.serverless ? 'Serverless' : 'Coordinator'}</span>
+          </div>
+          <div class="operator">
+            <span class="avatar" aria-hidden="true">{who().slice(0, 1).toUpperCase()}</span>
+            <span class="operator-name" title={session.data()?.email}>{who()}</span>
+            <Show when={session.data()?.mode === 'oidc'}><button type="button" class="btn icon ghost sm" title="Sign out" aria-label="Sign out" onClick={() => void logout()}><LogOut size={14} /></button></Show>
+          </div>
+        </div>
+      </aside>
+      <div class="scrim" aria-hidden="true" onClick={() => setDrawer(false)} />
+      <div class="main">
+        <header class="topbar">
+          <button type="button" class="btn icon ghost menu-button" aria-label="Open navigation" onClick={() => setDrawer(true)}><Menu size={16} /></button>
+          <div class="crumb"><Dynamic component={current().icon} size={14} aria-hidden="true" /><span>{current().label}</span></div>
+          <button type="button" class="search-trigger" onClick={() => setPalette(true)} aria-label="Search agents, accounts, and pages">
+            <Search size={14} aria-hidden="true" /><span>Search agents, accounts, pages…</span><Kbd>⌘K</Kbd>
+          </button>
+          <div class="topbar-tools">
+            <span class={'live-chip' + (unhealthy() ? ' bad' : '')}><Activity size={13} aria-hidden="true" />{unhealthy() ? 'Poll failed' : 'Live'}</span>
+            <ThemeToggle />
+          </div>
+        </header>
+        <main id="main" class="content" tabindex="-1">
+          <Show when={expired() || signoutError() || session.error() || roster.error()}>
+            <div class="banner"><Problem retry={expired() ? undefined : () => { refreshAll(); session.refresh(); }}>
+              {expired() ? <>Your session ended. <a href="/">Sign in again</a>.</> : signoutError() || roster.error() || session.error()}
+            </Problem></div>
+          </Show>
+          <Switch>
+            <Match when={route().page === 'overview'}><OverviewPage /></Match>
+            <Match when={route().page === 'agents'}><AgentsPage selectedId={(route() as { id?: string }).id} /></Match>
+            <Match when={route().page === 'accounts'}><AccountsPage /></Match>
+            <Match when={route().page === 'knowledge'}><KnowledgePage /></Match>
+            <Match when={route().page === 'versions'}><VersionsPage /></Match>
+            <Match when={route().page === 'issues'}><SystemIssuesPage /></Match>
+            <Match when={route().page === 'settings'}><SettingsPage tab={(route() as { tab: 'channels' }).tab} /></Match>
+          </Switch>
+        </main>
+      </div>
+    </div>
+    <Show when={palette()}><Palette close={() => setPalette(false)} /></Show>
+    <Show when={action()} keyed>{value => <AgentDialogs action={value} close={() => setAction(undefined)} />}</Show>
+    <Show when={connect()} keyed>{value => <ConnectDialog request={value} close={() => setConnect(undefined)} />}</Show>
+  </ConsoleContext.Provider>;
 }

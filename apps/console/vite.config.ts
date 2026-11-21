@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compile } from 'tailwindcss';
 import { defineConfig } from 'vite';
+import solid from 'vite-plugin-solid';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -11,12 +12,12 @@ const outDir = resolve(root, '../../crates/anyagents/src/server/console');
 
 export default defineConfig({
   root,
-  plugins: [{
+  plugins: [solid(), {
     name: 'console-tailwind',
     enforce: 'pre',
     async transform(css, id) {
       if (id !== resolve(root, 'src/style.css')) return;
-      // Compile Tailwind directly; the native CSS optimizer is not needed.
+      // Compile Tailwind v4 directly from the lockfile; no native optimizer or CDN.
       const compiler = await compile(css, {
         base: root,
         async loadStylesheet(id) {
