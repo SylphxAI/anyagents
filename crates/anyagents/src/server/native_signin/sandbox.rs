@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,11 +17,17 @@ use crate::sandbox_providers::providers::{
     EnsureSandboxRequest, ExecRequest, LeasePolicy, ProviderKind, SandboxHandle, SandboxProvider,
     shell_single_quote,
 };
+use anyagents_core::stateless::generate_callback_token;
+use anyagents_harness::masking::mask_known_secrets;
 
 const PTY: &str = include_str!("login_pty.py");
 // Installed by Dockerfile.sandbox. A coordinator path is not a guest path.
 const SANDBOX_PYTHON: &str = "/usr/bin/python3";
 const MAX_FILE: usize = 64 * 1024;
+const SLOT: &str = "anyagents-native-signin";
+const ENSURE_TIMEOUT: Duration = Duration::from_secs(90);
+const KEEPALIVE: Duration = Duration::from_secs(6);
+const CANCELLED: &str = "Sign-in cancelled.";
 const SESSION_TIME: Duration = Duration::from_secs(245);
 
 pub(super) struct Spec {
@@ -74,32 +81,40 @@ impl Spec {
 }
 
 pub(super) async fn run(
-    id: &str,
     state: AppState,
     spec: Spec,
     serverless: bool,
     output: &Output,
     input: mpsc::Receiver<Input>,
 ) -> Result<String, String> {
-    // Only a random suffix, not the input session's bearer, enters provider logs.
-    let name = format!("signin-{}-{}", spec.harness, &id[4..24]);
-    let directory = format!("/tmp/anyagents-{name}");
+    send(
+        output,
+        "prompt",
+        format!("Preparing an isolated {} sign-in…", spec.harness),
+    )
+    .await;
     let local = if serverless {
         None
     } else {
-        Some(tempfile::tempdir().map_err(|_| "Could not allocate an isolated login directory.")?)
+        Some(
+            tempfile::tempdir()
+                .map_err(|err| report("allocate local workspace", &err.to_string()))?,
+        )
     };
-    let (provider, mut request): (Arc<dyn SandboxProvider>, _) = if let Some(dir) = &local {
+    let (provider, request): (Arc<dyn SandboxProvider>, _) = if let Some(dir) = &local {
         (
             Arc::new(LocalHostProvider::with_root(dir.path())),
-            EnsureSandboxRequest::for_agent(&name),
+            EnsureSandboxRequest::for_agent(SLOT),
         )
     } else {
         let data_dir = state.store.data_dir().to_owned();
-        let registry = tokio::task::spawn_blocking(move || resolve_remote_provider_registry(Some(&data_dir)))
-            .await.ok().and_then(Result::ok).flatten()
+        let resolve =
+            tokio::task::spawn_blocking(move || resolve_remote_provider_registry(Some(&data_dir)));
+        let registry = progress(output, "Reading sandbox configuration…", resolve).await?
+            .map_err(|err| report("read sandbox configuration", &err.to_string()))?
+            .map_err(|err| report("read sandbox configuration", &err))?
             .ok_or("Configure a working sandbox provider (`ANYAGENTS_SANDBOX_PROVIDER`) before connecting an account in serverless mode.")?;
-        (registry.active(), registry.default_ensure_request(&name))
+        (registry.active(), registry.default_ensure_request(SLOT))
     };
     // These adapters emulate stdin by putting its contents in the provider's
     // command string. Do not send authorization codes over that transport.
@@ -109,74 +124,186 @@ pub(super) async fn run(
         return Err("This sandbox provider does not support private callback input. Use a provider with native stdin transport for this sign-in.".into());
     }
     let (python, local_binary) = if provider.kind() == ProviderKind::Local {
-        let binary = local_tool(spec.binary).ok_or_else(|| {
-            format!("{} is not installed in the sign-in runtime. Install it locally or choose a sandbox image that includes it.", spec.binary)
-        })?;
-        let python = local_tool("python3").ok_or("The sign-in runtime is missing Python 3. Install or declare Python 3 with PTY support.")?;
-        (python, Some(binary))
+        (local_tool("python3")?, Some(local_tool(spec.binary)?))
     } else {
         (SANDBOX_PYTHON.to_owned(), None)
     };
-    request.lease = LeasePolicy {
-        idle_ttl_ms: 0,
-        max_lease_ttl_ms: 300_000,
-    };
-    send(
+    let files = collect(
+        &provider,
+        request,
+        &spec,
+        &python,
+        local_binary.as_deref(),
         output,
-        "prompt",
-        format!("Preparing an isolated {} sign-in…", spec.harness),
+        input,
     )
-    .await;
-    let handle = timeout(Duration::from_secs(35), provider.ensure(&request)).await
-        .map_err(|_| "Sign-in sandbox setup timed out. Check provider availability and try again.")?
-        .map_err(|_| "Could not provision the sign-in sandbox. Check the configured provider and sandbox image.")?;
-    let runner = Runner {
-        provider: provider.as_ref(),
-        handle: &handle,
-        directory: &directory,
-        python: &python,
-        local_binary: local_binary.as_deref(),
-    };
-    let result = runner.login(&spec, output, input).await;
-    // Cleanup is bounded and attempted even on cancellation; also stop the
-    // process for providers that do not terminate it when deleting the mount.
-    let _ = runner
-        .command(
-            format!("if [ -d {directory} ]; then touch {directory}/stop; fi"),
-            1500,
-        )
-        .await;
-    if !matches!(
-        timeout(Duration::from_secs(3), provider.destroy(&handle)).await,
-        Ok(Ok(()))
-    ) {
-        let _ = timeout(Duration::from_secs(3), provider.release(&handle)).await;
-    }
-    if local.is_some() {
-        let _ = std::fs::remove_dir_all(directory);
-    }
-    let files = result?;
+    .await?;
     if output.is_closed() {
-        return Err("Sign-in cancelled.".into());
+        return Err(CANCELLED.into());
     }
     let store = Arc::clone(&state.store);
     let provider = spec.provider;
     let label = tokio::task::spawn_blocking(move || identity::finish(&store, &spec, files))
         .await
-        .map_err(|_| "Could not save the authenticated profile. Try again.")??;
+        .map_err(|err| report("save authenticated profile", &err.to_string()))??;
     state.profiles.invalidate(&state.store);
     super::super::quota_rotation::profiles_changed(Some(provider));
     Ok(label)
 }
 
-fn local_tool(name: &str) -> Option<String> {
-    let tool = anyagents_toolchain::tool(name, "native-signin").ok()?;
-    let path = tool.path();
-    // The launch changes cwd to the private home; relative paths are not safe.
-    if !path.is_absolute() {
-        return None;
+fn session_request(mut request: EnsureSandboxRequest) -> EnsureSandboxRequest {
+    if let Some(volume) = &mut request.volume {
+        volume.id_or_name = SLOT.into();
     }
-    path.to_str().map(str::to_owned)
+    // The remote lease expires on the provider, including when the coordinator
+    // goes away. A new ensure reattaches and renews the lease for this volume.
+    request.lease = LeasePolicy {
+        idle_ttl_ms: 600_000,
+        max_lease_ttl_ms: 600_000,
+    };
+    request
+}
+
+async fn collect(
+    provider: &Arc<dyn SandboxProvider>,
+    request: EnsureSandboxRequest,
+    spec: &Spec,
+    python: &str,
+    local_binary: Option<&str>,
+    output: &Output,
+    input: mpsc::Receiver<Input>,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let handle = progress(
+        output,
+        "Waiting for the sign-in sandbox…",
+        ensure(provider, request),
+    )
+    .await??;
+    let runner = Runner {
+        provider: provider.as_ref(),
+        handle: &handle,
+        // Independent of the stream's bearer; only shell-safe hex enters argv.
+        directory: &format!(
+            "/tmp/anyagents-signin-{}",
+            &generate_callback_token()[4..36]
+        ),
+        python,
+        local_binary,
+    };
+    // A dropped exec future does not stop a blocking adapter. Let launch settle
+    // (bounded by exec's timeout) before asking the guest to stop this session.
+    let launch = runner.launch(spec);
+    let result = keepalive(output, "Starting the native sign-in…", launch).await;
+    let result = match result {
+        Ok(()) if !output.is_closed() => progress(
+            output,
+            "Waiting for native sign-in to finish…",
+            runner.login(spec, output, input),
+        )
+        .await
+        .and_then(|result| result),
+        Ok(()) => Err(CANCELLED.into()),
+        Err(err) => Err(err),
+    };
+    let cleanup = runner.cleanup().await;
+    let files = result?;
+    cleanup?;
+    Ok(files)
+}
+
+async fn ensure(
+    provider: &Arc<dyn SandboxProvider>,
+    request: EnsureSandboxRequest,
+) -> Result<SandboxHandle, String> {
+    let request = session_request(request);
+    timeout(ENSURE_TIMEOUT, provider.ensure(&request))
+        .await
+        .map_err(|err| report("prepare sandbox (90-second deadline)", &err.to_string()))?
+        .map_err(|err| report("prepare sandbox", &err))
+}
+
+async fn progress<T>(
+    output: &Output,
+    text: &'static str,
+    work: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        _ = output.closed() => Err(CANCELLED.into()),
+        result = keepalive(output, text, work) => Ok(result),
+    }
+}
+
+async fn keepalive<T>(output: &Output, text: &'static str, work: impl Future<Output = T>) -> T {
+    let mut tick = tokio::time::interval_at(Instant::now() + KEEPALIVE, KEEPALIVE);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = tick.tick() => {
+                // Never block the actual operation on an unread stream. The
+                // console retains 60 events; the session deadline bounds ticks.
+                if let Ok(line) = serde_json::to_string(&super::SignInLine { kind: "progress", text: text.into() }) {
+                    let _ = output.try_send(line);
+                }
+            }
+        }
+    }
+}
+
+fn local_tool(name: &str) -> Result<String, String> {
+    let tool = anyagents_toolchain::tool(name, "native-signin")
+        .map_err(|err| report("resolve sign-in executable", &err.to_string()))?;
+    tool.path()
+        .to_str()
+        .filter(|_| tool.path().is_absolute())
+        .map(str::to_owned)
+        .ok_or_else(|| "The sign-in executable must have an absolute UTF-8 path.".into())
+}
+
+// Provider text is for operator logs, not the HTTP stream. Strip URL
+// credentials/query strings in addition to the shared credential masker.
+fn diagnostic(error: &str) -> String {
+    let sanitized = mask_known_secrets(error);
+    let detail = sanitized
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") {
+                "[endpoint]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(1024)
+        .collect()
+}
+
+fn report(operation: &str, error: &str) -> String {
+    eprintln!("native sign-in: {operation}: {}", diagnostic(error));
+    format!("Could not {operation}. Check the sign-in runtime and coordinator logs, then retry.")
+}
+
+// Exec adapters may reflect the command or response, including callback stdin,
+// credential file bytes, and the PTY transcript. Keep only the status from such
+// failures, never the provider's unstructured payload.
+fn private_exec_error(operation: &str, error: &str) -> String {
+    let status = error
+        .split_once("HTTP ")
+        .and_then(|(_, tail)| tail.get(..3))
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()));
+    report(
+        operation,
+        &status.map_or_else(
+            || "exec transport failed (private payload omitted)".into(),
+            |s| format!("HTTP {s} (private payload omitted)"),
+        ),
+    )
 }
 
 struct Runner<'a> {
@@ -191,28 +318,56 @@ struct Runner<'a> {
 impl Runner<'_> {
     async fn exec(
         &self,
+        operation: &str,
         request: ExecRequest,
         ms: u64,
+        private: bool,
     ) -> Result<crate::sandbox_providers::providers::ExecOutput, String> {
-        timeout(
+        let result = timeout(
             Duration::from_millis(ms + 1000),
             self.provider
                 .exec(self.handle, &request.with_timeout_ms(ms)),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .ok_or_else(|| {
-            "Could not reach the sign-in sandbox. Check the provider and retry.".to_owned()
-        })
+        .map_err(|err| report(operation, &err.to_string()))?
+        .map_err(|err| {
+            if private {
+                private_exec_error(operation, &err)
+            } else {
+                report(operation, &err)
+            }
+        })?;
+        if result.exit_code != 0 {
+            let detail = if private {
+                String::new()
+            } else {
+                result.stderr.clone()
+            };
+            return Err(report(
+                operation,
+                &format!("exec exited {}: {detail}", result.exit_code),
+            ));
+        }
+        Ok(result)
     }
 
-    async fn command(
-        &self,
-        command: String,
-        ms: u64,
-    ) -> Result<crate::sandbox_providers::providers::ExecOutput, String> {
-        self.exec(ExecRequest::shell(command), ms).await
+    async fn cleanup(&self) -> Result<(), String> {
+        // The supervisor owns the PTY and removes the home. Never kill by a PID
+        // read from disk or remove the directory while the CLI can still write.
+        self.exec(
+            "clean up sign-in workspace",
+            ExecRequest::shell(format!(
+                "cd {dir} 2>/dev/null || exit 0; /usr/bin/touch stop || exit 1; \
+             for i in 1 2 3 4 5 6 7 8 9 10 11 12; do \
+                 [ -d {dir} ] || exit 0; sleep 0.5; \
+             done; [ ! -d {dir} ]",
+                dir = self.directory,
+            )),
+            7000,
+            false,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn launch(&self, spec: &Spec) -> Result<(), String> {
@@ -229,19 +384,14 @@ impl Runner<'_> {
             |path| format!("binary={}", shell_single_quote(path)),
         );
         let python = shell_single_quote(self.python);
-        let result = self.command(format!(
-            "umask 077; {binary}; [ -f \"$binary\" ] && [ -x \"$binary\" ] || exit 127; [ -f {python} ] && [ -x {python} ] || exit 126; \
-             /bin/mkdir {dir} && cd {dir} || exit 125\n\
-             /bin/cat > login_pty.py <<'ANYAGENTS_PTY'\n{PTY}\nANYAGENTS_PTY\n\
-             /usr/bin/nohup {python} login_pty.py {harness} {credential} \"$binary\" {args} </dev/null >runner.log 2>&1 &",
+        let script = shell_single_quote(PTY);
+        self.exec("start native sign-in", ExecRequest::shell(format!(
+            "{binary}; [ -f \"$binary\" ] && [ -x \"$binary\" ] || {{ echo 'native login executable unavailable' >&2; exit 127; }}; \
+             [ -f {python} ] && [ -x {python} ] || {{ echo 'Python 3 unavailable' >&2; exit 126; }}; \
+             /usr/bin/nohup {python} -I -c {script} {dir} {harness} {credential} \"$binary\" {args} </dev/null >/dev/null 2>&1 &",
             harness = spec.harness, credential = spec.credential, args = spec.args,
-        ), 12_000).await?;
-        match result.exit_code {
-            0 => Ok(()),
-            127 => Err(format!("{} is not installed in the sign-in runtime. Install it locally or choose a sandbox image that includes it.", spec.binary)),
-            126 => Err("The sign-in runtime is missing Python 3. Use a sandbox image with Python 3 and PTY support.".into()),
-            _ => Err("Could not initialize the private sign-in workspace. Check sandbox permissions.".into()),
-        }
+        )), 12_000, false).await?;
+        Ok(())
     }
 
     async fn login(
@@ -250,14 +400,13 @@ impl Runner<'_> {
         output: &Output,
         mut input: mpsc::Receiver<Input>,
     ) -> Result<BTreeMap<String, Vec<u8>>, String> {
-        self.launch(spec).await?;
-        let deadline = Instant::now() + SESSION_TIME;
+        let started = Instant::now();
+        let deadline = started + SESSION_TIME;
         let mut transcript = Transcript::default();
         let mut log = Vec::new();
         let mut next = Instant::now();
         loop {
             tokio::select! {
-                _ = output.closed() => return Err("Sign-in cancelled.".into()),
                 _ = tokio::time::sleep_until(deadline) => return Err("Sign-in timed out. Open a fresh sign-in and complete it within four minutes.".into()),
                 Some(request) = input.recv() => {
                     let result = match transcript.relay(&request.value) {
@@ -268,13 +417,22 @@ impl Runner<'_> {
                 }
                 _ = tokio::time::sleep_until(next) => {
                     let start = log.len() + 1;
-                    let result = self.command(format!(
-                        "cd {} || exit 1; if [ -f exit ]; then cat exit; else echo pending; fi; \
-                         if [ -f output ]; then tail -c +{start} output | base64; fi", self.directory,
-                    ), 6500).await?;
-                    let (status, chunk) = result.stdout.split_once('\n').ok_or("Sign-in sandbox returned an invalid status.")?;
+                    let result = self.exec("poll native sign-in", ExecRequest::shell(format!(
+                        "cd {dir} 2>/dev/null || {{ echo starting; exit 0; }}; \
+                         /usr/bin/touch alive || exit 1; \
+                         if [ -f exit ]; then cat exit; else echo pending; fi; \
+                         if [ -f output ]; then tail -c +{start} output | base64; fi", dir = self.directory,
+                    )), 6500, true).await?;
+                    if result.stdout.trim() == "starting" {
+                        if started.elapsed() >= Duration::from_secs(10) {
+                            return Err(report("start private PTY supervisor", "the workspace did not appear after launch"));
+                        }
+                        next = Instant::now() + Duration::from_millis(200);
+                        continue;
+                    }
+                    let (status, chunk) = result.stdout.split_once('\n').ok_or_else(|| report("poll native sign-in", "exec output omitted the status line"))?;
                     let encoded: String = chunk.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                    let chunk = STANDARD.decode(encoded).map_err(|_| "Sign-in sandbox returned invalid output.")?;
+                    let chunk = STANDARD.decode(encoded).map_err(|err| report("decode sign-in output", &err.to_string()))?;
                     log.extend_from_slice(&chunk);
                     if log.len() > 262_144 { return Err("Sign-in produced too much output. Check the sandbox image.".into()); }
                     transcript.update(spec, &String::from_utf8_lossy(&log), output).await;
@@ -282,9 +440,8 @@ impl Runner<'_> {
                         "pending" => (),
                         "0" => break,
                         "124" => return Err("Sign-in expired. Start again to get a new link or device code.".into()),
-                        "125" | "126" => return Err("Could not run native sign-in in the runtime. Check that the sandbox image supports PTYs and Python 3.".into()),
-                        "127" => return Err(format!("Could not find {} in the sign-in runtime.", spec.binary)),
-                        _ => return Err(format!("{} could not complete sign-in. Check provider availability, device sign-in settings, and sandbox egress, then retry.", spec.harness)),
+                        "125" | "126" => return Err(report("run native sign-in", "PTY supervisor or CLI setup failed; check Python and PTY support")),
+                        _ => return Err(report("complete native sign-in", &format!("CLI exit status: {:?}", status.trim().parse::<i32>().ok()))),
                     }
                     next = Instant::now() + Duration::from_millis(850);
                 }
@@ -293,13 +450,14 @@ impl Runner<'_> {
         let mut files = BTreeMap::new();
         for rel in std::iter::once(spec.credential).chain(spec.account_file) {
             let got = self
-                .command(
-                    format!(
-                        "cd {} && if [ -f home/{rel} ]; then head -c {} home/{rel} | base64; fi",
-                        self.directory,
-                        MAX_FILE + 1
-                    ),
+                .exec(
+                    "read native credentials",
+                    ExecRequest::shell(format!(
+                        "cd {} && /usr/bin/touch alive && if [ -f home/{rel} ]; then head -c {} home/{rel} | base64; fi",
+                        self.directory, MAX_FILE + 1
+                    )),
                     5000,
+                    true,
                 )
                 .await?;
             let encoded: String = got
@@ -309,8 +467,8 @@ impl Runner<'_> {
                 .collect();
             let bytes = STANDARD
                 .decode(encoded)
-                .map_err(|_| "Sign-in sandbox returned invalid account data.")?;
-            if got.exit_code == 0 && !bytes.is_empty() && bytes.len() <= MAX_FILE {
+                .map_err(|err| report("decode native credentials", &err.to_string()))?;
+            if !bytes.is_empty() && bytes.len() <= MAX_FILE {
                 files.insert(rel.to_owned(), bytes);
             }
         }
@@ -318,13 +476,19 @@ impl Runner<'_> {
     }
 
     async fn relay(&self, payload: Relay<'_>) -> Result<(), &'static str> {
-        let mut data = serde_json::to_vec(&payload).map_err(|_| "Invalid callback.")?;
+        let mut data = serde_json::to_vec(&payload).map_err(|err| {
+            report("encode sign-in callback", &err.to_string());
+            "Invalid callback."
+        })?;
         data.push(b'\n');
         let request = ExecRequest::argv([self.python, "-c", "import socket, sys\nwith socket.socket(socket.AF_UNIX) as s:\n s.settimeout(6)\n s.connect('relay.sock')\n s.sendall(sys.stdin.buffer.read(16384))\n sys.exit(0 if s.recv(8) == b'ok\\n' else 1)"])
             .with_cwd(self.directory).with_stdin(data);
-        match self.exec(request, 7200).await {
-            Ok(out) if out.exit_code == 0 => Ok(()),
-            _ => Err(
+        match self
+            .exec("deliver native sign-in callback", request, 7200, true)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => Err(
                 "The sandbox could not deliver this callback. Check the pasted value or start a new sign-in.",
             ),
         }
@@ -577,6 +741,10 @@ fn strip_escapes(raw: &str) -> (String, Vec<&str>) {
     clean.push_str(rest);
     (clean, links)
 }
+
+#[cfg(test)]
+#[path = "sandbox_tests.rs"]
+mod sandbox_tests;
 
 #[cfg(test)]
 mod tests {

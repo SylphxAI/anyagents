@@ -88,8 +88,8 @@ pub(super) async fn start(
     let spec = sandbox::Spec::for_harness(canonical_harness(raw)).ok_or_else(|| ApiError::new(
         StatusCode::BAD_REQUEST, "Native sign-in supports Google Antigravity, Claude and OpenAI / Codex. For other providers, use their credential setup."))?;
     let serverless = serverless::is_serverless_mode();
-    start_session(state, move |id, state, output, input| async move {
-        sandbox::run(&id, state, spec, serverless, &output, input).await
+    start_session(state, move |_, state, output, input| async move {
+        sandbox::run(state, spec, serverless, &output, input).await
     })
 }
 
