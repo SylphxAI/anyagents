@@ -7,7 +7,7 @@ use super::helpers::{agent_by_id, hex};
 use super::mailbox::cursor;
 use super::types::{AgentSchedule, Incoming, NewSchedule, ReceiveOutcome};
 use super::{Store, now_ms};
-use crate::db::{DbExec, DbExecExt, DbRow};
+use crate::db::{DbBackend, DbExec, DbExecExt, DbRow};
 use crate::db_params;
 use crate::error::Error;
 use crate::id::AgentId;
@@ -383,6 +383,31 @@ impl Store {
                 &db_params![id.trim(), cleaned],
             )?;
             Ok(())
+        })
+    }
+
+    /// Attach a startup timer receipt only if the schedule still owns the slot
+    /// that was read before contacting the scheduler.
+    pub fn set_schedule_external_timer_id_for_slot(
+        &self,
+        id: &str,
+        expected_due: Option<i64>,
+        external_timer_id: &str,
+    ) -> Result<bool, Error> {
+        self.write_tx(|tx| {
+            let null_safe_eq = if tx.backend() == DbBackend::Postgres {
+                "IS NOT DISTINCT FROM"
+            } else {
+                "IS"
+            };
+            let updated = tx.db_execute(
+                &format!(
+                    "UPDATE agent_schedules SET external_timer_id = ?3
+                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms {null_safe_eq} ?2"
+                ),
+                &db_params![id, expected_due, external_timer_id],
+            )?;
+            Ok(updated == 1)
         })
     }
 
