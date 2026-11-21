@@ -1,7 +1,7 @@
 //! Coordinator boundary for versioned knowledge. All namespace authorization
 //! lives in the store; only this extractor may map OIDC to the owner actor.
 use anyagents_core::knowledge::{Actor, Edit, Mode, Scope};
-use anyagents_core::{AgentId, Error, Store};
+use anyagents_core::{AgentId, Error, GroupId, Store};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -10,7 +10,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::types::{AppState, spawn_store};
-use crate::auth::{AuthError, AuthRejection, Presented, Principal};
+use crate::auth::{
+    AuthError, AuthRejection, Presented, Principal, RequestAuthority, authenticate_request,
+};
+use crate::oauth_scope;
 
 mod retrieval;
 
@@ -29,11 +32,25 @@ impl FromRequestParts<AppState> for KnowledgeActor {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let oidc = Presented::of(parts).is_oidc();
-        match Principal::from_request_parts(parts, state).await? {
-            Principal::Agent { agent_id, .. } => Ok(Self(Actor::Agent(agent_id))),
-            Principal::Operator
-                if oidc
+        match authenticate_request(parts, state).await? {
+            RequestAuthority::Bearer(bearer) => {
+                let id = format!("oidc:{}", bearer.identity.sub);
+                if bearer.has_scope(oauth_scope::ADMIN) {
+                    Ok(Self(Actor::Owner(id)))
+                } else {
+                    Ok(Self(Actor::Scoped {
+                        id,
+                        read: bearer.has_scope(oauth_scope::KNOWLEDGE_READ),
+                        write: bearer.has_scope(oauth_scope::KNOWLEDGE_WRITE),
+                        grant: bearer.has_scope(oauth_scope::KNOWLEDGE_GRANT),
+                    }))
+                }
+            }
+            RequestAuthority::Principal(Principal::Agent { agent_id, .. }) => {
+                Ok(Self(Actor::Agent(agent_id)))
+            }
+            RequestAuthority::Principal(Principal::Operator)
+                if Presented::of(parts).is_console_session()
                     && parts
                         .extensions
                         .get::<crate::auth::InjectedPrincipal>()
@@ -41,9 +58,11 @@ impl FromRequestParts<AppState> for KnowledgeActor {
             {
                 Ok(Self(Actor::Owner("owner".into())))
             }
-            Principal::Operator => Err(AuthRejection(AuthError::Forbidden(
-                "knowledge requires an OIDC owner or an agent session".into(),
-            ))),
+            RequestAuthority::Principal(Principal::Operator) => {
+                Err(AuthRejection(AuthError::Forbidden(
+                    "knowledge requires an OIDC credential or an agent session".into(),
+                )))
+            }
         }
     }
 }
@@ -115,7 +134,8 @@ enum Request {
         limit: Option<usize>,
     },
     Grant {
-        agent_id: String,
+        agent_id: Option<String>,
+        group_id: Option<String>,
         namespace_pattern: String,
         mode: Mode,
     },
@@ -300,9 +320,28 @@ fn execute(store: &Store, actor: &Actor, request: Request) -> Result<Value, Erro
         )?,
         Request::Grant {
             agent_id: id,
+            group_id,
             namespace_pattern,
             mode,
-        } => json!(store.knowledge_grant(actor, &agent_id(id)?, &namespace_pattern, mode)?),
+        } => match (id, group_id) {
+            (Some(id), None) => {
+                json!(store.knowledge_grant(actor, &agent_id(id)?, &namespace_pattern, mode)?)
+            }
+            (None, Some(id)) => json!(
+                store.knowledge_grant_group(
+                    actor,
+                    &GroupId::parse(&id)
+                        .map_err(|_| Error::KnowledgeInvalid("invalid group ID".into()))?,
+                    &namespace_pattern,
+                    mode
+                )?
+            ),
+            _ => {
+                return Err(Error::KnowledgeInvalid(
+                    "provide exactly one of agent_id or group_id".into(),
+                ));
+            }
+        },
         Request::Grants {
             agent_id: id,
             after,

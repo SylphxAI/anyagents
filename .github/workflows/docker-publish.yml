@@ -206,7 +206,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=coordinator
 
   sandbox:
-    needs: resolve
+    needs: [resolve, coordinator]
     if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -274,7 +274,12 @@ jobs:
           push: ${{ needs.resolve.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Published variants inherit the platform binary from the immutable
+          # Coordinator image. No-push builds use the standalone source stage.
+          build-contexts: ${{ needs.resolve.outputs.push == 'true' && format('coordinator-release=docker-image://{0}@{1}', needs.resolve.outputs.coordinator_image, needs.coordinator.outputs.digest) || '' }}
           build-args: |
+            ANYAGENTS_GIT_SHA=${{ github.sha }}
+            COORDINATOR_CLI=${{ needs.resolve.outputs.push == 'true' && 'coordinator-release' || 'coordinator-cli-local' }}
             INSTALL_HARNESSES=${{ needs.resolve.outputs.install_harnesses }}
             SPIRON_INSTALL_URL=${{ needs.resolve.outputs.spiron_install_url }}
             SPIRON_NPM_PKG=${{ needs.resolve.outputs.spiron_npm_pkg }}

@@ -23,7 +23,9 @@ use ring::signature::{
 };
 use serde_json::{Value, json};
 
-use crate::auth::{AuthError, Principal};
+use crate::auth::AuthError;
+use crate::oauth_scope;
+use std::collections::BTreeSet;
 
 use super::admin_auth::{
     AdminAuthzError, AdminJwk, CLOCK_SKEW_SECS, IdTokenVerifyError, JwkKey, OidcConfig,
@@ -227,7 +229,10 @@ async fn protected_resource_metadata_route(State(state): State<AppState>) -> imp
         "authorization_servers": [cfg.issuer.clone()],
         "issuer": cfg.issuer,
         "client_id": device_client_id(&cfg),
-        "scopes_supported": ["openid", "email", "profile"],
+        "scopes_supported": [
+            "openid", "email", "profile", oauth_scope::KNOWLEDGE_READ,
+            oauth_scope::KNOWLEDGE_WRITE, oauth_scope::KNOWLEDGE_GRANT, oauth_scope::ADMIN,
+        ],
         "bearer_methods_supported": ["header"],
     });
     (
@@ -249,7 +254,8 @@ pub(crate) fn verify_bearer_jwt_claims(
     expected_resource: Option<&str>,
     allowed_clients: &[String],
     now_secs: i64,
-) -> Result<VerifiedIdToken, IdTokenVerifyError> {
+    client_audience: Option<&str>,
+) -> Result<VerifiedBearer, IdTokenVerifyError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
         return Err(IdTokenVerifyError::Invalid(
@@ -364,7 +370,8 @@ pub(crate) fn verify_bearer_jwt_claims(
         let resource_matched = aud_values
             .iter()
             .any(|aud| normalize_resource_uri(aud) == expected_res);
-        if !resource_matched {
+        let device_matched = client_audience.is_some_and(|client| aud_values.contains(&client));
+        if !resource_matched && !device_matched {
             return Err(IdTokenVerifyError::Invalid(
                 "bearer JWT aud does not match configured resource".to_string(),
             ));
@@ -442,12 +449,39 @@ pub(crate) fn verify_bearer_jwt_claims(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    Ok(VerifiedIdToken {
-        sub,
-        email,
-        email_verified,
-        name,
+    let scopes = obj
+        .get("scope")
+        .and_then(Value::as_str)
+        .and_then(oauth_scope::parse)
+        .ok_or_else(|| {
+            IdTokenVerifyError::Invalid("missing or invalid OAuth scope claim".into())
+        })?;
+    Ok(VerifiedBearer {
+        identity: VerifiedIdToken {
+            sub,
+            email,
+            email_verified,
+            name,
+        },
+        scopes: scopes.into_iter().map(str::to_owned).collect(),
     })
+}
+
+pub(crate) struct VerifiedBearer {
+    pub(crate) identity: VerifiedIdToken,
+    scopes: BTreeSet<String>,
+}
+
+impl VerifiedBearer {
+    pub(crate) fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.contains(scope)
+    }
+}
+
+impl std::fmt::Debug for VerifiedBearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedBearer").finish_non_exhaustive()
+    }
 }
 
 /// Authenticate an `Authorization: Bearer <jwt>` credential as `Principal::Operator`
@@ -456,12 +490,18 @@ pub(crate) fn verify_bearer_jwt_claims(
 pub(crate) async fn authenticate_bearer_token(
     data_dir: &Path,
     raw_token: &str,
-) -> Result<Principal, AuthError> {
+) -> Result<VerifiedBearer, AuthError> {
     let cfg = OidcConfig::from_env().ok_or_else(|| {
         AuthError::Unauthenticated("OIDC bearer authentication is not configured".to_string())
     })?;
     let expected_resource = expected_resource_audience(data_dir);
     let clients = allowed_client_ids(&cfg);
+    // An explicit audience is a strict deployment boundary. If the resource
+    // is inferred from the public URL, also accept the device-client audience
+    // for issuers that cannot issue RFC 8707 device tokens.
+    let client_audience = (env_non_empty(OIDC_RESOURCE_ENV).is_none()
+        && env_non_empty(OIDC_AUDIENCE_ENV).is_none())
+    .then(|| device_client_id(&cfg));
 
     let discovery = fetch_discovery(&cfg.issuer)
         .await
@@ -477,6 +517,7 @@ pub(crate) async fn authenticate_bearer_token(
         expected_resource.as_deref(),
         &clients,
         unix_now_secs(),
+        client_audience.as_deref(),
     ) {
         Ok(claims) => claims,
         Err(IdTokenVerifyError::UnknownKid) => {
@@ -490,6 +531,7 @@ pub(crate) async fn authenticate_bearer_token(
                 expected_resource.as_deref(),
                 &clients,
                 unix_now_secs(),
+                client_audience.as_deref(),
             )
             .map_err(|e| AuthError::Unauthenticated(e.to_string()))?
         }
@@ -498,22 +540,22 @@ pub(crate) async fn authenticate_bearer_token(
         }
     };
 
-    let needs_userinfo = verified.email_verified != Some(false)
-        && (verified.email.is_none() || verified.email_verified.is_none());
+    let needs_userinfo = verified.identity.email_verified != Some(false)
+        && (verified.identity.email.is_none() || verified.identity.email_verified.is_none());
     let userinfo = if needs_userinfo && let Some(ui_url) = discovery.userinfo_endpoint.as_deref() {
         fetch_userinfo(ui_url, raw_token).await.ok()
     } else {
         None
     };
 
-    authorize_admin_identity(&verified, userinfo.as_ref(), &cfg.allowed_emails).map_err(|err| {
-        match err {
+    authorize_admin_identity(&verified.identity, userinfo.as_ref(), &cfg.allowed_emails).map_err(
+        |err| match err {
             AdminAuthzError::Unauthenticated(msg) => AuthError::Unauthenticated(msg),
             AdminAuthzError::Forbidden(msg) => AuthError::Forbidden(msg),
-        }
-    })?;
+        },
+    )?;
 
-    Ok(Principal::Operator)
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -627,6 +669,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": "https://coord.example.com/",
                 "azp": "cli-device-client",
                 "email": "Ops@Example.com",
@@ -635,10 +678,17 @@ mod tests {
                 "exp": now + 600,
             }),
         );
-        let verified =
-            verify_bearer_jwt_claims(&valid_jwt, &jwks, issuer, Some(resource), &clients, now)
-                .expect("matching RFC 8707 resource aud must succeed");
-        let authz = authorize_admin_identity(&verified, None, &allowed_emails).unwrap();
+        let verified = verify_bearer_jwt_claims(
+            &valid_jwt,
+            &jwks,
+            issuer,
+            Some(resource),
+            &clients,
+            now,
+            None,
+        )
+        .expect("matching RFC 8707 resource aud must succeed");
+        let authz = authorize_admin_identity(&verified.identity, None, &allowed_emails).unwrap();
         assert_eq!(authz.email, "ops@example.com");
 
         // 2. Array aud containing configured resource succeeds.
@@ -649,6 +699,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": ["https://other.example.com", "https://coord.example.com"],
                 "email": "ops@example.com",
                 "email_verified": true,
@@ -657,8 +708,16 @@ mod tests {
             }),
         );
         assert!(
-            verify_bearer_jwt_claims(&array_aud_jwt, &jwks, issuer, Some(resource), &clients, now,)
-                .is_ok()
+            verify_bearer_jwt_claims(
+                &array_aud_jwt,
+                &jwks,
+                issuer,
+                Some(resource),
+                &clients,
+                now,
+                None
+            )
+            .is_ok()
         );
 
         // 3. Mismatched resource URI MUST fail closed!
@@ -669,6 +728,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": "https://evil-or-other.example.com",
                 "email": "ops@example.com",
                 "email_verified": true,
@@ -676,9 +736,16 @@ mod tests {
                 "exp": now + 600,
             }),
         );
-        let err =
-            verify_bearer_jwt_claims(&wrong_res_jwt, &jwks, issuer, Some(resource), &clients, now)
-                .unwrap_err();
+        let err = verify_bearer_jwt_claims(
+            &wrong_res_jwt,
+            &jwks,
+            issuer,
+            Some(resource),
+            &clients,
+            now,
+            None,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("aud does not match configured resource"),
@@ -693,6 +760,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": "cli-device-client",
                 "email": "ops@example.com",
                 "email_verified": true,
@@ -708,6 +776,7 @@ mod tests {
                 Some(resource),
                 &clients,
                 now,
+                None
             )
             .is_err()
         );
@@ -718,6 +787,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": resource,
                 "email": "ops@example.com",
                 "email_verified": true,
@@ -728,8 +798,16 @@ mod tests {
         );
         let none_jwt = format!("{none_header}.{none_payload}.sig");
         assert!(
-            verify_bearer_jwt_claims(&none_jwt, &jwks, issuer, Some(resource), &clients, now)
-                .is_err()
+            verify_bearer_jwt_claims(
+                &none_jwt,
+                &jwks,
+                issuer,
+                Some(resource),
+                &clients,
+                now,
+                None
+            )
+            .is_err()
         );
 
         let unverified_jwt = sign_es256(
@@ -739,6 +817,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "user-1",
+                "scope": "admin:*",
                 "aud": resource,
                 "email": "ops@example.com",
                 "email_verified": false,
@@ -753,10 +832,11 @@ mod tests {
             Some(resource),
             &clients,
             now,
+            None,
         )
         .unwrap();
         assert!(matches!(
-            authorize_admin_identity(&parsed_unverified, None, &allowed_emails),
+            authorize_admin_identity(&parsed_unverified.identity, None, &allowed_emails),
             Err(AdminAuthzError::Unauthenticated(_))
         ));
     }
@@ -773,6 +853,7 @@ mod tests {
             "ANYAGENTS_ADMIN_OIDC_CLIENT_ID",
             "ANYAGENTS_ADMIN_OIDC_DEVICE_CLIENT_ID",
             "ANYAGENTS_ADMIN_OIDC_RESOURCE",
+            "ANYAGENTS_ADMIN_OIDC_AUDIENCE",
             "ANYAGENTS_ADMIN_EMAILS",
             "ANYAGENTS_PUBLIC_URL",
         ]);
@@ -824,12 +905,16 @@ mod tests {
             std::env::set_var("ANYAGENTS_ADMIN_OIDC_CLIENT_ID", "web-console");
             std::env::set_var("ANYAGENTS_ADMIN_OIDC_DEVICE_CLIENT_ID", "cli-device");
             std::env::remove_var("ANYAGENTS_ADMIN_OIDC_RESOURCE");
+            std::env::remove_var("ANYAGENTS_ADMIN_OIDC_AUDIENCE");
             std::env::set_var("ANYAGENTS_ADMIN_EMAILS", "admin@example.com");
             std::env::set_var("ANYAGENTS_PUBLIC_URL", coord_url);
         }
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let recipient = store
+            .create_agent(anyagents_core::NewAgent::new("grant-recipient", "test"))
+            .unwrap();
         let auth = crate::auth::Mode::from_env(dir.path());
         let state = AppState {
             store,
@@ -869,6 +954,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "sub-1",
+                "scope": "admin:*",
                 "aud": coord_url,
                 "azp": "cli-device",
                 "email": "admin@example.com",
@@ -897,6 +983,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "sub-1",
+                "scope": "admin:*",
                 "aud": "https://wrong-coordinator.example.com",
                 "email": "admin@example.com",
                 "email_verified": true,
@@ -924,6 +1011,7 @@ mod tests {
             &json!({
                 "iss": issuer,
                 "sub": "sub-2",
+                "scope": "admin:*",
                 "aud": coord_url,
                 "email": "intruder@example.com",
                 "email_verified": true,
@@ -932,6 +1020,7 @@ mod tests {
             }),
         );
         let wrong_email_resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/agents")
@@ -942,6 +1031,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wrong_email_resp.status(), StatusCode::FORBIDDEN);
+
+        let issue = |scope: Option<Value>| {
+            let mut claims = json!({
+                "iss": issuer,
+                "sub": "scoped-subject",
+                "aud": "cli-device",
+                "azp": "cli-device",
+                "email": "admin@example.com",
+                "email_verified": true,
+                "iat": now - 5,
+                "exp": now + 600,
+            });
+            if let Some(scope) = scope {
+                claims["scope"] = scope;
+            }
+            sign_eddsa(&kp, "k-eddsa-1", &claims)
+        };
+        let request = |path, jwt: &str, payload: Value| {
+            app.clone().oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+        };
+        let knowledge = |jwt: &str, payload| request("/v1/knowledge", jwt, payload);
+        let read = json!({"action":"read", "namespace":"org:memory", "topic":"guide"});
+        let write = json!({"action":"write", "namespace":"org:memory", "topic":"guide", "body":"first", "reason":"initial", "expected_version":0});
+        let grant = json!({"action":"grant", "agent_id":recipient.id, "namespace_pattern":"org:memory", "mode":"read"});
+        let reader = issue(Some(json!("openid knowledge:read")));
+        let writer = issue(Some(json!("knowledge:write")));
+        let grantor = issue(Some(json!("knowledge:grant")));
+        for unauthorized in [reader.as_str(), grantor.as_str()] {
+            assert_eq!(
+                knowledge(unauthorized, write.clone())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            knowledge(&ok_jwt, write).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            knowledge(&reader, read.clone()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        for unauthorized in [&writer, &grantor] {
+            assert_eq!(
+                knowledge(unauthorized, read.clone())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(knowledge(&writer, json!({"action":"write", "namespace":"org:memory", "topic":"guide", "title":"second", "reason":"update", "expected_version":1})).await.unwrap().status(), StatusCode::OK);
+        let page = json!({"action":"grants"});
+        assert_eq!(
+            knowledge(&reader, page.clone()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            knowledge(&reader, grant.clone()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let granted = knowledge(&grantor, grant).await.unwrap();
+        assert_eq!(granted.status(), StatusCode::OK);
+        let grant: Value =
+            serde_json::from_slice(&granted.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            knowledge(&grantor, page).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            knowledge(&grantor, json!({"action":"revoke", "grant_id":grant["id"]}))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                "/v1/agents",
+                &grantor,
+                json!({"name":"mutation-should-fail"})
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        for scope in [
+            None,
+            Some(json!(["admin:*"])),
+            Some(json!("admin:*\topenid")),
+        ] {
+            let jwt = issue(scope);
+            assert_eq!(
+                knowledge(&jwt, read.clone()).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for scope in ["openid", "admin:write", "ADMIN:*", "admin:*,knowledge:read"] {
+            let jwt = issue(Some(json!(scope)));
+            assert_eq!(
+                knowledge(&jwt, read.clone()).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
 
         idp_handle.abort();
     }

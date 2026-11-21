@@ -6,8 +6,8 @@
 #   - guest-builder : compiles the release `anyagents-guest`, `anyagents-mcp-browser`,
 #                     `anyagents-mcp-web`, and `agent-code-mode` (`agent-tools`)
 #                     binaries from `Cargo.lock`
-#   - sandbox-base  : minimal Debian Bookworm developer sandbox with `anyagents-guest`,
-#                     `agent-code-mode`, persistent
+#   - sandbox-base  : minimal Debian Bookworm developer sandbox with the `anyagents` CLI,
+#                     `anyagents-guest`, `agent-code-mode`, persistent
 #                     `/home/user/agent-data/{state,workspace,tmp}` layout, CJK fonts,
 #                     and standard CLI utilities (git, rg, fd, jq, python3, node/npm, gh, tini)
 #   - sandbox-dev   : extends `sandbox-base` with open-source `rustc`/`cargo` (via rustup,
@@ -32,6 +32,7 @@
 #   docker push ghcr.io/<org>/anyagents-sandbox:full
 #   ANYAGENTS_SANDBOX_IMAGE="ghcr.io/<org>/anyagents-sandbox@sha256:<digest>"
 
+ARG COORDINATOR_CLI=coordinator-cli-local
 ARG RUST_IMAGE=rust:1-bookworm
 ARG BUN_IMAGE=oven/bun:1-slim
 ARG RUNTIME_IMAGE=debian:bookworm-slim
@@ -69,6 +70,17 @@ RUN cargo build --release --locked \
         /src/target/release/anyagents-mcp-browser \
         /src/target/release/anyagents-mcp-web \
         /src/target/release/agent-code-mode || true)
+
+# Standalone builds use the checked-in console assets. Publication replaces this
+# stage with the Coordinator runtime via a named build context, so Cargo builds
+# the published CLI only once per platform.
+FROM guest-builder AS coordinator-cli-local
+ARG ANYAGENTS_GIT_SHA
+RUN cargo build --release --locked -p anyagents --bin anyagents \
+    && (strip /src/target/release/anyagents || true) \
+    && install -m 0755 /src/target/release/anyagents /usr/local/bin/anyagents
+
+FROM ${COORDINATOR_CLI} AS coordinator-cli
 
 # ------------------------------------------------------------------------------
 # Stage 2: Minimal vendor-neutral developer sandbox (`sandbox-base`)
@@ -183,6 +195,8 @@ RUN set -eux; \
         echo "google-chrome-stable is not published for ${arch}; using Debian chromium"; \
     fi
 
+COPY --from=coordinator-cli --chmod=0755 /usr/local/bin/anyagents /usr/local/bin/anyagents
+
 # Install `anyagents-guest` runtime supervisor + MCP proxy alongside
 # `agent-code-mode` (`agent-tools`).
 COPY --from=guest-builder /src/target/release/anyagents-guest /usr/local/bin/anyagents-guest
@@ -221,6 +235,11 @@ ENV HOME=/home/user \
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
+
+# Check the installed CLI on PATH as the sandbox user, without starting services.
+RUN test "$(command -v anyagents)" = /usr/local/bin/anyagents \
+    && anyagents --version \
+    && anyagents auth login --help | grep -F -- --scope
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/anyagents-guest", "health"]
@@ -444,3 +463,11 @@ RUN set -eu; \
 
 WORKDIR /home/user/agent-data/workspace
 USER ${USER_UID}:${USER_GID}
+
+# Optional harness installs must leave the inherited CLI intact.
+RUN --mount=type=bind,from=coordinator-cli,source=/usr/local/bin/anyagents,target=/tmp/coordinator-anyagents \
+    test "$(command -v anyagents)" = /usr/local/bin/anyagents \
+    && test "$(stat -c %a /usr/local/bin/anyagents)" = 755 \
+    && cmp /tmp/coordinator-anyagents /usr/local/bin/anyagents \
+    && anyagents --version \
+    && anyagents auth login --help | grep -F -- --scope

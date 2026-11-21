@@ -11,7 +11,7 @@ if (consoleRoot) { consoleRoot.textContent = ''; render(() => <App />, consoleRo
 if (authTheme) render(() => <ThemeToggle />, authTheme);
 if (copyRoot && command) {
   const value = command.textContent?.trimEnd().endsWith('--url')
-    ? 'anyagents auth login --url ' + window.location.origin : command.textContent ?? '';
+    ? 'anyagents auth login --scope admin:* --url ' + window.location.origin : command.textContent ?? '';
   command.textContent = value;
   render(() => <CopyButton value={value} label="Copy" text />, copyRoot);
 }

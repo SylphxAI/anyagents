@@ -78,6 +78,7 @@ pub(crate) struct DeviceLoginOptions {
     pub(crate) issuer: Option<String>,
     pub(crate) client_id: Option<String>,
     pub(crate) resource: Option<String>,
+    pub(crate) scope: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -344,6 +345,60 @@ fn fetch_oidc_discovery(agent: &ureq::Agent, issuer: &str) -> Result<OidcDeviceD
     Ok(doc)
 }
 
+/// Some issuers implement the device grant but reject RFC 8707 on one or both
+/// endpoints. Retry only the explicit OAuth error and remember the outcome for
+/// the rest of this flow. The resource server still validates the JWT audience.
+fn post_device_form(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    operation: &str,
+    form: &[(&str, &str)],
+    resource: &mut Option<&str>,
+) -> Result<(u16, Vec<u8>), Error> {
+    loop {
+        let mut params = form.to_vec();
+        if let Some(value) = *resource {
+            params.push(("resource", value));
+        }
+        let mut response = agent
+            .post(endpoint)
+            .header("accept", "application/json")
+            .send_form(params)
+            .map_err(|err| Error::Message(format!("{operation} failed ({endpoint}): {err}")))?;
+        let status = response.status().as_u16();
+        let body = read_limited_body(&mut response);
+        if resource.is_some()
+            && status == 400
+            && serde_json::from_slice::<DeviceTokenErrorBody>(&body)
+                .is_ok_and(|err| err.error.as_deref() == Some("invalid_target"))
+        {
+            *resource = None;
+            continue;
+        }
+        return Ok((status, body));
+    }
+}
+
+fn requested_scope(values: &[String]) -> Result<String, Error> {
+    let mut scopes: Vec<_> = DEFAULT_SCOPE.split(' ').collect();
+    for value in values {
+        let mut any = false;
+        for token in value.split([' ', ',']).filter(|token| !token.is_empty()) {
+            if !crate::oauth_scope::valid_token(token) {
+                return Err(Error::Message("invalid --scope value".into()));
+            }
+            any = true;
+            if !scopes.contains(&token) {
+                scopes.push(token);
+            }
+        }
+        if !any {
+            return Err(Error::Message("empty --scope value".into()));
+        }
+    }
+    Ok(scopes.join(" "))
+}
+
 /// Execute RFC 8628 Device Authorization Grant with RFC 8707 `resource` audience
 /// scoping, calling `on_prompt` once the verification URI and user code arrive.
 pub(crate) fn execute_device_flow_with_timing(
@@ -353,6 +408,7 @@ pub(crate) fn execute_device_flow_with_timing(
     slow_down_step: Duration,
     mut on_prompt: impl FnMut(&DeviceAuthResponse),
 ) -> Result<StoredControlAuth, Error> {
+    let requested_scope = requested_scope(&opts.scope)?;
     let agent = build_http_agent();
 
     let raw_url = opts
@@ -434,22 +490,17 @@ pub(crate) fn execute_device_flow_with_timing(
     })?;
 
     // 1. RFC 8628 §3.1 Device Authorization Request (with RFC 8707 `resource`).
-    let mut dev_form: Vec<(&str, &str)> =
-        vec![("client_id", client_id.as_str()), ("scope", DEFAULT_SCOPE)];
-    if !effective_resource.is_empty() {
-        dev_form.push(("resource", effective_resource.as_str()));
-    }
-    let mut dev_resp = agent
-        .post(&device_endpoint)
-        .header("accept", "application/json")
-        .send_form(dev_form)
-        .map_err(|err| {
-            Error::Message(format!(
-                "RFC 8628 device authorization request failed ({device_endpoint}): {err}"
-            ))
-        })?;
-    let dev_status = dev_resp.status().as_u16();
-    let dev_body = read_limited_body(&mut dev_resp);
+    let mut send_resource = (!effective_resource.is_empty()).then_some(effective_resource.as_str());
+    let (dev_status, dev_body) = post_device_form(
+        &agent,
+        &device_endpoint,
+        "RFC 8628 device authorization request",
+        &[
+            ("client_id", client_id.as_str()),
+            ("scope", requested_scope.as_str()),
+        ],
+        &mut send_resource,
+    )?;
     if !(200..300).contains(&dev_status) {
         let err_detail = serde_json::from_slice::<DeviceTokenErrorBody>(&dev_body)
             .ok()
@@ -501,32 +552,27 @@ pub(crate) fn execute_device_flow_with_timing(
             std::thread::sleep(sleep_for);
         }
 
-        let mut token_form: Vec<(&str, &str)> = vec![
-            ("grant_type", DEVICE_GRANT_TYPE),
-            ("device_code", device_auth.device_code.as_str()),
-            ("client_id", client_id.as_str()),
-        ];
-        if !effective_resource.is_empty() {
-            token_form.push(("resource", effective_resource.as_str()));
-        }
-
-        let mut tok_resp = agent
-            .post(&discovery.token_endpoint)
-            .header("accept", "application/json")
-            .send_form(token_form)
-            .map_err(|err| {
-                Error::Message(format!(
-                    "OIDC token polling request failed ({}): {err}",
-                    discovery.token_endpoint
-                ))
-            })?;
-        let tok_status = tok_resp.status().as_u16();
-        let tok_body = read_limited_body(&mut tok_resp);
+        let (tok_status, tok_body) = post_device_form(
+            &agent,
+            &discovery.token_endpoint,
+            "OIDC token polling request",
+            &[
+                ("grant_type", DEVICE_GRANT_TYPE),
+                ("device_code", device_auth.device_code.as_str()),
+                ("client_id", client_id.as_str()),
+            ],
+            &mut send_resource,
+        )?;
 
         if (200..300).contains(&tok_status) {
             let success: DeviceTokenSuccess = serde_json::from_slice(&tok_body).map_err(|err| {
                 Error::Message(format!("invalid OIDC token JSON response: {err}"))
             })?;
+            // RFC 6749 §5.1: an omitted scope means the requested scope was granted.
+            let scope = success.scope.unwrap_or(requested_scope);
+            if crate::oauth_scope::parse(&scope).is_none() {
+                return Err(Error::Message("invalid OAuth token response scope".into()));
+            }
             let obtained_at = unix_now_secs();
             let expires_at = success
                 .expires_in
@@ -543,7 +589,7 @@ pub(crate) fn execute_device_flow_with_timing(
                 id_token: success.id_token,
                 refresh_token: success.refresh_token,
                 token_type: success.token_type,
-                scope: success.scope,
+                scope: Some(scope),
                 expires_at_unix: expires_at,
                 email,
                 obtained_at_unix: obtained_at,
@@ -650,6 +696,7 @@ pub(crate) fn status_cmd(json_out: bool) -> Result<(), Error> {
                 "issuer": auth.issuer,
                 "client_id": auth.client_id,
                 "email": auth.email,
+                "scope": auth.scope,
                 "expires_at_unix": auth.expires_at_unix,
                 "state_file": path.display().to_string(),
             }),
@@ -687,13 +734,17 @@ pub(crate) fn status_cmd(json_out: bool) -> Result<(), Error> {
                 if !auth.resource.is_empty() {
                     crate::ui::note(&format!("Resource: {}", auth.resource));
                 }
+                if let Some(scope) = &auth.scope {
+                    crate::ui::note(&format!("Granted scopes: {scope}"));
+                }
                 crate::ui::note(&format!("State file: {}", path.display()));
             } else {
                 println!(
-                    "{status_label}\t{}\t{}\t{}",
+                    "{status_label}\t{}\t{}\t{}\t{}",
                     auth.coordinator_url,
                     auth.email.as_deref().unwrap_or("-"),
-                    path.display()
+                    path.display(),
+                    auth.scope.as_deref().unwrap_or("-")
                 );
             }
         }
@@ -819,7 +870,17 @@ mod tests {
 
     #[test]
     fn rfc8628_device_flow_discovers_sends_rfc8707_resource_polls_and_saves_private_0600() {
-        let seen_device_body = Arc::new(Mutex::new(String::new()));
+        check_device_flow(false, false);
+    }
+
+    #[test]
+    fn rfc8628_device_flow_retries_invalid_target_and_drops_resource_for_remaining_polls() {
+        check_device_flow(true, false);
+        check_device_flow(false, true);
+    }
+
+    fn check_device_flow(reject_device_resource: bool, reject_token_resource: bool) {
+        let seen_device_body = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_token_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
         let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -852,7 +913,11 @@ mod tests {
                     .to_string(),
                 ),
                 ("POST", "/oauth/device") => {
-                    *dev_cap.lock().unwrap() = body;
+                    let has_resource = body.split('&').any(|param| param.starts_with("resource="));
+                    dev_cap.lock().unwrap().push(body);
+                    if reject_device_resource && has_resource {
+                        return (400, r#"{"error":"invalid_target"}"#.into());
+                    }
                     (
                         200,
                         serde_json::json!({
@@ -867,7 +932,11 @@ mod tests {
                     )
                 }
                 ("POST", "/oauth/token") => {
+                    let has_resource = body.split('&').any(|param| param.starts_with("resource="));
                     tok_cap.lock().unwrap().push(body);
+                    if reject_token_resource && has_resource {
+                        return (400, r#"{"error":"invalid_target"}"#.into());
+                    }
                     let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if n == 0 {
                         (
@@ -908,6 +977,10 @@ mod tests {
                 issuer: None,
                 client_id: None,
                 resource: None,
+                scope: vec![
+                    "knowledge:read,knowledge:write".into(),
+                    "knowledge:grant openid".into(),
+                ],
             },
             &save_path,
             Duration::from_millis(5),
@@ -929,22 +1002,47 @@ mod tests {
         assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 3);
 
         // Verify RFC 8707 `resource` and `scope` were sent on the device request.
-        let dev_form = seen_device_body.lock().unwrap().clone();
+        let dev_forms = seen_device_body.lock().unwrap();
+        let has_resource = |s: &String| s.contains("resource=http");
+        let expected_device = if reject_device_resource {
+            vec![true, false]
+        } else {
+            vec![true]
+        };
+        assert_eq!(
+            dev_forms.iter().map(has_resource).collect::<Vec<_>>(),
+            expected_device
+        );
+        let dev_form = dev_forms.last().unwrap();
         assert!(
             dev_form.contains("client_id=anyagents-cli-public"),
             "{dev_form}"
         );
         assert!(
-            dev_form.contains("scope=openid+email+profile"),
+            dev_form.contains(
+                "scope=openid+email+profile+knowledge%3Aread+knowledge%3Awrite+knowledge%3Agrant"
+            ),
             "{dev_form}"
         );
-        assert!(dev_form.contains("resource=http"), "{dev_form}");
 
         // Verify RFC 8628 grant_type + RFC 8707 resource were sent on token polls.
         let tok_forms = seen_token_bodies.lock().unwrap().clone();
-        assert_eq!(tok_forms.len(), 3);
-        assert!(tok_forms[0].contains("device_code=dev-code-123"));
-        assert!(tok_forms[0].contains("resource=http"));
+        let expected_token = if reject_device_resource {
+            vec![false, false, false]
+        } else if reject_token_resource {
+            vec![true, false, false, false]
+        } else {
+            vec![true, true, true]
+        };
+        assert_eq!(
+            tok_forms.iter().map(has_resource).collect::<Vec<_>>(),
+            expected_token
+        );
+        assert!(
+            tok_forms
+                .iter()
+                .all(|form| form.contains("device_code=dev-code-123"))
+        );
 
         // Verify caller-private permissions (`0700` dir / `0600` file) on Unix.
         #[cfg(unix)]
@@ -1010,6 +1108,7 @@ mod tests {
                     issuer: Some(base),
                     client_id: Some("cid".into()),
                     resource: Some("https://coord.example.com".into()),
+                    scope: vec![],
                 },
                 &save_path,
                 Duration::from_millis(2),

@@ -47,6 +47,9 @@ pub(crate) enum AuthCommand {
         /// Explicit RFC 8707 `resource` audience URI (defaults to `--url`).
         #[arg(long)]
         resource: Option<String>,
+        /// Additional OAuth scopes (repeat or separate by spaces/commas).
+        #[arg(long, value_name = "SCOPES")]
+        scope: Vec<String>,
     },
     /// Show caller's control-plane OIDC login status (never prints token values).
     Status {
@@ -492,18 +495,21 @@ pub(crate) fn run_auth_cmd(
             issuer,
             client_id,
             resource,
+            scope,
         } => {
             let wants_device_flow = target.is_none()
                 || url.is_some()
                 || issuer.is_some()
                 || client_id.is_some()
-                || resource.is_some();
+                || resource.is_some()
+                || !scope.is_empty();
             if wants_device_flow {
                 auth_device::login_cmd(&DeviceLoginOptions {
                     url: url.or(target),
                     issuer,
                     client_id,
                     resource,
+                    scope,
                 })
             } else {
                 let target_str = target.unwrap_or_default();

@@ -90,13 +90,15 @@ async function knowledge(req, res) {
     }
     case 'grants': return json(res, 200, { grants, next_after: null });
     case 'grant': {
-      const { agent_id, namespace_pattern, mode } = body;
-      if (typeof agent_id !== 'string' || !agent_id.startsWith('agt_') || typeof namespace_pattern !== 'string'
+      const { agent_id, group_id, namespace_pattern, mode } = body;
+      const recipient = typeof agent_id === 'string' && agent_id.startsWith('agt_') && group_id === undefined ? { agent_id }
+        : typeof group_id === 'string' && /^[^:\s]+$/.test(group_id) && agent_id === undefined ? { group_id } : null;
+      if (!recipient || typeof namespace_pattern !== 'string'
         || !namespace_pattern.trim() || !['read', 'write', 'propose'].includes(mode)) return json(res, 400, { error: 'Invalid grant' });
       if (flags.has('--reject-write-grant') && mode === 'write') return json(res, 403, { error: 'Write grants are unavailable in this fixture' });
-      const existing = grants.find(grant => grant.agent_id === agent_id && grant.namespace_pattern === namespace_pattern && grant.mode === mode);
+      const existing = grants.find(grant => grant.agent_id === agent_id && grant.group_id === group_id && grant.namespace_pattern === namespace_pattern && grant.mode === mode);
       if (existing) return json(res, 200, existing);
-      const grant = { id: 'kgrant_mock_' + ++mockGrantId, agent_id, namespace_pattern, mode, granted_by: 'owner', granted_at_ms: Date.now() };
+      const grant = { id: 'kgrant_mock_' + ++mockGrantId, ...recipient, namespace_pattern, mode, granted_by: 'owner', granted_at_ms: Date.now() };
       grants.unshift(grant);
       return json(res, 200, grant);
     }

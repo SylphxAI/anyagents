@@ -1,5 +1,5 @@
-//! Versioned knowledge. Authorization depends only on the authenticated actor
-//! and explicit namespace capabilities, never on roster metadata.
+//! Versioned knowledge. Authorization uses the authenticated actor, direct and
+//! group namespace grants, and draft-only submission for live identities.
 
 use serde::{Deserialize, Serialize};
 

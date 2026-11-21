@@ -96,7 +96,13 @@ fn knowledge_http_owner_grants_and_cas() {
     let mut labeled = NewAgent::new("role-is-not-authority", "test");
     labeled.role = Some("director".into());
     let agent = state.store.create_agent(labeled).unwrap();
+    state
+        .store
+        .set_agent_lifecycle(&agent.id, "standing")
+        .unwrap();
     let token = state.store.issue_capability(&agent.id).unwrap();
+    state.store.join_group("reviewers", &agent.id).unwrap();
+    let store = state.store.clone();
     let router = super::router().with_state(state);
     let now = admin_auth::unix_now_secs();
     let cookie = admin_auth::sign_admin_session(
@@ -125,14 +131,33 @@ fn knowledge_http_owner_grants_and_cas() {
             assert_eq!(doc["version"], 1);
             assert_eq!(call(agent_auth, json!({"action":"read", "namespace":namespace, "topic":"topic"})).await.0, StatusCode::FORBIDDEN);
         }
+        let proposal = |namespace| json!({"action":"propose", "namespace":namespace, "topic":"topic", "body":"proposal", "reason":"revision reason", "sim_expected":"expected behavior", "expected_version":1});
+        assert_eq!(call(agent_auth, proposal("domain:example")).await.0, StatusCode::FORBIDDEN);
+        let (status, draft) = call(agent_auth, proposal("org:memory")).await;
+        assert_eq!(status, StatusCode::OK, "{draft}");
+        assert_eq!(draft["status"], "pending");
+        let read_org = json!({"action":"read", "namespace":"org:memory", "topic":"topic"});
+        assert_eq!(call(root, read_org).await.1["body"], "first");
+        let promote = |version| json!({"action":"promote", "namespace":"org:memory", "proposal_id":draft["id"], "expected_version":version});
+        assert_eq!(call(agent_auth, promote(1)).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(call(root, promote(2)).await.0, StatusCode::CONFLICT);
+        let (status, promotion) = call(root, promote(1)).await;
+        assert_eq!(status, StatusCode::OK, "{promotion}");
+        assert_eq!(promotion["doc"]["version"], 2);
+        let (_, history) = call(root, json!({"action":"revisions", "namespace":"org:memory", "topic":"topic"})).await;
+        assert_eq!(history["revisions"][0]["sim_expected"], "expected behavior");
         let grant = |mode| json!({"action":"grant", "agent_id":agent.id, "namespace_pattern":"org:instructions", "mode":mode});
         assert_eq!(call((crate::operator::HEADER, OPERATOR), grant("read")).await.0, StatusCode::FORBIDDEN);
         assert_eq!(call(agent_auth, grant("read")).await.0, StatusCode::FORBIDDEN);
-        let (status, read_grant) = call(root, grant("read")).await;
+        let grant_group = json!({"action":"grant", "group_id":"reviewers", "namespace_pattern":"org:instructions", "mode":"read"});
+        let mut ambiguous = grant_group.clone();
+        ambiguous["agent_id"] = json!(agent.id);
+        assert_eq!(call(root, ambiguous).await.0, StatusCode::BAD_REQUEST);
+        let (status, read_grant) = call(root, grant_group).await;
         assert_eq!(status, StatusCode::OK, "{read_grant}");
-        for mode in ["write", "propose"] {
-            assert_eq!(call(root, grant(mode)).await.0, StatusCode::OK);
-        }
+        assert_eq!(read_grant["group_id"], "reviewers");
+        assert_eq!(call(root, json!({"action":"grants"})).await.1["grants"][0]["id"], read_grant["id"]);
+        assert_eq!(call(root, grant("write")).await.0, StatusCode::OK);
         let write = |version, body| json!({"action":"write", "namespace":"org:instructions", "topic":"topic", "body":body, "reason":"update", "expected_version":version});
         assert_eq!(call(agent_auth, write(1, "second")).await.0, StatusCode::OK);
         let (status, conflict) = call(root, write(1, "must-not-overwrite")).await;
@@ -140,8 +165,9 @@ fn knowledge_http_owner_grants_and_cas() {
         assert_eq!(conflict["current_version"], 2);
         let read = json!({"action":"read", "namespace":"org:instructions", "topic":"topic"});
         assert_eq!(call(agent_auth, read.clone()).await.1["body"], "second");
-        assert_eq!(call(root, json!({"action":"revoke", "grant_id":read_grant["id"]})).await.1["revoked"], true);
+        store.leave_group("reviewers", &agent.id).unwrap();
         assert_eq!(call(agent_auth, read).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(call(root, json!({"action":"revoke", "grant_id":read_grant["id"]})).await.1["revoked"], true);
         let (status, receipt) = call(agent_auth, json!({"action":"write", "namespace":"org:instructions", "topic":"topic", "title":"new title", "reason":"metadata only", "expected_version":2})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(receipt, json!({"namespace":"org:instructions", "topic":"topic", "version":3}));
@@ -304,10 +330,13 @@ async fn knowledge_mcp_dispatch_returns_only_authorized_citations() {
             )
             .unwrap();
     }
-    let grant = state
+    let group = GroupId::parse("readers").unwrap();
+    state.store.join_group(group.as_str(), &agent.id).unwrap();
+    state
         .store
-        .knowledge_grant(&owner, &agent.id, "org:memory", Mode::Read)
+        .knowledge_grant_group(&owner, &group, "org:memory", Mode::Read)
         .unwrap();
+    let id = agent.id.clone();
     let store = state.store.clone();
     let tools = crate::mcp::test_agent_over_router(super::router().with_state(state), agent);
     let search = json!({"action":"search", "scope":"all", "query":"部署守則"});
@@ -324,9 +353,23 @@ async fn knowledge_mcp_dispatch_returns_only_authorized_citations() {
             .await
             .is_err()
     );
-    store.knowledge_revoke(&owner, &grant.id).unwrap();
+    store.leave_group(group.as_str(), &id).unwrap();
     assert_eq!(
         tools.test_dispatch_memory(search).await.unwrap()["hits"],
         json!([])
+    );
+    let mut draft = json!({"action":"propose", "namespace":"org:memory", "topic":"guide", "expected_version":1, "body":"draft update", "reason":"fixture"});
+    assert_eq!(
+        tools.test_dispatch_memory(draft.clone()).await.unwrap()["status"],
+        "pending"
+    );
+    draft["action"] = json!("write");
+    assert!(tools.test_dispatch_memory(draft).await.is_err());
+    assert_eq!(
+        store
+            .knowledge_read(&owner, "org:memory", "guide")
+            .unwrap()
+            .version,
+        1
     );
 }

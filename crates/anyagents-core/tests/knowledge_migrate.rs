@@ -2,7 +2,7 @@ use anyagents_core::db::{
     MigrateToPostgresOptions, configured_direct_database_url, migrate_sqlite_dir_to_postgres,
 };
 use anyagents_core::knowledge::{Actor, Edit, Mode, Scope};
-use anyagents_core::{NewAgent, Store};
+use anyagents_core::{GroupId, NewAgent, Store};
 use sqlx::{ConnectOptions, postgres::PgConnectOptions};
 
 #[test]
@@ -40,6 +40,8 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
         .create_agent(NewAgent::new("knowledge-reader", "test"))
         .unwrap();
     let reader = Actor::Agent(agent.id.clone());
+    let group = GroupId::parse("knowledge-readers").unwrap();
+    source.join_group(group.as_str(), &agent.id).unwrap();
     let ns = "org:instructions";
     let topic = "readiness";
     let phrase = "部署守則";
@@ -55,7 +57,7 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
         .knowledge_write(&owner, ns, topic, Some(0), &edit, false)
         .unwrap();
     source
-        .knowledge_grant(&owner, &agent.id, ns, Mode::Read)
+        .knowledge_grant_group(&owner, &group, ns, Mode::Read)
         .unwrap();
     source
         .knowledge_grant(&owner, &agent.id, ns, Mode::Propose)
@@ -112,7 +114,8 @@ fn check_migration(rt: &tokio::runtime::Runtime, url: &str) {
     for (table, count) in [
         ("knowledge_docs", 2),
         ("knowledge_revisions", 4),
-        ("knowledge_grants", 2),
+        ("knowledge_grants", 1),
+        ("knowledge_group_grants", 1),
         ("knowledge_proposals", 1),
     ] {
         let stat = first

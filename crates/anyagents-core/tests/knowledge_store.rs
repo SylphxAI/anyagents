@@ -1,5 +1,5 @@
 use anyagents_core::knowledge::{Actor, Edit, Mode, Scope};
-use anyagents_core::{Error, NewAgent, Store};
+use anyagents_core::{Error, GroupId, NewAgent, Store};
 
 const INSTRUCTIONS: &str = "org:instructions";
 const DOMAIN: &str = "domain:example";
@@ -65,9 +65,28 @@ fn check_contract(store: &Store) {
             .unwrap()
             .is_empty()
     );
+    let group = GroupId::parse(&format!("readers-{tag}")).unwrap();
+    store.join_group(group.as_str(), &reader_id).unwrap();
     let broad = store
-        .knowledge_grant(&owner, &reader_id, "org:*", Mode::Read)
+        .knowledge_grant_group(&owner, &group, "org:*", Mode::Read)
         .unwrap();
+    assert_eq!(broad.group_id.as_deref(), Some(group.as_str()));
+    assert!(broad.agent_id.is_empty());
+    let denied = store.knowledge_propose(&editor, DOMAIN, &tag, 1, &original);
+    assert!(matches!(denied, Err(Error::PermissionDenied(_))));
+    let domain = store
+        .knowledge_grant_group(&owner, &group, DOMAIN, Mode::Read)
+        .unwrap();
+    assert!(
+        store
+            .knowledge_propose(&reader, DOMAIN, &tag, 1, &original)
+            .is_ok()
+    );
+    assert!(matches!(
+        store.knowledge_write(&reader, DOMAIN, &tag, Some(1), &original, false),
+        Err(Error::PermissionDenied(_))
+    ));
+    store.knowledge_revoke(&owner, &domain.id).unwrap();
     let instructions = store.knowledge_wake_context(&reader_id).unwrap().unwrap();
     assert!(instructions.len() <= 4096 && instructions.ends_with("</org_instructions>"));
     assert!(instructions.contains("&lt;marker&gt;&amp;"));
@@ -98,6 +117,18 @@ fn check_contract(store: &Store) {
         hits.iter()
             .all(|h| h.topic == tag && h.version == 1 && h.namespace.starts_with("org:"))
     );
+    store.leave_group(group.as_str(), &reader_id).unwrap();
+    assert!(matches!(
+        store.knowledge_read(&reader, INSTRUCTIONS, &tag),
+        Err(Error::PermissionDenied(_))
+    ));
+    assert!(
+        store
+            .knowledge_search(&reader, &Scope::All, &searchable, 20)
+            .unwrap()
+            .is_empty()
+    );
+    store.join_group(group.as_str(), &reader_id).unwrap();
     let wildcard = store
         .knowledge_grant(&owner, &reader_id, "*", Mode::Read)
         .unwrap();
