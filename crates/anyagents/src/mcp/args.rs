@@ -131,6 +131,14 @@ pub(super) struct ConversationArgs {
     pub(super) limit: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentListDetail {
+    #[default]
+    Compact,
+    Full,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(super) struct AgentsArgs {
     /// Action to perform:
@@ -187,6 +195,9 @@ pub(super) struct AgentsArgs {
     /// Optional case-insensitive multi-token search query for `list`: every whitespace-separated token must match `name`, `id`, `role`, `description`, `workdir`, `harness`, `model`, or `aliases`.
     #[serde(default, alias = "search", alias = "filter", alias = "q")]
     pub(super) query: Option<String>,
+    /// For list: compact rows by default; use "full" for all roster fields you are allowed to see.
+    #[serde(default)]
+    pub(super) detail: AgentListDetail,
     /// Target agent name or `agt_...` ID (`"self"`, `"all"`, or a peer/sub-agent name; optional on `spawn` where a `<caller>-sub-<id>` name is auto-generated if omitted).
     #[serde(
         default,

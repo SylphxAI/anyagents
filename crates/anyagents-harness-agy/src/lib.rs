@@ -69,7 +69,7 @@ impl AgyHarness {
     /// Start one child.
     ///
     /// `program` is the `agy` executable, or a test double. `session_id`, when
-    /// set, is passed as `--resume`.
+    /// set, is passed as `--conversation`.
     pub fn start(
         program: impl Into<PathBuf>,
         session_id: Option<&str>,

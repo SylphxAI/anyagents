@@ -75,15 +75,12 @@ impl TurnWatchdog {
         Duration::from_millis(now.saturating_sub(last))
     }
 
-    pub(super) fn expired_reason(&self, in_turn: bool, harness: &str) -> Option<String> {
-        if let Some(max_d) = self.max_duration
-            && self.started_at.elapsed() >= max_d
-        {
-            return Some(format!(
-                "guest harness `{harness}` exceeded max turn duration ({}s)",
-                max_d.as_secs()
-            ));
-        }
+    pub(super) fn duration_cap(&self) -> Option<Duration> {
+        self.max_duration
+            .filter(|cap| self.started_at.elapsed() >= *cap)
+    }
+
+    pub(super) fn silent_failure(&self, in_turn: bool, harness: &str) -> Option<String> {
         if in_turn
             && let Some(silent_d) = self.silent_timeout
             && self.silent_elapsed() >= silent_d

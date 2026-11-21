@@ -103,6 +103,10 @@ pub struct AgentView {
     pub has_open_turn: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_turn_age_ms: Option<i64>,
+    /// Retained sandbox storage on a quiescent task agent, idle for over 30 minutes.
+    /// Advisory only: consider archiving if the task and its work are settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_task_volume_age_ms: Option<i64>,
     #[serde(default)]
     pub profile: Option<String>,
     pub id: String,

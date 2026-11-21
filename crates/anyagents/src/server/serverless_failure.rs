@@ -369,8 +369,11 @@ pub(super) fn deliver_settled_turn_outcome(
     turn: &PendingRemoteTurn,
     agent: Option<&Agent>,
 ) -> (bool, Option<AgentId>) {
-    if turn.status == "failed" {
-        if let Some(parent_id) = notify_parent_on_failed_turn(store, turn, agent) {
+    if matches!(
+        turn.status.as_str(),
+        "failed" | anyagents_core::stateless::TURN_LIMIT_PAUSED
+    ) {
+        if let Some(parent_id) = notify_parent_on_incomplete_turn(store, turn, agent) {
             return (true, Some(parent_id));
         }
         return (false, None);
@@ -478,7 +481,7 @@ pub(super) fn deliver_settled_turn_outcome(
     }
 }
 
-fn notify_parent_on_failed_turn(
+fn notify_parent_on_incomplete_turn(
     store: &Store,
     turn: &PendingRemoteTurn,
     agent: Option<&Agent>,
@@ -486,11 +489,6 @@ fn notify_parent_on_failed_turn(
     if agent.is_none_or(|a| a.state == "archived") {
         return None;
     }
-    let err_text = turn
-        .error_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
     let target_parent = turn
         .metadata_json
         .as_ref()
@@ -507,12 +505,26 @@ fn notify_parent_on_failed_turn(
     let child_label = agent
         .map(|a| a.name.as_str())
         .unwrap_or(turn.agent_id.as_str());
-    let mut incoming = Incoming::new(format!(
-        "Sub-agent `{child_label}` failed turn `{}`: {err_text}",
-        turn.turn_id
-    ));
+    let text = if turn.status == anyagents_core::stateless::TURN_LIMIT_PAUSED {
+        format!(
+            "Sub-agent {child_label} {} (turn {}; workspace preserved — send a follow-up message to resume).",
+            turn.result_text.as_deref()?,
+            turn.turn_id
+        )
+    } else {
+        let err = turn
+            .error_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        format!(
+            "Sub-agent `{child_label}` failed turn `{}`: {err}",
+            turn.turn_id
+        )
+    };
+    let mut incoming = Incoming::new(text);
     incoming.sender = Some(format!("agent:{}", turn.agent_id));
-    incoming.source_key = Some(format!("serverless-turn-failed:{}", turn.turn_id));
+    incoming.source_key = Some(format!("serverless-turn-{}:{}", turn.status, turn.turn_id));
     match store.receive(&target_parent, incoming) {
         Ok(ReceiveOutcome::New(_)) => Some(target_parent),
         Ok(ReceiveOutcome::Duplicate(_)) => None,

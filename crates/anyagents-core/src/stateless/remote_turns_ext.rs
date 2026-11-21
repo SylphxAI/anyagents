@@ -13,8 +13,9 @@ use crate::migrate::now_ms;
 
 use super::remote_turns::{
     NewRemoteTurn, PendingRemoteTurn, RemoteTurnEventUpdate, RemoteTurnStore, SettleOutcome,
-    SettleRemoteTurn, is_terminal_remote_turn_status, sanitize_pg_json, sanitize_pg_text,
-    validate_status, validate_terminal_status, validate_turn_id, verify_callback_token_hash,
+    SettleRemoteTurn, TURN_LIMIT_PAUSED, is_terminal_remote_turn_status, sanitize_pg_json,
+    sanitize_pg_text, validate_status, validate_terminal_status, validate_turn_id,
+    verify_callback_token_hash,
 };
 
 /// Default freshness window (3 minutes) for projecting an active remote turn
@@ -37,7 +38,7 @@ fn terminal_turn_rank(turn: &PendingRemoteTurn) -> (i64, i64, bool, &str) {
     (
         turn.updated_at_ms,
         turn.created_at_ms,
-        turn.status == "completed",
+        turn.status != "failed",
         turn.turn_id.as_str(),
     )
 }
@@ -73,8 +74,8 @@ pub(super) fn pg_latest_failed_for_agent(
             "SELECT turn_id, status, error_text, updated_at_ms
              FROM public.pending_remote_turns
              WHERE agent_id = $1
-               AND status IN ('completed', 'failed')
-             ORDER BY updated_at_ms DESC, created_at_ms DESC, (status = 'completed') DESC, turn_id DESC
+               AND status IN ('completed', 'failed', 'turn_limit_paused')
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, (status <> 'failed') DESC, turn_id DESC
              LIMIT 1",
         )
         .bind(&aid)
@@ -120,8 +121,8 @@ pub(super) fn pg_list_latest_failed_by_agent(
                  SELECT DISTINCT ON (agent_id)
                         agent_id, turn_id, status, error_text, updated_at_ms
                  FROM public.pending_remote_turns
-                 WHERE status IN ('completed', 'failed')
-                 ORDER BY agent_id, updated_at_ms DESC, created_at_ms DESC, (status = 'completed') DESC, turn_id DESC
+                 WHERE status IN ('completed', 'failed', 'turn_limit_paused')
+                 ORDER BY agent_id, updated_at_ms DESC, created_at_ms DESC, (status <> 'failed') DESC, turn_id DESC
              ) latest
              WHERE status = 'failed'
                AND error_text IS NOT NULL
@@ -159,7 +160,10 @@ pub(super) fn collect_latest_failed_by_agent<'a>(
 ) -> HashMap<String, LatestRemoteTurnError> {
     let mut latest_by_agent: HashMap<&str, &'a PendingRemoteTurn> = HashMap::new();
     for turn in turns {
-        if !matches!(turn.status.as_str(), "completed" | "failed") {
+        if !matches!(
+            turn.status.as_str(),
+            "completed" | "failed" | TURN_LIMIT_PAUSED
+        ) {
             continue;
         }
         latest_by_agent
@@ -187,7 +191,13 @@ pub(super) fn latest_failed_for_agent_from_iter<'a>(
 ) -> Option<LatestRemoteTurnError> {
     let winner = turns
         .into_iter()
-        .filter(|t| &t.agent_id == agent_id && matches!(t.status.as_str(), "completed" | "failed"))
+        .filter(|t| {
+            &t.agent_id == agent_id
+                && matches!(
+                    t.status.as_str(),
+                    "completed" | "failed" | TURN_LIMIT_PAUSED
+                )
+        })
         .max_by(|a, b| terminal_turn_rank(a).cmp(&terminal_turn_rank(b)))?;
     failed_turn_to_error(winner)
 }
