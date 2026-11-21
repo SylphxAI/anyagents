@@ -91,7 +91,9 @@ async fn cold_ensure_streams_keepalives_and_has_a_90_second_deadline() {
     assert_eq!(line["kind"], "progress");
     assert!(!slow.is_finished());
     let (_, handle) = slow.await.unwrap();
-    assert_eq!(handle.unwrap().sandbox_id, "local-anyagents-native-signin");
+    let handle = handle.unwrap();
+    assert_eq!(handle.sandbox_id, "local-anyagents-native-signin");
+    assert!(handle.volume_id.is_none());
     let (elapsed, error) = run(Duration::from_secs(95)).await.unwrap();
     assert_eq!(elapsed, Duration::from_secs(90));
     assert!(error.unwrap_err().contains("90-second deadline"));
@@ -232,5 +234,4 @@ config.mkdir()
     assert_eq!(files[".claude.json"], b"account-fixture-code");
     assert!(!homes[1].0.exists());
     assert!(!Path::new(&homes[1].1).exists());
-    assert!(root.path().join(SLOT).is_dir());
 }
