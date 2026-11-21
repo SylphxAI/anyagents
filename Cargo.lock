@@ -223,6 +223,8 @@ dependencies = [
  "ring",
  "rmcp",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "schemars",
  "serde",
  "serde_json",
@@ -233,12 +235,14 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite 0.29.0",
  "toml",
  "tower",
  "ureq",
  "url",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

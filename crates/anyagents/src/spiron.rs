@@ -653,6 +653,7 @@ mod tests {
                 "memory",
                 "schedules",
                 "groups",
+                "nodes",
             ]
         );
     }

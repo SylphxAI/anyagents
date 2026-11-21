@@ -155,6 +155,7 @@ identifier!(AgentId, "agt");
 identifier!(MessageId, "msg");
 identifier!(ChannelId, "chn");
 identifier!(UsageId, "usg");
+identifier!(NodeId, "nd");
 
 /// A named group's stable identifier, as stored in `groups.name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]

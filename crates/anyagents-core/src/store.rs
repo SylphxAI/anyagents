@@ -107,6 +107,7 @@ mod mail_notices;
 mod mailbox;
 mod mcp_ops;
 pub mod memory_index;
+pub mod nodes;
 mod operator_inbox;
 mod origin;
 mod outcomes;

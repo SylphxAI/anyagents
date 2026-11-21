@@ -11,11 +11,25 @@ use memory_tool::MemoryArgs;
 #[path = "ingress_tool.rs"]
 mod ingress_tool;
 
+#[path = "nodes_tool.rs"]
+mod nodes_tool;
+
 #[path = "send_tool.rs"]
 mod send_tool;
 
 #[tool_router(vis = "pub(super)")]
 impl AgentMcp {
+    #[tool(
+        description = "List authorized remote edge nodes (`{action: \"list\"}`) or execute a scoped command on an online granted node (`{action: \"exec\", node_id, command, args?, cwd?, timeout_secs?}`). Requires an active owner-approved grant on the target node and fails closed when offline, paused, revoked, or ungranted."
+    )]
+    pub(super) async fn nodes(
+        &self,
+        Parameters(args): Parameters<nodes_tool::NodesArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        nodes_tool::call(self, args)
+            .await
+            .map(rmcp::handler::server::wrapper::Json)
+    }
     #[tool(
         description = "Manage this agent's external ingress rules. Use the channel and numeric IDs from sender_awareness. Block a sender or known group, remove an exact block, or list rules. Protected senders bypass. A permanent group block may leave the chat; unblocking does not rejoin it."
     )]
@@ -1724,6 +1738,14 @@ impl AgentMcp {
                 ingress_tool::call(
                     self,
                     serde_json::from_value(args).map_err(|e| e.to_string())?,
+                )
+                .await
+            }
+            "nodes" => {
+                nodes_tool::call(
+                    self,
+                    serde_json::from_value(args)
+                        .map_err(|e| format!("invalid `nodes` arguments: {e}"))?,
                 )
                 .await
             }

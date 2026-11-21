@@ -50,6 +50,7 @@ fn remote_session_tokens_get_universal_mcp_surface() {
             "memory",
             "schedules",
             "groups",
+            "nodes",
         ]
     );
 

@@ -22,6 +22,7 @@ mod create;
 mod data;
 mod fake_opencode;
 mod gateway;
+mod groups_cli;
 mod harness_double;
 mod host_memory;
 mod identity;
@@ -32,6 +33,8 @@ mod mcp;
 mod mcp_config;
 mod memory_service;
 mod muse_config;
+mod node_cli;
+mod node_protocol;
 mod oauth_scope;
 mod opencode_config;
 mod operator;
@@ -117,6 +120,8 @@ enum Command {
     Secrets(control_cli::SecretsCliArgs),
     /// Manage organization knowledge grants as an owner.
     Knowledge(knowledge_cli::KnowledgeCliArgs),
+    /// Pair and run a remote user-device / edge node (`anyagents node pair|run|status|pause|resume|revoke`).
+    Node(node_cli::NodeCliArgs),
     /// List or manage agents.
     #[command(display_order = 2, visible_alias = "agent")]
     Agents {
@@ -1088,6 +1093,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Profiles(args) => control_cli::run_profiles_cmd(&data, args),
         Command::Secrets(args) => control_cli::run_secrets_cmd(&data, args),
         Command::Knowledge(args) => knowledge_cli::run(args),
+        Command::Node(args) => node_cli::run(&data, args),
         Command::Mcp {
             config,
             _profile: _,
@@ -2623,124 +2629,7 @@ fn delivery_label(value: &serde_json::Value) -> String {
 }
 
 fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {
-    match action {
-        GroupsCommand::Join { group, agent } => {
-            let who = match agent
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                Some(a) => a,
-                None => client::agent_identity()
-                    .map(|id| id.to_string())
-                    .ok_or_else(|| {
-                        anyagents_core::Error::Message("groups join needs an agent name".into())
-                    })?,
-            };
-            let agent = agent::named(data, &who)?;
-            agent::join_group(data, &group, &agent.id)?;
-            if ui::is_pretty() {
-                ui::success(&format!("{} joined {group}", agent.name));
-            } else {
-                println!("{group}\t{}", agent.name);
-            }
-        }
-        GroupsCommand::Leave { group, agent } => {
-            let who = match agent
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                Some(a) => a,
-                None => client::agent_identity()
-                    .map(|id| id.to_string())
-                    .ok_or_else(|| {
-                        anyagents_core::Error::Message("groups leave needs an agent name".into())
-                    })?,
-            };
-            let agent = agent::named(data, &who)?;
-            agent::leave_group(data, &group, &agent.id)?;
-            if ui::is_pretty() {
-                ui::success(&format!("{} left {group}", agent.name));
-            } else {
-                println!("{group}\t{}", agent.name);
-            }
-        }
-        GroupsCommand::Members { group } => {
-            let members = agent::group_members(data, &group)?;
-            if ui::is_pretty() {
-                let role_map: std::collections::HashMap<String, Option<String>> =
-                    anyagents_core::Store::open(data.join("state.db"))
-                        .ok()
-                        .and_then(|s| s.list_agents().ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|a| (a.name, a.role))
-                        .collect();
-                println!(
-                    "\n  {}  {} members\n",
-                    ui::bold_cyan(&format!("Group · {group}")),
-                    ui::bold(&members.len().to_string())
-                );
-                for name in members {
-                    let role = role_map.get(&name).and_then(|r| r.as_deref());
-                    let display = match role.map(str::trim).filter(|s| !s.is_empty()) {
-                        Some(r) => format!("{} {}", ui::bold(&name), ui::dim(&format!("· {r}"))),
-                        None => ui::bold(&name),
-                    };
-                    println!("  • {display}");
-                }
-                println!();
-                return Ok(());
-            }
-            for name in members {
-                println!("{name}");
-            }
-        }
-        GroupsCommand::List => {
-            let list = agent::list_groups(data)?;
-            if ui::is_pretty() {
-                if list.is_empty() {
-                    println!("  {}", ui::dim("No groups found."));
-                    return Ok(());
-                }
-                let role_map: std::collections::HashMap<String, Option<String>> =
-                    anyagents_core::Store::open(data.join("state.db"))
-                        .ok()
-                        .and_then(|s| s.list_agents().ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|a| (a.name, a.role))
-                        .collect();
-                println!(
-                    "\n  {}  {} total\n",
-                    ui::bold_cyan("Groups"),
-                    ui::bold(&list.len().to_string())
-                );
-                let mut table =
-                    ui::Table::new(&[("GROUP", false), ("COUNT", true), ("MEMBERS", false)]);
-                for (group, members) in list {
-                    let formatted_members: Vec<String> = members
-                        .iter()
-                        .map(|m| {
-                            let r = role_map.get(m).and_then(|v| v.as_deref());
-                            create::format_agent_display(m, r)
-                        })
-                        .collect();
-                    table.add_row(vec![
-                        ui::bold(&ui::cyan(&group)),
-                        ui::dim(&members.len().to_string()),
-                        formatted_members.join(", "),
-                    ]);
-                }
-                table.print();
-                println!();
-                return Ok(());
-            }
-            for (group, members) in list {
-                println!("{group}\t{}", members.join(","));
-            }
-        }
-    }
-    Ok(())
+    groups_cli::run(data, action)
 }
 
 #[cfg(test)]

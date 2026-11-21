@@ -68,6 +68,7 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         20,
         include_str!("../../migrations_pg/020_knowledge_group_grants.sql"),
     ),
+    (21, include_str!("../../migrations_pg/021_nodes.sql")),
 ];
 
 #[cfg(test)]

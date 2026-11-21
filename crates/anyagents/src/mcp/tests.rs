@@ -1131,6 +1131,7 @@ mod spawn_args_tests {
                 "memory",
                 "schedules",
                 "groups",
+                "nodes",
             ]
         );
         for blocked in [

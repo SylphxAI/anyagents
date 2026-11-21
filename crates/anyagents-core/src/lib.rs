@@ -32,7 +32,12 @@ pub mod secrets_store;
 pub mod stateless;
 pub mod storage;
 mod store;
-pub use store::{TakeoverLink, knowledge};
+pub use store::nodes::{
+    KNOWN_NODE_CAPABILITIES, NODE_CAPABILITY_EXEC, NODE_TOKEN_PREFIX, NewNodeAuditEvent,
+    NewNodePair, NodeAuditEvent, NodeGrant, NodeRecord, NodeStatus, PairedNode, is_node_token,
+    validate_node_capability,
+};
+pub use store::{TakeoverLink, knowledge, nodes};
 
 pub use address::{Address, AddressError};
 pub use anyagents_harness::{
@@ -44,7 +49,7 @@ pub use browser_profiles_store::{
     validate_browser_profile_name,
 };
 pub use error::Error;
-pub use id::{AgentId, ChannelId, GroupId, MessageId, UsageId};
+pub use id::{AgentId, ChannelId, GroupId, MessageId, NodeId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use s3_store::{
     DEFAULT_MAX_S3_OBJECT_BYTES, ObjectMeta, S3_ACCESS_KEY_ID_ENV, S3_BUCKET_ENV, S3_ENDPOINT_ENV,

@@ -8,6 +8,7 @@ export function parseRoute(hash = window.location.hash): Route {
   try { id = raw ? decodeURIComponent(raw) : undefined; } catch { /* Ignore a malformed link. */ }
   switch (section) {
     case 'agents': case 'fleet': return { page: 'agents', id };
+    case 'nodes': return { page: 'nodes', id };
     case 'accounts': case 'profiles': return { page: 'accounts' };
     case 'knowledge': return { page: 'knowledge' };
     case 'versions': return { page: 'versions' };
@@ -22,6 +23,7 @@ export function parseRoute(hash = window.location.hash): Route {
 export function href(route: Route): string {
   switch (route.page) {
     case 'agents': return '#agents' + (route.id ? '/' + encodeURIComponent(route.id) : '');
+    case 'nodes': return '#nodes' + (route.id ? '/' + encodeURIComponent(route.id) : '');
     case 'settings': return '#settings/' + route.tab;
     default: return '#' + route.page;
   }

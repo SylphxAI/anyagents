@@ -230,7 +230,7 @@ async fn protected_resource_metadata_route(State(state): State<AppState>) -> imp
         "issuer": cfg.issuer,
         "client_id": device_client_id(&cfg),
         "scopes_supported": [
-            "openid", "email", "profile", oauth_scope::KNOWLEDGE_READ,
+            "openid", "email", "profile", oauth_scope::NODE_CONNECT, oauth_scope::KNOWLEDGE_READ,
             oauth_scope::KNOWLEDGE_WRITE, oauth_scope::KNOWLEDGE_GRANT, oauth_scope::ADMIN,
         ],
         "bearer_methods_supported": ["header"],
@@ -1145,6 +1145,42 @@ mod tests {
                 StatusCode::FORBIDDEN
             );
         }
+
+        // `node:connect` OIDC scope is accepted by `/v1/nodes/pair` and rejected on unrelated scopes.
+        let node_connect_jwt = issue(Some(json!("openid node:connect")));
+        assert_eq!(
+            request(
+                "/v1/nodes/pair",
+                &reader,
+                json!({"name":"laptop","hostname":"host","os":"linux","arch":"x86_64"}),
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let paired_resp = request(
+            "/v1/nodes/pair",
+            &node_connect_jwt,
+            json!({"name":"laptop","hostname":"host","os":"linux","arch":"x86_64"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paired_resp.status(), StatusCode::CREATED);
+        let paired_json: Value =
+            serde_json::from_slice(&paired_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            paired_json["node_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("nd_"))
+        );
+        assert!(
+            paired_json["node_token"]
+                .as_str()
+                .is_some_and(anyagents_core::is_node_token)
+        );
+        assert_eq!(paired_json["node"]["owner_id"], "admin@example.com");
 
         idp_handle.abort();
     }
