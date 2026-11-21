@@ -325,25 +325,45 @@ pub fn resolve_sync_config(
     }))
 }
 
-/// Single path segments stripped from Chromium `user-data/` during packing:
-/// disposable caches and process-scoped singleton lock files.
-const STRIPPED_PATH_COMPONENTS: &[&str] = &[
-    "Cache",
-    "Code Cache",
-    "GPUCache",
-    "GrShaderCache",
-    "ShaderCache",
-    "DawnCache",
-    "GraphiteDawnCache",
-    "Crashpad",
-    "SingletonLock",
-    "SingletonCookie",
-    "SingletonSocket",
-    "LOCK",
+// These names are only matched at the user-data root or directly inside a
+// Chromium profile. Never search arbitrary descendants: a site or extension
+// can use these same names for files that hold its state.
+const STRIPPED_PROFILE_ENTRIES: &[&str] = &[
+    "cache",
+    "code cache",
+    "gpucache",
+    "grshadercache",
+    "shadercache",
+    "dawncache",
+    "dawngraphitecache",
+    "dawnwebgpucache",
+    "graphitedawncache",
+    "media cache",
+    "crashpad",
+    "browsermetrics",
+    "component_crx_cache",
+    "extensions_crx_cache",
+    "subresource filter",
+    "screenai",
+    "wasmttsengine",
+    "zxcvbndata",
+    "ondeviceheadsuggestmodel",
+    "widevinecdm",
+    "singletonlock",
+    "singletoncookie",
+    "singletonsocket",
+    "lock",
     "takeover.lock",
-    "DevToolsActivePort",
+    "devtoolsactiveport",
     "devtools.log",
 ];
+
+fn is_chromium_profile_directory(name: &str) -> bool {
+    matches!(name, "default" | "guest profile" | "system profile")
+        || name
+            .strip_prefix("profile ")
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Relative names of Chromium cookie stores: the legacy `Cookies` (+`-journal`)
 /// layout and the modern `Network/Cookies` (+`-journal` / `-wal` / `-shm`)
@@ -423,24 +443,42 @@ pub fn fsync_profile_files(user_data_dir: &Path) -> Result<(), String> {
 /// Return `true` when `rel_path` (relative to `user-data/`) is a disposable
 /// cache or Chromium lock file that must be stripped before archiving.
 pub fn should_strip_profile_path(rel_path: &Path) -> bool {
-    let comps: Vec<&str> = rel_path
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(os) => os.to_str(),
-            _ => None,
-        })
-        .collect();
-    for seg in &comps {
-        if STRIPPED_PATH_COMPONENTS.contains(seg) {
-            return true;
+    let mut entries = profile_relative_path(rel_path).iter();
+    let Some(name) = entries.next().and_then(|entry| entry.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    STRIPPED_PROFILE_ENTRIES.contains(&name.as_str())
+        || [
+            "optimizationguide",
+            "optguide",
+            "safe browsing",
+            "browsermetrics-",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || (name == "service worker"
+            && entries
+                .next()
+                .and_then(|entry| entry.to_str())
+                .is_some_and(|entry| {
+                    entry.eq_ignore_ascii_case("CacheStorage")
+                        || entry.eq_ignore_ascii_case("ScriptCache")
+                }))
+}
+
+fn profile_relative_path(rel_path: &Path) -> &Path {
+    let mut components = rel_path.components();
+    match components.next() {
+        Some(Component::Normal(name))
+            if name
+                .to_str()
+                .is_some_and(|name| is_chromium_profile_directory(&name.to_ascii_lowercase())) =>
+        {
+            components.as_path()
         }
+        _ => rel_path,
     }
-    for pair in comps.windows(2) {
-        if pair[0] == "Service Worker" && pair[1] == "CacheStorage" {
-            return true;
-        }
-    }
-    false
 }
 
 /// Pack `user_data_dir` into a compressed tar archive (`.tar.zst` when `zstd`
@@ -510,6 +548,15 @@ fn append_dir_filtered(
                 .map_err(|e| format!("failed adding dir `{}` to tar: {e}", rel.display()))?;
             append_dir_filtered(builder, root, &path)?;
         } else if ft.is_file() {
+            // Temporary files at the profile boundary are disposable, but not
+            // arbitrary files with that suffix in site or extension storage.
+            if profile_relative_path(rel).parent() == Some(Path::new(""))
+                && rel
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+            {
+                continue;
+            }
             let bytes = std::fs::read(&path)
                 .map_err(|e| format!("failed reading `{}`: {e}", path.display()))?;
             let mut header = tar::Header::new_gnu();
@@ -1022,51 +1069,61 @@ pub fn sync_up_profile(
             BrowserError::new(
                 "PROFILE_SYNC_ERROR",
                 format!(
-                    "failed uploading browser profile `{}` to coordinator: {err}",
-                    sync.profile_name
+                    "failed uploading browser profile `{}` ({} compressed bytes) to coordinator: {err}",
+                    sync.profile_name, archive.len()
                 ),
             )
         })?;
     let status = resp.status().as_u16();
+    let size = archive.len();
     match status {
-        200..=299 => Ok(archive.len()),
+        200..=299 => Ok(size),
         401 => Err(BrowserError::new(
             "UNAUTHORIZED",
             format!(
-                "coordinator rejected credential while uploading browser profile `{}`",
+                "coordinator rejected credential (HTTP 401) while uploading browser profile `{}` ({size} compressed bytes)",
                 sync.profile_name
             ),
         )),
-        403 => {
-            let detail = read_error_detail(&mut resp);
-            Err(BrowserError::new(
-                "PROFILE_FORBIDDEN",
-                format!(
-                    "browser profile `{}` upload denied (not granted){}",
-                    sync.profile_name,
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                ),
-            ))
-        }
+        403 => Err(BrowserError::new(
+            "PROFILE_FORBIDDEN",
+            format!(
+                "browser profile `{}` upload denied (HTTP 403, not granted; {size} compressed bytes)",
+                sync.profile_name
+            ),
+        )),
         other => {
-            let detail = read_error_detail(&mut resp);
+            let detail = upload_response_hint(&mut resp);
             Err(BrowserError::new(
                 "PROFILE_SYNC_ERROR",
                 format!(
-                    "coordinator returned HTTP {other} uploading browser profile `{}`{}",
-                    sync.profile_name,
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
+                    "coordinator returned HTTP {other} uploading browser profile `{}` ({size} compressed bytes){detail}",
+                    sync.profile_name
                 ),
             ))
         }
+    }
+}
+
+// Proxy or backend error bodies are untrusted and may reflect credentials or
+// request content. Retain only known limit messages, never raw response text.
+fn upload_response_hint(resp: &mut ureq::http::Response<ureq::Body>) -> &'static str {
+    if resp.status().as_u16() != 413 {
+        return "";
+    }
+    let detail = read_error_detail(resp).to_ascii_lowercase();
+    if detail.contains("length limit exceeded") {
+        ": length limit exceeded"
+    } else if detail.contains("browser profile archive exceeds maximum size") {
+        ": browser profile archive exceeds maximum size"
+    } else if detail.contains("request entity too large") {
+        ": Request Entity Too Large"
+    } else if detail.contains("payload too large") {
+        ": Payload Too Large"
+    } else if detail.contains("content too large") {
+        ": Content Too Large"
+    } else {
+        ""
     }
 }
 
@@ -1184,101 +1241,114 @@ mod tests {
     fn pack_strips_caches_and_chromium_locks_and_preserves_session_data() {
         let src = tempfile::tempdir().unwrap();
         let ud = src.path().join("user-data");
-        std::fs::create_dir_all(ud.join("Default/Cache")).unwrap();
-        std::fs::create_dir_all(ud.join("Default/Code Cache/js")).unwrap();
-        std::fs::create_dir_all(ud.join("Default/GPUCache")).unwrap();
-        std::fs::create_dir_all(ud.join("GrShaderCache")).unwrap();
-        std::fs::create_dir_all(ud.join("ShaderCache")).unwrap();
-        std::fs::create_dir_all(ud.join("DawnCache")).unwrap();
-        std::fs::create_dir_all(ud.join("GraphiteDawnCache")).unwrap();
-        std::fs::create_dir_all(ud.join("Default/Service Worker/CacheStorage")).unwrap();
-        std::fs::create_dir_all(ud.join("Default/Service Worker/Database")).unwrap();
-        std::fs::create_dir_all(ud.join("Crashpad/reports")).unwrap();
-        std::fs::create_dir_all(ud.join("Default/Local Storage/leveldb")).unwrap();
-
-        // Disposable files that MUST be stripped.
-        std::fs::write(ud.join("Default/Cache/big.bin"), b"cache-junk").unwrap();
-        std::fs::write(ud.join("Default/Code Cache/js/a.bin"), b"code-cache").unwrap();
-        std::fs::write(ud.join("Default/GPUCache/g.bin"), b"gpu-cache").unwrap();
-        std::fs::write(ud.join("GrShaderCache/s.bin"), b"gr-shader").unwrap();
-        std::fs::write(ud.join("ShaderCache/s.bin"), b"shader").unwrap();
-        std::fs::write(ud.join("DawnCache/d.bin"), b"dawn").unwrap();
-        std::fs::write(ud.join("GraphiteDawnCache/gd.bin"), b"gdawn").unwrap();
-        std::fs::write(
-            ud.join("Default/Service Worker/CacheStorage/c.bin"),
-            b"sw-cache",
-        )
-        .unwrap();
-        std::fs::write(ud.join("Crashpad/reports/dump.dmp"), b"crash").unwrap();
-        std::fs::write(ud.join("SingletonLock"), b"lock").unwrap();
-        std::fs::write(ud.join("SingletonCookie"), b"cookie").unwrap();
-        std::fs::write(ud.join("SingletonSocket"), b"sock").unwrap();
-        std::fs::write(ud.join("Default/LOCK"), b"db-lock").unwrap();
-        std::fs::write(ud.join("takeover.lock"), b"takeover").unwrap();
-
-        // Session data that MUST be preserved.
-        std::fs::write(ud.join("Local State"), b"{\"os_crypt\":\"basic\"}").unwrap();
-        std::fs::write(ud.join("Default/Cookies"), b"sqlite-cookies-bytes").unwrap();
-        std::fs::write(
-            ud.join("Default/Local Storage/leveldb/000001.ldb"),
-            b"local-storage-data",
-        )
-        .unwrap();
-        std::fs::write(ud.join("Default/Service Worker/Database/db"), b"sw-db-keep").unwrap();
+        let disposable = [
+            ("Default/Cache", "Default/Cache/Cache_Data/data_1"),
+            ("Default/Code Cache", "Default/Code Cache/js/code"),
+            ("Default/GPUCache", "Default/GPUCache/data_0"),
+            ("GrShaderCache", "GrShaderCache/data_0"),
+            ("ShaderCache", "ShaderCache/data_0"),
+            ("DawnCache", "DawnCache/data_0"),
+            ("GraphiteDawnCache", "GraphiteDawnCache/data_0"),
+            (
+                "Profile 1/dawngraphitecache",
+                "Profile 1/dawngraphitecache/data_0",
+            ),
+            ("Default/DawnWebGPUCache", "Default/DawnWebGPUCache/data_0"),
+            ("Default/Media Cache", "Default/Media Cache/data_0"),
+            ("Crashpad", "Crashpad/reports/dump.dmp"),
+            ("BrowserMetrics", "BrowserMetrics/metrics.pma"),
+            ("BrowserMetrics-test.pma", "BrowserMetrics-test.pma"),
+            ("component_crx_cache", "component_crx_cache/component.crx"),
+            ("extensions_crx_cache", "extensions_crx_cache/extension.crx"),
+            (
+                "OptimizationGuidePredictionModels",
+                "OptimizationGuidePredictionModels/model",
+            ),
+            ("OptGuideOnDeviceModel", "OptGuideOnDeviceModel/model"),
+            ("Safe Browsing", "Safe Browsing/db"),
+            ("Safe Browsing Cookies", "Safe Browsing Cookies"),
+            ("Subresource Filter", "Subresource Filter/rules"),
+            ("ZxcvbnData", "ZxcvbnData/dictionary"),
+            ("OnDeviceHeadSuggestModel", "OnDeviceHeadSuggestModel/model"),
+            ("ScreenAI", "ScreenAI/component"),
+            ("WasmTtsEngine", "WasmTtsEngine/component"),
+            ("WidevineCdm", "WidevineCdm/component"),
+            (
+                "Default/Service Worker/CacheStorage",
+                "Default/Service Worker/CacheStorage/cache",
+            ),
+            (
+                "Profile 1/Service Worker/scriptcache",
+                "Profile 1/Service Worker/scriptcache/code",
+            ),
+            ("SingletonLock", "SingletonLock"),
+            ("SingletonCookie", "SingletonCookie"),
+            ("SingletonSocket", "SingletonSocket"),
+            ("Default/LOCK", "Default/LOCK"),
+            ("takeover.lock", "takeover.lock"),
+            ("stale.tmp", "stale.tmp"),
+            ("Default/stale.TMP", "Default/stale.TMP"),
+        ];
+        let keep: &[(&str, &[u8])] = &[
+            ("Local State", b"{\"os_crypt\":\"basic\"}"),
+            ("Default/Cookies", b"sqlite-cookies"),
+            ("Default/Cookies-journal", b"legacy-journal"),
+            ("Default/Network/Cookies", b"network-cookies"),
+            ("Default/Network/Cookies-wal", b"network-wal"),
+            ("Default/Login Data For Account", b"account-logins"),
+            ("Default/Login Data-journal", b"login-journal"),
+            ("Default/Web Data", b"web-data"),
+            ("Default/Web Data-wal", b"web-data-wal"),
+            ("Default/Preferences", b"{\"profile\":{}}"),
+            ("Default/Secure Preferences", b"{\"protection\":{}}"),
+            ("Default/Local Storage/leveldb/000001.ldb", b"local-storage"),
+            ("Default/Session Storage/000001.log", b"session-storage"),
+            ("Default/IndexedDB/site/000001.ldb", b"indexed-db"),
+            ("Default/Sessions/Session_123", b"open-tabs"),
+            ("Default/Service Worker/Database/db", b"service-worker-db"),
+            // Collision controls: matching names below state dirs are not disposable.
+            ("Default/IndexedDB/site/Cache/data", b"indexed-db-blob"),
+            ("Default/Extensions/id/Cache/auth.tmp", b"extension-auth"),
+            (
+                "Default/Local Extension Settings/id/LOCK",
+                b"extension-lock",
+            ),
+            ("Profile 1/Network/Cookies", b"second-profile-cookies"),
+        ];
+        for (rel, bytes) in disposable
+            .iter()
+            .map(|&(_, file)| (file, &b"disposable"[..]))
+            .chain(keep.iter().copied())
+        {
+            let path = ud.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
 
         let (archive, _ct) = pack_user_data_dir(&ud).unwrap();
         #[cfg(target_os = "linux")]
         if find_zstd_binary().is_some() {
-            assert!(
-                archive.starts_with(ZSTD_MAGIC),
-                "expected zstd frame magic when zstd is installed"
-            );
+            assert!(archive.starts_with(ZSTD_MAGIC));
         }
 
         let dst = tempfile::tempdir().unwrap();
-        let restored = dst.path().join("user-data");
-        let files = unpack_user_data_archive(&archive, &restored).unwrap();
-        assert_eq!(files, 4);
-
-        // Preserved session files exist with exact content.
         assert_eq!(
-            std::fs::read(restored.join("Local State")).unwrap(),
-            b"{\"os_crypt\":\"basic\"}"
+            unpack_user_data_archive(&archive, dst.path()).unwrap(),
+            keep.len()
         );
-        assert_eq!(
-            std::fs::read(restored.join("Default/Cookies")).unwrap(),
-            b"sqlite-cookies-bytes"
-        );
-        assert_eq!(
-            std::fs::read(restored.join("Default/Local Storage/leveldb/000001.ldb")).unwrap(),
-            b"local-storage-data"
-        );
-        assert_eq!(
-            std::fs::read(restored.join("Default/Service Worker/Database/db")).unwrap(),
-            b"sw-db-keep"
-        );
-
-        // Stripped caches & lock files are completely absent.
-        for stripped in [
-            "Default/Cache",
-            "Default/Code Cache",
-            "Default/GPUCache",
-            "GrShaderCache",
-            "ShaderCache",
-            "DawnCache",
-            "GraphiteDawnCache",
-            "Default/Service Worker/CacheStorage",
-            "Crashpad",
-            "SingletonLock",
-            "SingletonCookie",
-            "SingletonSocket",
-            "Default/LOCK",
-            "takeover.lock",
-        ] {
-            assert!(
-                !restored.join(stripped).exists(),
-                "expected `{stripped}` to be stripped"
+        for (rel, bytes) in keep {
+            assert_eq!(
+                &std::fs::read(dst.path().join(rel)).unwrap(),
+                bytes,
+                "{rel}"
             );
+        }
+        for (entry, file) in disposable {
+            assert!(
+                !dst.path().join(entry).exists(),
+                "expected to strip {entry}"
+            );
+            assert!(ud.join(file).is_file(), "packing must not delete {file}");
         }
     }
 
@@ -1631,6 +1701,55 @@ mod tests {
         assert_eq!(
             list_remote_profiles(&api_url, &bad, None).unwrap_err().code,
             "UNAUTHORIZED"
+        );
+    }
+
+    #[test]
+    fn upload_413_reports_wire_size_and_only_known_response_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut size = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    size = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut payload = vec![0; size.unwrap()];
+            reader.read_exact(&mut payload).unwrap();
+            let body = "<h1>Request Entity Too Large</h1>\r\nreflected-test-credential";
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            payload.len()
+        });
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("Local State"), b"{}").unwrap();
+        let sync = RemoteProfileSync {
+            api_url: format!("http://{addr}"),
+            auth: CoordinatorAuth::Agent("reflected-test-credential".into()),
+            profile_name: "demo-profile".into(),
+        };
+        let err = sync_up_profile(&sync, work.path()).unwrap_err();
+        let size = mock.join().unwrap();
+        assert_eq!(err.code, "PROFILE_SYNC_ERROR");
+        assert_eq!(
+            err.message,
+            format!(
+                "coordinator returned HTTP 413 uploading browser profile `demo-profile` ({size} compressed bytes): Request Entity Too Large"
+            )
         );
     }
 
