@@ -13,6 +13,10 @@ use crate::sandbox_providers::sylphx::DEFAULT_TEMPLATE;
 
 const NS: &str = "markers";
 const DRAIN: &str = "sandbox-drain-lease";
+/// Guest heartbeats fire every 5s while live; an older `inflight_children > 0`
+/// snapshot with no active turn is stale (e.g. a completed or dead guest) and
+/// must not block turn-boundary lease recycling indefinitely.
+const INFLIGHT_HEARTBEAT_FRESHNESS_MS: i64 = 60_000;
 
 pub(crate) fn desired_image(store: &Store, binding: Option<&SandboxBinding>) -> String {
     let registry = ProviderRegistry::from_env_or_config(Some(store.data_dir()), None).ok();
@@ -58,15 +62,29 @@ pub(crate) fn requested(store: &Store, binding: &SandboxBinding) -> Result<bool,
         .is_some_and(|blob| blob.content == key.as_bytes()))
 }
 
-pub(crate) fn busy(store: &Store, agent: &AgentId) -> Result<bool, Error> {
+pub(crate) fn has_active_turn(store: &Store, agent: &AgentId) -> Result<bool, Error> {
     Ok(store.has_open_turn(agent)?
         || !store
             .remote_turn_store()
             .list_active_for_agent(agent)?
-            .is_empty()
-        || store
-            .runtime_heartbeat(agent)?
-            .is_some_and(|hb| hb.inflight_children > 0))
+            .is_empty())
+}
+
+fn heartbeat_reports_live_children(hb: &anyagents_core::RuntimeHeartbeat, now_ms: i64) -> bool {
+    hb.inflight_children > 0
+        && hb
+            .heartbeat_at_ms
+            .is_some_and(|ts| now_ms.saturating_sub(ts) <= INFLIGHT_HEARTBEAT_FRESHNESS_MS)
+}
+
+pub(crate) fn busy(store: &Store, agent: &AgentId) -> Result<bool, Error> {
+    if has_active_turn(store, agent)? {
+        return Ok(true);
+    }
+    let now = anyagents_core::now_ms();
+    Ok(store
+        .runtime_heartbeat(agent)?
+        .is_some_and(|hb| heartbeat_reports_live_children(&hb, now)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -131,6 +149,20 @@ pub(crate) fn recycle_at_boundary(
     };
     let config_dir = anyagents_core::agent_config_dir(store.data_dir(), agent);
     release_sandbox_binding_with_provider(store, &binding, provider, Some(&config_dir))?;
+    // Clear any stale guest child-process count from the released lease so
+    // subsequent version checks and turns see a clean idle runtime state.
+    let now = anyagents_core::now_ms();
+    let _ = store.update_runtime_heartbeat(
+        agent,
+        &anyagents_core::RuntimeHeartbeat {
+            owner_replica_id: Some(store.replica_id().to_string()),
+            turn_state: "idle".to_string(),
+            retry_at_ms: None,
+            heartbeat_at_ms: Some(now),
+            idle_since_ms: Some(now),
+            inflight_children: 0,
+        },
+    );
     // The marker is scoped to the released lease identity, so a failed delete
     // cannot accidentally request an upgrade on a newly attached lease.
     let _ = store.blob_store().delete_agent_file(agent, NS, DRAIN);
@@ -412,5 +444,37 @@ mod tests {
         .await
         .unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn stale_inflight_children_heartbeat_does_not_block_recycle() {
+        let now = 1_795_222_000_000;
+        let fresh = anyagents_core::RuntimeHeartbeat {
+            owner_replica_id: None,
+            turn_state: "idle".to_string(),
+            retry_at_ms: None,
+            heartbeat_at_ms: Some(now - 5_000),
+            idle_since_ms: None,
+            inflight_children: 2,
+        };
+        assert!(heartbeat_reports_live_children(&fresh, now));
+
+        let stale = anyagents_core::RuntimeHeartbeat {
+            heartbeat_at_ms: Some(now - INFLIGHT_HEARTBEAT_FRESHNESS_MS - 1_000),
+            ..fresh.clone()
+        };
+        assert!(!heartbeat_reports_live_children(&stale, now));
+
+        let missing_ts = anyagents_core::RuntimeHeartbeat {
+            heartbeat_at_ms: None,
+            ..fresh.clone()
+        };
+        assert!(!heartbeat_reports_live_children(&missing_ts, now));
+
+        let zero_children = anyagents_core::RuntimeHeartbeat {
+            inflight_children: 0,
+            ..fresh
+        };
+        assert!(!heartbeat_reports_live_children(&zero_children, now));
     }
 }
