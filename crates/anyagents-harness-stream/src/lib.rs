@@ -9,6 +9,8 @@
 //! written again.
 
 mod rpc;
+mod usage;
+use usage::{CumulativeUsage, reported_usage, turn_usage};
 
 pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
@@ -47,6 +49,8 @@ pub struct LineEffect {
 pub enum LineProtocol {
     /// `result` closes the turn and reports usage but no cost.
     Result,
+    /// A result reports cumulative tokens for its session, not for its turn.
+    CumulativeResult,
     /// A persistent controller acknowledges each correlated input before the
     /// mailbox releases custody. `result` is the only terminal frame.
     AcknowledgedResult,
@@ -78,7 +82,7 @@ impl StreamSpec {
                 resume_flag: "--resume",
                 start_line: "user",
                 cancel: "interrupt",
-                protocol: LineProtocol::Result,
+                protocol: LineProtocol::CumulativeResult,
             },
             // The adapter contract (`docs/architecture.md`): one JSON line on
             // stdin per message, a `result` line when its turn ends. The
@@ -129,7 +133,9 @@ impl StreamSpec {
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
                 LineProtocol::AcknowledgedResult => kind == Some("result"),
-                LineProtocol::Result => kind == Some("result") && (!is_error || self.is_agy()),
+                LineProtocol::Result | LineProtocol::CumulativeResult => {
+                    kind == Some("result") && (!is_error || self.is_agy())
+                }
             };
         LineEffect {
             finishes_turn: finishes,
@@ -142,30 +148,9 @@ impl StreamSpec {
                 .or_else(|| value.pointer("/step_update/conversation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            usage: finishes.then(|| self.usage_of(value)),
+            usage: finishes.then(|| reported_usage(self.protocol, value)),
             quota_reset_at_ms,
             text: self.text_of(value),
-        }
-    }
-
-    fn usage_of(&self, value: &Value) -> TurnUsage {
-        let usage = value
-            .get("usage")
-            .or_else(|| value.pointer("/result/usage"))
-            .or_else(|| value.pointer("/message/usage"));
-        TurnUsage {
-            input_tokens: number(usage, "input_tokens").max(number(usage, "input")),
-            output_tokens: number(usage, "output_tokens").max(number(usage, "output")),
-            cache_read_tokens: number(usage, "cache_read_tokens")
-                .max(number(usage, "cacheRead"))
-                .max(number(usage, "cache_read_input_tokens")),
-            cache_write_tokens: number(usage, "cache_write_tokens")
-                .max(number(usage, "cacheWrite"))
-                .max(number(usage, "cache_creation_input_tokens")),
-            // Spiron reports what a turn cost (`cost_micros`, micro-USD).
-            reported_cost_micros: (self.protocol == LineProtocol::AcknowledgedResult)
-                .then(|| value.get("cost_micros").and_then(Value::as_i64))
-                .flatten(),
         }
     }
 
@@ -408,6 +393,7 @@ struct State {
     sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
+    cumulative: CumulativeUsage,
     /// The text lines of the open turn so far, and the id they were read under.
     text: Option<(String, Vec<String>)>,
     /// The last open turn ended on quiet rather than on a result line.
@@ -468,6 +454,15 @@ impl StreamHarness {
         launch: Launch,
         agy_rpc: Option<AgyRpcConfig>,
     ) -> Result<Self, HarnessError> {
+        Self::launch_with_usage_checkpoint(launch, agy_rpc, None)
+    }
+
+    /// Spawn a child with optional durable session counter snapshots.
+    pub fn launch_with_usage_checkpoint(
+        launch: Launch,
+        agy_rpc: Option<AgyRpcConfig>,
+        checkpoint_dir: Option<PathBuf>,
+    ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             spec: launch.spec,
             program: launch.program,
@@ -477,7 +472,10 @@ impl StreamHarness {
             agy_rpc,
             mode: launch.mode,
             delivery: launch.delivery,
-            shared: Arc::new(Mutex::new(State::new(launch.session_id.as_deref()))),
+            shared: Arc::new(Mutex::new(State {
+                cumulative: CumulativeUsage::new(checkpoint_dir),
+                ..State::new(launch.session_id.as_deref())
+            })),
             stdin: Arc::new(Mutex::new(None)),
             #[cfg(unix)]
             socket: None,
@@ -2041,6 +2039,7 @@ impl State {
             sign_in_fault: None,
             session_id: session_id.map(str::to_string),
             usages: Vec::new(),
+            cumulative: CumulativeUsage::default(),
             text: None,
             finished_quiet: HashSet::new(),
             ready: None,
@@ -2124,7 +2123,7 @@ fn read_stdout(
                 effect.quota_reset_at_ms = None;
                 if kind == Some("result") {
                     effect.finishes_turn = true;
-                    effect.usage = Some(spec.usage_of(&value));
+                    effect.usage = Some(reported_usage(spec.protocol, &value));
                 }
             }
         }
@@ -2203,7 +2202,10 @@ fn read_stdout(
                     effect.finishes_turn = false;
                     continue_turn = Some((
                         agy_continue_line(&spec, content),
-                        effect.usage.take().unwrap_or_else(|| spec.usage_of(&value)),
+                        effect
+                            .usage
+                            .take()
+                            .unwrap_or_else(|| reported_usage(spec.protocol, &value)),
                     ));
                 }
             }
@@ -2378,7 +2380,9 @@ fn read_stdout(
                             Some(error.unwrap_or("harness turn failed").to_string());
                     }
                 }
-                let usage = effect.usage.unwrap_or_else(|| spec.usage_of(&value));
+                let usage = effect
+                    .usage
+                    .unwrap_or_else(|| reported_usage(spec.protocol, &value));
                 if consumption {
                     finish_consumed(
                         &mut state,
@@ -2393,7 +2397,9 @@ fn read_stdout(
                 {
                     retire_agy_empty_turn(&mut state, agy_rpc.as_ref());
                 } else {
-                    finish_open(&mut state, usage);
+                    finish_open(&mut state, |state| {
+                        turn_usage(state, spec.protocol, &value, usage)
+                    });
                 }
             } else if let Some(ref synth_err) = synthetic_401 {
                 let mut rejected_ids = std::mem::take(&mut state.open);
@@ -2455,7 +2461,9 @@ fn read_stdout(
         {
             let mut state = lock(&shared);
             if state.generation == generation {
-                finish_open(&mut state, usage);
+                finish_open(&mut state, |state| {
+                    turn_usage(state, spec.protocol, &value, usage)
+                });
                 state.touch();
             }
         }
@@ -2715,7 +2723,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
 /// The turn ended: its inputs are finished, the first carrying its usage. An
 /// Antigravity turn that closed took the line that opened it; a message its
 /// cascade's mailbox still holds was not taken by it and finishes nothing.
-fn finish_open(state: &mut State, usage: TurnUsage) {
+fn finish_open(state: &mut State, usage: impl FnOnce(&mut State) -> TurnUsage) {
     state.turn_user_inputs = 0;
     state.last_turn_step_type = None;
     state.idle_since = None;
@@ -2738,7 +2746,7 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
             state.agy_taken.insert(id.clone());
         }
         state.finished.insert(id.clone());
-        let item_usage = usage.take().unwrap_or_default();
+        let item_usage = usage.take().map(|usage| usage(state)).unwrap_or_default();
         state.usages.push((id, item_usage));
     }
     if !state.followups.is_empty() {
@@ -3806,7 +3814,7 @@ fn agy_steer_attempt(
             // while held open by a background task. Close those open messages now
             // so `turn_recovery.completed_seq` advances and never replays stale
             // completed turns on restart.
-            finish_open(&mut state, TurnUsage::default());
+            finish_open(&mut state, |_| TurnUsage::default());
             state.turns_started += 1;
         } else if !had_open {
             state.turns_started += 1;
@@ -4514,7 +4522,7 @@ fn watch_agy_cascade(
                 wake.notify_all();
                 continue;
             }
-            finish_open(&mut state, TurnUsage::default());
+            finish_open(&mut state, |_| TurnUsage::default());
             state.turn_user_inputs = 1;
             state.touch();
             drop(state);
@@ -4702,13 +4710,6 @@ fn proof_outcome(proof: Proof) -> DeliverOutcome {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
-}
-
-fn number(value: Option<&Value>, key: &str) -> u64 {
-    value
-        .and_then(|item| item.get(key))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
 }
 
 fn quota_of(value: &Value) -> Option<i64> {

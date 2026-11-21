@@ -98,46 +98,39 @@ impl AgyHarness {
         }
         let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
-        let agy_rpc = if work_dir.is_some() && !fake_mode {
-            environment
-                .iter()
-                .rev()
-                .find(|(k, _)| k == "ANYAGENTS_AGENT_CONFIG")
-                .or_else(|| {
-                    environment
-                        .iter()
-                        .rev()
-                        .find(|(k, _)| k == "AGY_CONFIG_DIR")
-                })
-                .map(|(_, v)| {
-                    let csrf_token = environment
-                        .iter()
-                        .find(|(k, _)| k == "ANYAGENTS_AGY_CSRF_TOKEN")
-                        .map(|(_, val)| val.clone())
-                        .unwrap_or_else(|| {
-                            let nanos = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0);
-                            format!("agy-csrf-{}-{nanos}", std::process::id())
-                        });
-                    if !args.iter().any(|a| a == "--csrf_token") {
-                        args.push("--csrf_token".to_string());
-                        args.push(csrf_token.clone());
-                    }
-                    let port_override = environment
-                        .iter()
-                        .find(|(k, _)| k == "ANYAGENTS_AGY_HTTP_PORT")
-                        .and_then(|(_, val)| val.parse::<u16>().ok());
-                    AgyRpcConfig {
-                        config_dir: normalize_agy_config_root(Path::new(v)),
-                        csrf_token,
-                        port_override,
-                    }
-                })
-        } else {
-            None
-        };
+        let config_dir = ["ANYAGENTS_AGENT_CONFIG", "AGY_CONFIG_DIR"]
+            .into_iter()
+            .find_map(|key| environment.iter().rev().find(|(k, _)| k == key))
+            .map(|(_, path)| normalize_agy_config_root(Path::new(path)));
+        let agy_rpc = config_dir
+            .as_ref()
+            .filter(|_| work_dir.is_some() && !fake_mode)
+            .map(|config_dir| {
+                let csrf_token = environment
+                    .iter()
+                    .find(|(k, _)| k == "ANYAGENTS_AGY_CSRF_TOKEN")
+                    .map(|(_, val)| val.clone())
+                    .unwrap_or_else(|| {
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        format!("agy-csrf-{}-{nanos}", std::process::id())
+                    });
+                if !args.iter().any(|a| a == "--csrf_token") {
+                    args.push("--csrf_token".to_string());
+                    args.push(csrf_token.clone());
+                }
+                let port_override = environment
+                    .iter()
+                    .find(|(k, _)| k == "ANYAGENTS_AGY_HTTP_PORT")
+                    .and_then(|(_, val)| val.parse::<u16>().ok());
+                AgyRpcConfig {
+                    config_dir: config_dir.clone(),
+                    csrf_token,
+                    port_override,
+                }
+            });
         // Mid-turn mail needs the language server; without it a line written
         // mid-turn waits for the turn to end.
         let (mode, delivery) = if agy_rpc.is_some() {
@@ -148,7 +141,7 @@ impl AgyHarness {
                 anyagents_harness_stream::LINE_PER_TURN,
             )
         };
-        let inner = StreamHarness::launch_with_agy_rpc(
+        let inner = StreamHarness::launch_with_usage_checkpoint(
             Launch {
                 spec: spec.clone(),
                 program: program.into(),
@@ -160,6 +153,7 @@ impl AgyHarness {
                 delivery,
             },
             agy_rpc,
+            config_dir.map(|dir| dir.join(".anyagents-agy-usage")),
         )?;
         if let Some(id) = session_id {
             inner.seed_session_id(id);
