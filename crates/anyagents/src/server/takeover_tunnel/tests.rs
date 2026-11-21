@@ -38,24 +38,64 @@ impl Drop for TestFixture {
 
 async fn start_fixture(grace: Duration, keepalive: Duration) -> TestFixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-    let a = store
-        .create_agent(
-            NewAgent::new("agent-a", "claude-code")
-                .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
-        )
-        .unwrap();
-    let b = store
-        .create_agent(
-            NewAgent::new("agent-b", "claude-code")
-                .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
-        )
-        .unwrap();
-    let tok_a = store.begin_remote_session(&a.id, 60_000).unwrap().token;
-    let tok_b = store.begin_remote_session(&b.id, 60_000).unwrap().token;
+    start_fixture_with_store(dir, grace, keepalive, |dir| {
+        Store::open(dir.join("state.db")).unwrap()
+    })
+    .await
+}
+
+async fn start_fixture_with_store(
+    dir: tempfile::TempDir,
+    grace: Duration,
+    keepalive: Duration,
+    open: impl FnOnce(&std::path::Path) -> Store + Send + 'static,
+) -> TestFixture {
+    let path = dir.path().to_owned();
+    let (store, a, tok_a, tok_b) = tokio::task::spawn_blocking(move || {
+        let store = Arc::new(open(&path));
+        let suffix = path.file_name().unwrap().to_string_lossy();
+        let suffix = suffix.trim_start_matches('.');
+        let a = store
+            .create_agent(
+                NewAgent::new(format!("viewer-{suffix}-a"), "claude-code")
+                    .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
+            )
+            .unwrap();
+        let b = store
+            .create_agent(
+                NewAgent::new(format!("viewer-{suffix}-b"), "claude-code")
+                    .with_runtime(ExecutionRuntime::Sandbox { provider: None }),
+            )
+            .unwrap();
+        let tok_a = store.begin_remote_session(&a.id, 60_000).unwrap().token;
+        let tok_b = store.begin_remote_session(&b.id, 60_000).unwrap().token;
+        (store, a, tok_a, tok_b)
+    })
+    .await
+    .unwrap();
     let reg = Arc::new(TakeoverRegistry::with_tunables(grace, keepalive));
     install_test_registry(&store, reg);
 
+    let (addr, server_task, stopping) = serve(&store).await;
+    TestFixture {
+        _dir: dir,
+        addr,
+        store,
+        agent_a: a.id,
+        agent_a_token: tok_a,
+        agent_b_token: tok_b,
+        server_task,
+        stopping,
+    }
+}
+
+async fn serve(
+    store: &Arc<Store>,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    watch::Sender<bool>,
+) {
     let state = AppState {
         store: store.clone(),
         health: HealthBoard::default(),
@@ -79,16 +119,7 @@ async fn start_fixture(grace: Duration, keepalive: Duration) -> TestFixture {
             .await
             .unwrap();
     });
-    TestFixture {
-        _dir: dir,
-        addr,
-        store,
-        agent_a: a.id,
-        agent_a_token: tok_a,
-        agent_b_token: tok_b,
-        server_task,
-        stopping,
-    }
+    (addr, server_task, stopping)
 }
 
 async fn dial_guest(
@@ -622,10 +653,19 @@ async fn tunnel_sends_keepalive_pings_and_evicts_after_grace_window() {
 }
 
 async fn register_guest(fx: &TestFixture, sid: &str, token: &str) -> ClientWs {
+    register_guest_mode(fx, sid, token, false).await
+}
+
+async fn register_guest_mode(
+    fx: &TestFixture,
+    sid: &str,
+    token: &str,
+    reconnect: bool,
+) -> ClientWs {
     let mut guest = dial_guest(fx.addr, sid, &fx.agent_a_token).await;
     let frame = ControlFrame::Register {
         token: token.into(),
-        reconnect: false,
+        reconnect,
         agent_id: None,
         local_origin: None,
     };
@@ -719,7 +759,7 @@ async fn reset_negotiates_lifecycle_and_requires_operator_then_coalesces_wake() 
         for accept in ["application/json", "*/*", "application/json, text/html;q=0"] {
             let (status, headers, _) =
                 http_call(fx.addr, "GET", page, &[("accept", accept)], "").await;
-            assert_eq!(status, 404); // existing JSON response when there is no in-memory registry entry
+            assert_eq!(status, 410); // The authenticated durable deadline survives a registry miss.
             assert_eq!(headers[header::CONTENT_TYPE], "application/json");
         }
         let (status, _, body) =
@@ -852,3 +892,6 @@ async fn handback_waits_for_workstation_release_then_closes_and_wakes_idle_owner
         assert!(pending[0].text.contains("[Browser handback]") && !pending[0].text.contains("handback-link-fixture"));
     }).await.expect("handback test timed out");
 }
+
+#[path = "reconnect_tests.rs"]
+mod reconnect_tests;

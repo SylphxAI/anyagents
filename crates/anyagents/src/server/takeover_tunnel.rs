@@ -50,6 +50,7 @@ use super::types::AppState;
 mod guest_frames;
 mod lease;
 mod proxy;
+mod reconnect;
 mod recovery;
 mod viewer;
 use guest_frames::{handle_guest_binary_frame, handle_guest_control_frame};
@@ -345,6 +346,8 @@ impl TakeoverSession {
 /// Bounded in-memory registry of active takeover reverse-tunnel sessions.
 pub(crate) struct TakeoverRegistry {
     sessions: RwLock<HashMap<String, Arc<TakeoverSession>>>,
+    inserted: Notify,
+    mutations: Mutex<()>,
     grace_window: Duration,
     keepalive_interval: Duration,
     max_sessions: usize,
@@ -358,6 +361,8 @@ impl TakeoverRegistry {
     fn with_tunables(grace_window: Duration, keepalive_interval: Duration) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            inserted: Notify::new(),
+            mutations: Mutex::new(()),
             grace_window,
             keepalive_interval,
             max_sessions: MAX_SESSIONS,
@@ -379,9 +384,16 @@ impl TakeoverRegistry {
         tx: mpsc::Sender<OutboundTunnelMsg>,
     ) -> Result<(Arc<TakeoverSession>, u64), RegisterError> {
         let Register { token, reconnect } = register;
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, s| !s.is_evictable(self.grace_window));
-        if let Some(existing) = sessions.get(session_id).cloned() {
+        let _mutation = self.mutations.lock().await;
+        let (existing, at_capacity) = {
+            let mut sessions = self.sessions.write().await;
+            sessions.retain(|_, s| !s.is_evictable(self.grace_window));
+            (
+                sessions.get(session_id).cloned(),
+                sessions.len() >= self.max_sessions,
+            )
+        };
+        if let Some(existing) = existing {
             if !existing.owner.may_reattach(&owner) {
                 return Err(("FORBIDDEN", "session owned by another principal", 4403));
             }
@@ -404,7 +416,7 @@ impl TakeoverRegistry {
             existing.reconnect_notify.notify_waiters();
             return Ok((existing, generation));
         }
-        if sessions.len() >= self.max_sessions {
+        if at_capacity {
             return Err((
                 "CAPACITY_EXCEEDED",
                 "maximum takeover sessions reached",
@@ -413,7 +425,9 @@ impl TakeoverRegistry {
         }
         let pin =
             LeasePin::register(Arc::clone(&store), &owner, session_id, &token, reconnect).await?;
-        recovery::remember_link(&store, &owner, session_id, &token, pin.as_ref()).await;
+        if pin.is_none() {
+            recovery::remember_link(&store, &owner, session_id, &token).await;
+        }
         let entry = Arc::new(TakeoverSession {
             owner,
             store: Arc::downgrade(&store),
@@ -437,7 +451,11 @@ impl TakeoverRegistry {
             inflight_http: Mutex::new(HashMap::new()),
             inflight_ws: Mutex::new(HashMap::new()),
         });
-        sessions.insert(session_id.to_string(), Arc::clone(&entry));
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), Arc::clone(&entry));
+        self.inserted.notify_waiters();
         Ok((entry, 1))
     }
 
@@ -450,8 +468,11 @@ impl TakeoverRegistry {
     ) {
         // Take locks in the same order as registration. A superseded socket
         // cannot revoke the generation that replaced it.
-        let mut sessions = self.sessions.write().await;
-        if !sessions
+        let _mutation = self.mutations.lock().await;
+        if !self
+            .sessions
+            .read()
+            .await
             .get(session_id)
             .is_some_and(|cur| Arc::ptr_eq(cur, entry))
         {
@@ -470,7 +491,7 @@ impl TakeoverRegistry {
         if matches!(entry.owner, TunnelOwner::Agent(_)) {
             recovery::end_link(entry.store.upgrade(), session_id, &entry.token).await;
         }
-        sessions.remove(session_id);
+        self.sessions.write().await.remove(session_id);
     }
 }
 
@@ -887,30 +908,24 @@ enum ViewerAuth {
     CookieOrBearer,
 }
 
-fn authenticate_viewer(
+fn viewer_credentials<'a>(
     session_id: &str,
-    expected_token: &str,
-    headers: &HeaderMap,
-    uri: &Uri,
-) -> Option<ViewerAuth> {
-    let eq = |s: &str| constant_time_eq(s.as_bytes(), expected_token.as_bytes());
-    if uri.query().is_some_and(|q| {
-        url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "token" && eq(&v))
-    }) {
-        return Some(ViewerAuth::QueryToken);
-    }
+    headers: &'a HeaderMap,
+    uri: &'a Uri,
+) -> impl Iterator<Item = (std::borrow::Cow<'a, str>, ViewerAuth)> + 'a {
+    let query = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .filter_map(|(k, v)| (k == "token").then_some((v, ViewerAuth::QueryToken)));
     let cname = format!("{COOKIE_PREFIX}{session_id}");
-    let cookie_ok = headers
+    let cookies = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|r| r.split(';'))
-        .any(|p| {
-            p.trim()
-                .split_once('=')
-                .is_some_and(|(k, v)| k.trim() == cname && eq(v.trim()))
+        .filter_map(move |p| {
+            let (key, value) = p.trim().split_once('=')?;
+            (key.trim() == cname).then_some(value.trim())
         });
-    let bearer_ok = headers
+    let bearers = headers
         .get_all(header::AUTHORIZATION)
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -918,9 +933,24 @@ fn authenticate_viewer(
             let t = r.trim();
             t.strip_prefix("Bearer ")
                 .or_else(|| t.strip_prefix("bearer "))
-        })
-        .any(|tok| eq(tok.trim()));
-    (cookie_ok || bearer_ok).then_some(ViewerAuth::CookieOrBearer)
+                .map(str::trim)
+        });
+    query.chain(
+        cookies
+            .chain(bearers)
+            .map(|token| (token.into(), ViewerAuth::CookieOrBearer)),
+    )
+}
+
+fn authenticate_viewer(
+    session_id: &str,
+    expected_token: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Option<ViewerAuth> {
+    viewer_credentials(session_id, headers, uri).find_map(|(token, auth)| {
+        constant_time_eq(token.as_bytes(), expected_token.as_bytes()).then_some(auth)
+    })
 }
 
 fn check_viewer_origin(headers: &HeaderMap, session: &TakeoverSession) -> bool {
@@ -962,13 +992,20 @@ async fn resolve_and_auth_viewer(
     session_id: &str,
     headers: &HeaderMap,
     uri: &Uri,
-) -> Result<ResolvedViewer, (StatusCode, &'static str)> {
-    let not_found = (StatusCode::NOT_FOUND, "takeover session not found");
+    wait_on_miss: bool,
+) -> Result<ResolvedViewer, reconnect::ViewerError> {
+    let not_found = reconnect::NOT_FOUND;
     if !is_valid_takeover_session_id(session_id) {
         return Err(not_found);
     }
     let registry = registry_for_store(&state.store);
-    let session = registry.get_active(session_id).await.ok_or(not_found)?;
+    let session = match registry.get_active(session_id).await {
+        Some(entry) => entry,
+        None if wait_on_miss => {
+            reconnect::wait(&registry, &state.store, session_id, headers, uri).await?
+        }
+        None => return Err(not_found),
+    };
     let auth = authenticate_viewer(session_id, &session.token, headers, uri)
         .ok_or((StatusCode::UNAUTHORIZED, "valid takeover token required"))?;
     if *session.returned.borrow() {
@@ -977,16 +1014,13 @@ async fn resolve_and_auth_viewer(
     if let Some(pin) = &session.pin {
         match pin.check().await {
             Ok(()) => {}
-            Err(EXPIRED) => return Err((StatusCode::GONE, "takeover lease expired")),
+            Err(EXPIRED) => return Err(reconnect::GONE),
             Err(ENDED) => {
                 recovery::end_link(session.store.upgrade(), session_id, &session.token).await;
                 return Err(not_found);
             }
             Err(_) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cannot verify takeover lease",
-                ));
+                return Err(reconnect::UNAVAILABLE);
             }
         }
     }
@@ -1002,7 +1036,7 @@ async fn viewer_no_slash_route(
     req: Request,
 ) -> Response {
     let (_, session, mint_cookie) =
-        match resolve_and_auth_viewer(&state, &session_id, req.headers(), req.uri()).await {
+        match resolve_and_auth_viewer(&state, &session_id, req.headers(), req.uri(), true).await {
             Ok(v) => v,
             Err(error) => {
                 return recovery::viewer_error(
@@ -1108,23 +1142,31 @@ async fn handle_viewer_request(
     req: Request,
 ) -> Response {
     let (mut parts, body) = req.into_parts();
-    let (registry, session, mint_cookie) =
-        match resolve_and_auth_viewer(&state, &session_id, &parts.headers, &parts.uri).await {
-            Ok(v) => v,
-            Err(error) if subpath == "/" => {
-                return recovery::viewer_error(
-                    &state,
-                    &session_id,
-                    &parts.method,
-                    &parts.headers,
-                    &parts.uri,
-                    error,
-                    parts.extensions.get().copied().unwrap_or_default(),
-                )
-                .await;
-            }
-            Err((st, msg)) => return json_error_response(st, msg),
-        };
+    let (registry, session, mint_cookie) = match resolve_and_auth_viewer(
+        &state,
+        &session_id,
+        &parts.headers,
+        &parts.uri,
+        true,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(error) if subpath == "/" => {
+            return recovery::viewer_error(
+                &state,
+                &session_id,
+                &parts.method,
+                &parts.headers,
+                &parts.uri,
+                error,
+                parts.extensions.get().copied().unwrap_or_default(),
+            )
+            .await;
+        }
+        Err(reconnect::RECONNECTING) => return reconnect::retry_response(false),
+        Err((st, msg)) => return recovery::no_store(json_error_response(st, msg)),
+    };
     if !check_viewer_origin(&parts.headers, &session) {
         return json_error_response(
             StatusCode::FORBIDDEN,
@@ -1133,6 +1175,9 @@ async fn handle_viewer_request(
     }
     let root_document = parts.method == axum::http::Method::GET
         && subpath == "/"
+        && matches!(session.owner, TunnelOwner::Agent(_));
+    let desktop_script = parts.method == axum::http::Method::GET
+        && subpath == "/app.js"
         && matches!(session.owner, TunnelOwner::Agent(_));
     // Keep ownership changes ordered with the Coordinator handback action;
     // never hold this lock for a streaming RFB or SSE request.
@@ -1178,8 +1223,8 @@ async fn handle_viewer_request(
         mint_cookie,
     )
     .await;
-    let response = if root_document {
-        viewer::add_controls(response).await
+    let response = if root_document || desktop_script {
+        viewer::decorate(response, root_document).await
     } else {
         response
     };

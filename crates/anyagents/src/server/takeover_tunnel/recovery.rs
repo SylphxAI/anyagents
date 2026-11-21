@@ -28,7 +28,6 @@ pub(super) async fn remember_link(
     owner: &TunnelOwner,
     session_id: &str,
     token: &str,
-    pin: Option<&LeasePin>,
 ) {
     let TunnelOwner::Agent(agent) = owner else {
         return;
@@ -39,11 +38,10 @@ pub(super) async fn remember_link(
         session_id.to_owned(),
         sha256_hex(token.as_bytes()),
     );
-    let expiry = pin.map(LeasePin::expires_ms);
     // A recovery-store fault must not take the existing viewer transport down.
     if !matches!(
         tokio::task::spawn_blocking(
-            move || store.remember_takeover_link(&sid, &hash, &agent, expiry)
+            move || store.remember_takeover_link(&sid, &hash, &agent, None)
         )
         .await,
         Ok(Ok(()))
@@ -134,7 +132,7 @@ pub(super) fn unavailable() -> ApiError {
     )
 }
 
-fn prefers_html(headers: &HeaderMap) -> bool {
+pub(super) fn prefers_html(headers: &HeaderMap) -> bool {
     let mut html: f32 = 0.0;
     let mut json: f32 = 0.0;
     for value in headers
@@ -175,6 +173,9 @@ pub(super) async fn viewer_error(
     error: (StatusCode, &'static str),
     console: ConsoleAvailable,
 ) -> Response {
+    if error == reconnect::RECONNECTING {
+        return reconnect::retry_response(*method == Method::GET && prefers_html(headers));
+    }
     if *method != Method::GET
         || !prefers_html(headers)
         || !matches!(
@@ -207,12 +208,15 @@ pub(super) async fn viewer_error(
             "",
         );
     };
-    let Some(retired) = link.retired else {
+    let retired = link
+        .retired
+        .or_else(|| (error == reconnect::GONE).then_some(Retired::Expired));
+    let Some(retired) = retired else {
         return page(
-            StatusCode::SERVICE_UNAVAILABLE,
+            error.0,
             "Unavailable",
-            "Desktop not connected",
-            "This link is known, but the desktop isn’t available here. Try again shortly.",
+            "Desktop no longer available",
+            "Ask for a new takeover link.",
             "",
             "",
         );

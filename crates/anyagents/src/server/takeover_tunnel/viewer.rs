@@ -18,6 +18,15 @@ pub(super) fn router() -> Router<AppState> {
             axum::routing::post(handback),
         )
         .route("/takeover/{session_id}/_returned", get(returned))
+        .route("/takeover/{session_id}/_connection", get(connection))
+        .route(
+            "/assets/takeover-retry.js",
+            get(|| async { recovery::javascript(include_str!("retry.js")) }),
+        )
+        .route(
+            "/assets/takeover-connection.js",
+            get(|| async { recovery::javascript(include_str!("connection.js")) }),
+        )
         .route(
             "/assets/takeover-viewer.js",
             get(|| async { recovery::javascript(include_str!("viewer.js")) }),
@@ -25,14 +34,18 @@ pub(super) fn router() -> Router<AppState> {
 }
 
 // The proxy already limits non-SSE guest responses. Only decorate the known
-// workstation document, not its scripts, assets, or any arbitrary HTML viewer.
-pub(super) async fn add_controls(response: Response) -> Response {
+// workstation document and bootstrap script, not arbitrary guest assets.
+pub(super) async fn decorate(response: Response, is_document: bool) -> Response {
     if response.status() != StatusCode::OK
         || !response
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.split(';').next() == Some("text/html"))
+            .is_some_and(|v| match v.split(';').next() {
+                Some("text/html") => is_document,
+                Some("text/javascript" | "application/javascript") => !is_document,
+                _ => false,
+            })
         || response.headers().contains_key(header::CONTENT_ENCODING)
     {
         return response;
@@ -41,23 +54,82 @@ pub(super) async fn add_controls(response: Response) -> Response {
     let Ok(bytes) = to_bytes(body, MAX_HTTP_RESP_BYTES).await else {
         return json_error_response(StatusCode::BAD_GATEWAY, "could not read the takeover page");
     };
-    if let Ok(html) = std::str::from_utf8(&bytes)
-        && html.contains(SCRIPT_TAG)
-    {
-        let html = html.replacen(
-            SCRIPT_TAG,
-            concat!(
-                r#"<script type="module" src="app.js"></script>"#,
-                r#"<script defer src="/assets/takeover-viewer.js"></script>"#
-            ),
-            1,
-        );
+    let patched = std::str::from_utf8(&bytes).ok().and_then(|source| {
+        if !is_document {
+            return patch_script(source);
+        }
+        source.contains(SCRIPT_TAG).then(|| {
+            source.replacen(
+                SCRIPT_TAG,
+                concat!(
+                    r#"<script type="module" src="app.js"></script>"#,
+                    r#"<script defer src="/assets/takeover-viewer.js"></script>"#
+                ),
+                1,
+            )
+        })
+    });
+    if let Some(patched) = patched {
         for field in [header::CONTENT_LENGTH, header::ETAG, header::LAST_MODIFIED] {
             parts.headers.remove(field);
         }
-        return recovery::no_store(Response::from_parts(parts, Body::from(html)));
+        return recovery::no_store(Response::from_parts(parts, Body::from(patched)));
     }
     Response::from_parts(parts, Body::from(bytes))
+}
+
+// Change only the known bootstrap points; the guest still owns desktop input,
+// canvas, and controls. Leave unknown script versions untouched.
+fn patch_script(source: &str) -> Option<String> {
+    const HOOKS: [(&str, &str); 4] = [
+        (
+            "function connect() {",
+            "const transport = desktopTransport(connect);\nfunction connect() {",
+        ),
+        (
+            "connected = true;",
+            "connected = true;\n    transport.ready('rfb');",
+        ),
+        ("setTimeout(connect, 2000);", "transport.lost('rfb');"),
+        (
+            "const events = new EventSource('events');\nevents.addEventListener('state', e => apply(JSON.parse(e.data)));",
+            "transport.events(apply, () => apply({ holder: 'agent', browser_running: browserRunning }));",
+        ),
+    ];
+    if HOOKS
+        .iter()
+        .any(|(needle, _)| source.matches(needle).count() != 1)
+    {
+        return None;
+    }
+    let mut patched =
+        format!("import {{ desktopTransport }} from '/assets/takeover-connection.js';\n{source}");
+    for (needle, replacement) in HOOKS {
+        patched = patched.replacen(needle, replacement, 1);
+    }
+    Some(patched)
+}
+
+async fn connection(
+    State(state): State<AppState>,
+    AxumPath(sid): AxumPath<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let result = match resolve_and_auth_viewer(&state, &sid, &headers, &uri, true).await {
+        Ok((_, entry, _)) if !check_viewer_origin(&headers, &entry) => Err((
+            StatusCode::FORBIDDEN,
+            "cross-origin takeover request denied",
+        )),
+        Ok((_, entry, _)) if entry.conn.read().await.tx.is_some() => Ok(()),
+        Ok(_) => Err(reconnect::RECONNECTING),
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => recovery::no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(reconnect::RECONNECTING) => reconnect::retry_response(false),
+        Err((status, message)) => recovery::no_store(json_error_response(status, message)),
+    }
 }
 
 fn handback_key(session_id: &str, token: &str) -> String {
@@ -79,7 +151,7 @@ async fn handback(
             "Missing required takeover action header.",
         ));
     }
-    let result = match resolve_and_auth_viewer(&state, &sid, &headers, &uri).await {
+    let result = match resolve_and_auth_viewer(&state, &sid, &headers, &uri, false).await {
         Ok((registry, entry, _)) if check_viewer_origin(&headers, &entry) => {
             // Once accepted, a dropped browser request must not cancel the wake
             // between release and durable mailbox admission.
