@@ -87,8 +87,11 @@ class Engine:
 
     def save(self):
         """What a test reads about the running turn."""
-        (self.root / "state.json").write_text(
-            json.dumps({"turn": self.turn, "pending": len(self.pending)}))
+        # Readers must see a complete snapshot, even while an RPC queues mail.
+        path = self.root / "state.json"
+        tmp = path.with_name(".state.json.tmp")
+        tmp.write_text(json.dumps({"turn": self.turn, "pending": len(self.pending)}))
+        os.replace(tmp, path)
 
     def journal(self, inp, kind):
         """Record that the model saw `inp`. A vendor that deduplicates by our
