@@ -171,6 +171,7 @@ fn webhook_router_serves_mcp_profile_full_for_sandboxed_only_and_gateway_prefix(
     let sbx_cfg = anyagents_core::agent_config_dir(dir.path(), &sbx_agent.id);
     std::fs::create_dir_all(&sbx_cfg).unwrap();
     crate::sandbox_providers::sylphx::SylphxLeaseConfig {
+        scoped: false,
         endpoint: "https://sandbox.example.test".into(),
         token: None,
         parent: "orgs/o1/projects/p1/envs/e1".into(),

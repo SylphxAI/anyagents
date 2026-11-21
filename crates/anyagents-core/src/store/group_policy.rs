@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use super::{Agent, AgentId, Error, Store, agent_by_id, agent_exists, now_ms};
 use crate::db::{DbExec, DbExecExt as _, db_params};
+use crate::sandbox_targets::{is_sandbox_group, lock_sandbox_group};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -52,6 +53,8 @@ impl Store {
     ) -> Result<(), Error> {
         self.write_tx(|tx| {
             let caller = caller(tx, actor)?;
+            let mut names = names.to_vec();
+            names.sort_unstable();
             for name in names {
                 apply(tx, caller.as_ref(), name, GroupAction::Join, targets, None)?;
             }
@@ -157,10 +160,25 @@ fn apply(
     public: Option<bool>,
 ) -> Result<(), Error> {
     validate_name(name)?;
+    lock_sandbox_group(conn, name)?;
     let existing = group(conn, name)?;
+    let visibility_change = public.is_some() && action != GroupAction::Join;
+    if is_sandbox_group(conn, name)? {
+        if caller.is_some() && (action != GroupAction::Members || visibility_change) {
+            return Err(forbidden(
+                name,
+                "sandbox billing membership is operator-managed",
+            ));
+        }
+        if visibility_change && public == Some(true) {
+            return Err(forbidden(
+                name,
+                "sandbox billing groups must remain private",
+            ));
+        }
+    }
     // `public` on join configures a new group only. It never grants access to
     // or changes visibility of an existing group, even for an owner.
-    let visibility_change = public.is_some() && action != GroupAction::Join;
     if visibility_change && let (Some(existing), Some(caller)) = (&existing, caller) {
         let owner_authority = match &existing.owner_agent_id {
             Some(owner) => supervises(conn, &caller.id, owner)?,

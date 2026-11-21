@@ -387,6 +387,7 @@ pub fn runs_off_host_in(store: &Store, agent: &Agent, config_dir: &Path) -> bool
         || crate::sandbox_exec::has_remote_sandbox_provider(Some(store.data_dir()))
         || crate::sandbox_providers::SandboxMode::from_env().is_remote_required()
         || store.sandbox_binding(&agent.id).ok().flatten().is_some()
+        || !matches!(store.sandbox_credential_ref(&agent.id), Ok(None))
 }
 
 /// Why a remote agent cannot be created or started here, when it cannot.

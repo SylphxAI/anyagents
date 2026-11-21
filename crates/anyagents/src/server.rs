@@ -58,6 +58,7 @@ mod roles;
 mod runtime;
 pub(crate) mod runtime_issues;
 pub(crate) mod s3_media_profiles;
+mod sandbox_targets;
 mod schedules;
 pub(crate) mod secrets;
 pub(crate) mod serverless;
@@ -189,6 +190,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
     router
         .merge(agents::router())
         .merge(secrets::router())
+        .merge(sandbox_targets::router())
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(runtime_issues::agent_router())

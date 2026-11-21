@@ -174,8 +174,7 @@ fn sandbox_fingerprint(
     if handle.provider == ProviderKind::Local || handle.sandbox_id.trim().is_empty() {
         return Err(unavailable);
     }
-    let registry =
-        resolve_registry_for_binding(Some(store.data_dir()), &binding).map_err(|_| failure)?;
+    let registry = resolve_registry_for_binding(store, &binding).map_err(|_| failure)?;
     if registry.active_kind() != handle.provider {
         return Err(unavailable);
     }

@@ -118,18 +118,38 @@ impl ProviderRegistry {
         config_or_data_dir: Option<&Path>,
         overrides: Option<&SandboxRegistryConfig>,
     ) -> Result<Self, String> {
+        Self::from_config(&Self::resolved_config(config_or_data_dir, overrides)?)
+    }
+
+    pub(crate) fn for_scoped_target(
+        data_dir: &Path,
+        overrides: &SandboxRegistryConfig,
+        reference: &str,
+    ) -> Result<Self, String> {
+        let cfg = Self::resolved_config(Some(data_dir), Some(overrides))?;
+        Self::build(&cfg, Some(reference))
+    }
+
+    fn resolved_config(
+        config_or_data_dir: Option<&Path>,
+        overrides: Option<&SandboxRegistryConfig>,
+    ) -> Result<SandboxRegistryConfig, String> {
         let file_cfg = load_file_config(config_or_data_dir).unwrap_or_default();
         let env_cfg = load_env_config()?;
         let mut merged = merge_configs(&file_cfg, &env_cfg);
         if let Some(ov) = overrides {
             merged = merge_configs(&merged, ov);
         }
-        Self::from_config(&merged)
+        Ok(merged)
     }
 
     /// Build a [`ProviderRegistry`] purely from an explicit [`SandboxRegistryConfig`] without
     /// reading process environment variables.
     pub fn from_config(cfg: &SandboxRegistryConfig) -> Result<Self, String> {
+        Self::build(cfg, None)
+    }
+
+    fn build(cfg: &SandboxRegistryConfig, reference: Option<&str>) -> Result<Self, String> {
         let active_kind = resolve_active_kind(cfg)?;
         let default_mount_path = cfg
             .mount_path
@@ -185,7 +205,11 @@ impl ProviderRegistry {
                 }
                 sc.default_volume_size_gib = cfg.volume_size_gib;
                 sc.default_lease = default_lease.clone();
-                Arc::new(SylphxProvider::new(sc)?)
+                let mut provider = SylphxProvider::new(sc)?;
+                if let Some(reference) = reference {
+                    provider.scope_to(reference)?;
+                }
+                Arc::new(provider)
             }
             ProviderKind::E2b => {
                 let mut ec = E2bConfig::default();

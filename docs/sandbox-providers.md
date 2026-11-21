@@ -197,3 +197,20 @@ Any custom sandbox controller (Kubernetes, Firecracker, Fly Machines, Nomad, or 
    - Response (`200`): `{ "healthy": true, "message": "ok" }`.
 
 See [Send a file from a remote sandbox](sandbox-media.md) for private outbound attachments over MCP.
+
+## Tenant sandbox billing targets
+
+A coordinator can use a separate sandbox API bearer for each billing tenant. This does not change model credentials, deployment-secret grants, or messaging access. Configure this on a sandbox-runtime agent through the authenticated operator API; send credential bodies over a trusted connection and keep them out of shell history.
+
+| Operation | Request |
+|---|---|
+| Create or rotate a named credential | `PUT /v1/sandbox-credentials/{name}` with `{"token":"…","parent":"orgs/example/projects/example/envs/test","base_url":"https://sandbox.example.com"}`. Omit `base_url` to use the provider default. |
+| Associate a reusable sandbox profile with a credential | `PUT /v1/sandbox-profiles/{name}` with `{"credential":"tenant-key"}`. |
+| Assign a profile to an existing private, operator-owned group | `PUT /v1/groups/{name}/sandbox-target` with `{"profile":"tenant-profile"}`. Use `null` to clear. Only the operator may change that group's membership while the binding exists. |
+| Set or clear an agent's overrides | `PUT /v1/agents/{name}/sandbox-target` with `{"profile":"tenant-profile"}` or `{"credential":"tenant-key"}`. Omitted fields are cleared; `{}` restores inheritance. |
+| Inspect the effective reference | `GET /v1/agents/{name}/sandbox-target` returns `source` (`agent`, `profile`, `group`, `inherited`, or `default`) and the credential **name** when configured, never its value. |
+| Remove a credential | `DELETE /v1/sandbox-credentials/{name}`. Existing references remain in place and further operations through them fail closed. |
+
+Resolution walks from the agent up its parent chain. At each level, a direct credential wins over a sandbox profile, which wins over group profiles. Multiple groups at that level must agree on the credential. Only agents with no effective binding use the existing coordinator default. Credentials are encrypted with `ANYAGENTS_MASTER_KEY` and never granted to the guest. A same-target token rotation applies to new provider calls; it does not cancel requests already in flight.
+
+The coordinator does not move an existing volume across billing targets. Configure new agents before their first sandbox lease. If a change conflicts with an existing binding, restore its original credential name, API endpoint, and parent before operating on those resources. Plan any cross-target data migration separately; removing or changing a credential does not copy or delete a volume.

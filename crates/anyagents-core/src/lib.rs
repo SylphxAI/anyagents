@@ -26,6 +26,7 @@ pub mod raw_segment;
 pub mod redaction;
 pub mod s3_media;
 pub mod s3_store;
+pub mod sandbox_targets;
 mod secret;
 pub mod secrets_store;
 pub mod stateless;

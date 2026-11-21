@@ -6,8 +6,14 @@
 //! bearer capability token.
 
 mod sylphx_binding;
+mod target;
 pub(crate) use sylphx_binding::client_for_binding as sylphx_client_for_binding;
 use sylphx_binding::sylphx_lease_from_handle;
+use target::{binding_spec_value, registry_for_agent};
+pub(crate) use target::{
+    destroy_sandbox_for_agent, resolve_registry_for_agent, resolve_registry_for_binding,
+    validate_credential, validate_scoped_endpoint,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read as _, Write};
@@ -193,18 +199,19 @@ pub fn run_with_io_in_store<R: BufRead + Send + 'static, W: Write + Send + 'stat
         // 1. Unified Track 3B `ProviderRegistry` path (`ANYAGENTS_SANDBOX_PROVIDER`,
         //    `ANYAGENTS_SANDBOX_IMAGE`, `ANYAGENTS_SANDBOX_TEMPLATE`, `LeasePolicy`),
         //    or an existing non-legacy PG `agent_sandbox_bindings` row.
-        let existing_binding = effective_store
-            .as_deref()
-            .zip(parsed_agent_id.as_ref())
-            .and_then(|(s, id)| s.sandbox_binding(id).ok().flatten());
-        let registry_opt =
-            match resolve_remote_provider_registry(data_dir.as_deref()).map_err(Error::Message)? {
-                Some(reg) => Some(reg),
-                None => existing_binding
-                    .as_ref()
-                    .filter(|b| b.provider != "legacy_http" && b.provider != "local")
-                    .and_then(|b| resolve_registry_for_binding(data_dir.as_deref(), b).ok()),
-            };
+        let (existing_binding, registry_opt) = if let Some((store, id)) =
+            effective_store.as_deref().zip(parsed_agent_id.as_ref())
+        {
+            let binding = store.sandbox_binding(id)?;
+            let registry =
+                registry_for_agent(store, id, binding.as_ref()).map_err(Error::Message)?;
+            (binding, registry)
+        } else {
+            (
+                None,
+                resolve_remote_provider_registry(data_dir.as_deref()).map_err(Error::Message)?,
+            )
+        };
 
         if let Some(registry) = registry_opt {
             let remote_workdir = existing_binding
@@ -237,6 +244,7 @@ pub fn run_with_io_in_store<R: BufRead + Send + 'static, W: Write + Send + 'stat
             };
 
             if handle.provider == ProviderKind::Sylphx {
+                let scoped = registry.active().credential_target().is_some();
                 let lease = sylphx_lease_from_handle(
                     &handle,
                     &registry,
@@ -247,6 +255,11 @@ pub fn run_with_io_in_store<R: BufRead + Send + 'static, W: Write + Send + 'stat
                 .map_err(Error::Message)?;
                 return run_sylphx_sandbox(
                     lease,
+                    scoped
+                        .then_some(effective_store.as_ref())
+                        .flatten()
+                        .cloned()
+                        .zip(parsed_agent_id.clone()),
                     data_dir.as_deref(),
                     cfg_dir,
                     aid,
@@ -296,6 +309,7 @@ pub fn run_with_io_in_store<R: BufRead + Send + 'static, W: Write + Send + 'stat
         if let Some(lease) = lease_cfg {
             return run_sylphx_sandbox(
                 lease,
+                None,
                 data_dir.as_deref(),
                 cfg_dir,
                 aid,
@@ -877,46 +891,6 @@ pub(crate) fn has_remote_sandbox_provider(data_dir: Option<&Path>) -> bool {
         .is_some()
 }
 
-fn binding_spec_value(binding: &SandboxBinding) -> Value {
-    serde_json::from_str::<Value>(&binding.spec_json).unwrap_or_else(|_| json!({}))
-}
-
-fn overrides_from_binding(binding: &SandboxBinding) -> SandboxRegistryConfig {
-    let spec = binding_spec_value(binding);
-    let spec_str = |key: &str| {
-        spec.get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    SandboxRegistryConfig {
-        provider: (!binding.provider.trim().is_empty()).then(|| binding.provider.clone()),
-        endpoint: spec_str("endpoint"),
-        image: binding.image.clone(),
-        template: binding.template.clone(),
-        shape: spec_str("shape"),
-        parent: spec_str("parent"),
-        volume_size_gib: binding.volume_size_gib.and_then(|v| u32::try_from(v).ok()),
-        idle_ttl_ms: (binding.idle_ttl_ms >= 0).then_some(binding.idle_ttl_ms as u64),
-        max_lease_ttl_ms: spec.get("max_lease_ttl_ms").and_then(Value::as_u64),
-        mount_path: spec_str("mount_path"),
-        workdir: (!binding.remote_workdir.trim().is_empty())
-            .then(|| binding.remote_workdir.clone()),
-        ..SandboxRegistryConfig::default()
-    }
-}
-
-/// Resolve a [`ProviderRegistry`] targeting an existing persisted [`SandboxBinding`]
-/// (combining environment credentials with the binding's provider/endpoint/parent).
-pub(crate) fn resolve_registry_for_binding(
-    data_dir: Option<&Path>,
-    binding: &SandboxBinding,
-) -> Result<ProviderRegistry, String> {
-    let overrides = overrides_from_binding(binding);
-    ProviderRegistry::from_env_or_config(data_dir, Some(&overrides))
-}
-
 /// Convert a persisted [`SandboxBinding`] into a [`SandboxHandle`] for provider reuse or release.
 pub(crate) fn sandbox_handle_from_binding(binding: &SandboxBinding) -> Option<SandboxHandle> {
     let provider = ProviderKind::from_str(&binding.provider).ok()?;
@@ -1168,7 +1142,23 @@ pub(crate) fn ensure_sandbox_with_provider(
     remote_workdir: Option<&str>,
     extra_env: &BTreeMap<String, String>,
 ) -> Result<EnsuredSandbox, String> {
-    let existing = store.sandbox_binding(agent_id).map_err(|e| e.to_string())?;
+    let mut existing = store.sandbox_binding(agent_id).map_err(|e| e.to_string())?;
+    target::verify_provider_target(store, agent_id, existing.as_ref(), provider.as_ref())?;
+    let scoped_target = provider.credential_target();
+    if let Some(target) = &scoped_target
+        && existing
+            .as_ref()
+            .is_none_or(|b| binding_spec_value(b).get("credential_target").is_none())
+    {
+        let mut pin = SandboxBinding::new(agent_id.clone(), provider.kind().as_str());
+        pin.spec_json = json!({"credential_target": target}).to_string();
+        existing = Some(
+            store
+                .sandbox_binding_store()
+                .upsert(&pin)
+                .map_err(|e| e.to_string())?,
+        );
+    }
     let mut vol = VolumeSpec::for_agent(agent_id.as_str());
     vol.size_gib = volume_size_gib.or_else(|| {
         existing
@@ -1232,7 +1222,7 @@ pub(crate) fn ensure_sandbox_with_provider(
             .ok()
             .flatten()
             .is_some();
-    let binding = binding_from_handle(
+    let mut binding = binding_from_handle(
         agent_id,
         existing.as_ref(),
         &handle,
@@ -1241,6 +1231,14 @@ pub(crate) fn ensure_sandbox_with_provider(
         None,
         allow_transport_token,
     );
+    if let Some(target) = &scoped_target {
+        let mut spec = binding_spec_value(&binding);
+        spec["credential_target"] = target.clone();
+        spec.as_object_mut()
+            .expect("binding spec is an object")
+            .remove("endpoint");
+        binding.spec_json = spec.to_string();
+    }
     let stored = store
         .sandbox_binding_store()
         .upsert(&binding)
@@ -1248,8 +1246,9 @@ pub(crate) fn ensure_sandbox_with_provider(
 
     // Preserve backwards-compatible local `sandbox-sylphx.json` mirror when Sylphx
     // is active and the config dir is writable.
-    if handle.provider == ProviderKind::Sylphx
-        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), &stored)
+    if scoped_target.is_none()
+        && handle.provider == ProviderKind::Sylphx
+        && let Ok(reg) = resolve_registry_for_binding(store, &stored)
         && let Ok(lease_cfg) = sylphx_lease_from_handle(
             &handle,
             &reg,
@@ -1313,8 +1312,11 @@ pub(crate) fn ensure_sandbox_for_agent(
     remote_workdir: Option<&str>,
     extra_env: &BTreeMap<String, String>,
 ) -> Result<Option<SandboxBinding>, String> {
-    if let Some(registry) = resolve_remote_provider_registry(Some(store.data_dir()))? {
-        let ensured = ensure_sandbox_with_registry(
+    let existing = store
+        .sandbox_binding(&agent.id)
+        .map_err(|e| e.to_string())?;
+    if let Some(registry) = registry_for_agent(store, &agent.id, existing.as_ref())? {
+        return ensure_sandbox_with_registry(
             store,
             &registry,
             &agent.id,
@@ -1322,27 +1324,8 @@ pub(crate) fn ensure_sandbox_for_agent(
             config_dir,
             remote_workdir,
             extra_env,
-        )?;
-        return Ok(Some(ensured.binding));
-    }
-
-    if let Some(existing) = store.sandbox_binding(&agent.id).ok().flatten()
-        && existing.provider != "legacy_http"
-        && existing.provider != "local"
-    {
-        let registry = resolve_registry_for_binding(Some(store.data_dir()), &existing)?;
-        if registry.active_kind() != ProviderKind::Local {
-            let ensured = ensure_sandbox_with_registry(
-                store,
-                &registry,
-                &agent.id,
-                Some(&agent.name),
-                config_dir,
-                remote_workdir,
-                extra_env,
-            )?;
-            return Ok(Some(ensured.binding));
-        }
+        )
+        .map(|ensured| Some(ensured.binding));
     }
 
     // Legacy file-only `sandbox-sylphx.json` without env vars.
@@ -1450,7 +1433,9 @@ pub(crate) fn release_sandbox_binding_with_provider(
         .sandbox_binding_store()
         .clear_lease(&binding.agent_id)
         .map_err(|e| e.to_string())?;
-    if let Some(cfg_dir) = config_dir {
+    if let Some(cfg_dir) = config_dir
+        && provider.credential_target().is_none()
+    {
         clear_local_sylphx_lease_only(cfg_dir);
     }
     Ok(true)
@@ -1463,16 +1448,13 @@ pub(crate) fn release_sandbox_for_agent(
     agent_id: &AgentId,
     config_dir: &Path,
 ) -> Result<bool, String> {
-    if let Some(binding) = store.sandbox_binding(agent_id).ok().flatten() {
+    if let Some(binding) = store.sandbox_binding(agent_id).map_err(|e| e.to_string())? {
         if binding.lease_id.is_none() && binding.lease_resource.is_none() {
             let _ = store.sandbox_binding_store().clear_lease(agent_id);
             return Ok(false);
         }
-        if binding.provider != "legacy_http"
-            && binding.provider != "local"
-            && let Ok(registry) = resolve_registry_for_binding(Some(store.data_dir()), &binding)
-            && registry.active_kind() != ProviderKind::Local
-        {
+        if binding.provider != "legacy_http" && binding.provider != "local" {
+            let registry = resolve_registry_for_binding(store, &binding)?;
             return release_sandbox_binding_with_provider(
                 store,
                 &binding,
@@ -1480,6 +1462,13 @@ pub(crate) fn release_sandbox_for_agent(
                 Some(config_dir),
             );
         }
+    }
+    if store
+        .sandbox_credential_ref(agent_id)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err("cannot release a legacy sandbox with an explicit sandbox credential".into());
     }
     crate::sandbox_providers::release_sandbox_for_config_dir(config_dir)?;
     let _ = store.sandbox_binding_store().clear_lease(agent_id);
@@ -1812,7 +1801,7 @@ pub(crate) fn sweep_idle_sandboxes(
         if binding.provider == "legacy_http" || binding.provider == "local" {
             return Ok(None);
         }
-        let reg = resolve_registry_for_binding(Some(data_dir), binding)?;
+        let reg = resolve_registry_for_binding(store, binding)?;
         if reg.active_kind() == ProviderKind::Local {
             return Ok(None);
         }
@@ -2501,7 +2490,10 @@ pub(crate) fn hydrate_sandbox_lease_file_from_store(
     }
     let handle = sandbox_handle_from_binding(&binding)?;
     if handle.provider == ProviderKind::Sylphx
-        && let Ok(reg) = resolve_registry_for_binding(Some(store.data_dir()), &binding)
+        && binding_spec_value(&binding)
+            .get("credential_target")
+            .is_none()
+        && let Ok(reg) = resolve_registry_for_binding(store, &binding)
         && let Ok(lease_cfg) = sylphx_lease_from_handle(
             &handle,
             &reg,
@@ -2707,6 +2699,7 @@ fn collect_dereferenced_tree(
 #[allow(clippy::too_many_arguments)]
 fn run_sylphx_sandbox<R: BufRead + Send + 'static>(
     lease: SylphxLeaseConfig,
+    scoped_owner: Option<(Arc<Store>, AgentId)>,
     data_dir: Option<&Path>,
     config_dir: &Path,
     agent_id_str: &str,
@@ -2788,7 +2781,11 @@ fn run_sylphx_sandbox<R: BufRead + Send + 'static>(
                     break;
                 }
                 drop(stop);
-                let _ = renew_lease_for_config_dir(&renew_cfg);
+                if let Some((store, id)) = &scoped_owner {
+                    let _ = crate::sandbox_upgrade::renew_scoped_lease(store, id);
+                } else {
+                    let _ = renew_lease_for_config_dir(&renew_cfg);
+                }
             }
         })
         .ok();
@@ -3842,6 +3839,7 @@ mod tests {
         std::os::unix::fs::symlink(&real_skill, skill_mount.join("my-skill")).unwrap();
 
         let lease = SylphxLeaseConfig {
+            scoped: false,
             endpoint: format!("http://{addr}"),
             token: Some("sbx-tok".into()),
             parent: "orgs/o1/projects/p1/envs/e1".into(),

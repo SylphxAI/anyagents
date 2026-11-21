@@ -43,8 +43,8 @@ fn is_lease_collision_or_timeout(err: &str) -> bool {
 use super::{
     DEFAULT_MOUNT_PATH, EnsureSandboxRequest, ExecOutput, ExecRequest, LeasePolicy,
     NetworkPolicySpec, ProviderHealth, ProviderKind, SandboxCapabilities, SandboxHandle,
-    SandboxProvider, http_call_json, normalize_unix_dir, resolve_layout, run_blocking,
-    sanitize_name, shell_single_quote,
+    SandboxProvider, normalize_unix_dir, resolve_layout, run_blocking, sanitize_name,
+    shell_single_quote,
 };
 
 const DEFAULT_SYLPHX_ENDPOINT: &str = "https://api.sylphx.com";
@@ -55,7 +55,7 @@ const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const INLINE_STDIN_MAX_BYTES: usize = 24 * 1024;
 
 /// Configuration for [`SylphxProvider`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SylphxConfig {
     pub endpoint: String,
     pub token: Option<String>,
@@ -83,9 +83,10 @@ impl SylphxConfig {
 }
 
 /// First-class [`SandboxProvider`] for Sylphx Sandboxes v1.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SylphxProvider {
     config: SylphxConfig,
+    reference: Option<String>,
 }
 
 impl SylphxProvider {
@@ -105,20 +106,40 @@ impl SylphxProvider {
         if config.endpoint.is_empty() {
             config.endpoint = DEFAULT_SYLPHX_ENDPOINT.to_string();
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            reference: None,
+        })
     }
 
     pub fn config(&self) -> &SylphxConfig {
         &self.config
     }
 
+    pub(crate) fn scope_to(&mut self, reference: &str) -> Result<(), String> {
+        crate::sandbox_exec::validate_scoped_endpoint(&self.config.endpoint)?;
+        self.reference = Some(reference.into());
+        Ok(())
+    }
+
     fn client(&self) -> SylphxSandboxClient {
-        SylphxSandboxClient::new(self.config.endpoint.clone(), self.config.token.clone())
+        let mut client =
+            SylphxSandboxClient::new(self.config.endpoint.clone(), self.config.token.clone());
+        client.scoped = self.reference.is_some();
+        client
     }
 }
 
 #[async_trait]
 impl SandboxProvider for SylphxProvider {
+    fn credential_target(&self) -> Option<serde_json::Value> {
+        self.reference.as_ref().map(|name| serde_json::json!({"name": name, "target_sha256": agent_tools::sha256_hex(&serde_json::to_vec(&(&self.config.endpoint, &self.config.parent)).expect("strings serialize"))}))
+    }
+
+    fn scoped_lease_client(&self) -> Option<SylphxSandboxClient> {
+        self.reference.as_ref().map(|_| self.client())
+    }
+
     fn kind(&self) -> ProviderKind {
         ProviderKind::Sylphx
     }
@@ -486,17 +507,12 @@ impl SandboxProvider for SylphxProvider {
     }
 
     async fn health(&self) -> Result<ProviderHealth, String> {
-        let endpoint = self.config.endpoint.clone();
-        let token = self.config.token.clone();
+        let client = self.client();
 
         run_blocking(move || {
             let started = Instant::now();
-            let mut headers = Vec::new();
-            if let Some(ref tok) = token {
-                headers.push(("authorization".to_string(), format!("Bearer {tok}")));
-            }
-            let shapes_url = format!("{endpoint}/v1/sandbox_shapes");
-            let (status, body) = http_call_json("GET", &shapes_url, &headers, None, 10_000)?;
+            let shapes_url = format!("{}/v1/sandbox_shapes", client.endpoint);
+            let (status, body) = client.request_json("GET", &shapes_url, None, 10_000)?;
             let healthy = (200..300).contains(&status);
             Ok(ProviderHealth {
                 provider: ProviderKind::Sylphx,

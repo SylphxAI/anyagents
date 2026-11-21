@@ -470,8 +470,10 @@ pub(super) fn create_with_seat_and_sandbox_mode(
                 .unwrap_or_else(|| "default".to_string());
             pairs.push(("SYLPHX_AGENT_ENV".to_string(), env_slug));
         }
+        let scoped_sandbox = store.sandbox_credential_ref(&agent.id)?.is_some();
         let effective_cloud = crate::remote::is_agent_cloud(&agent, Some(&data), None);
         if sandbox_mode.is_remote_required()
+            && !scoped_sandbox
             && !effective_cloud
             && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
             && crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&data))
@@ -491,7 +493,8 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         // Explicit filesystem paths and explicit inheritance keep their local semantics.
         let remote_placement = (agent.runtime.is_cloud()
             || crate::vendor::is_cloud_harness(&agent.harness)
-            || sandbox_mode.is_remote_required())
+            || sandbox_mode.is_remote_required()
+            || scoped_sandbox)
             && explicit_workdir.is_none()
             && !wd_is_inherit_keyword;
         // Record the allocation before any checkout or cloud provisioning can
@@ -680,6 +683,7 @@ pub(super) fn create_with_seat_and_sandbox_mode(
         store.set_agent_launch_env(&agent.id, &pairs)?;
         if !remote_placement
             && !effective_cloud
+            && !scoped_sandbox
             && crate::sandbox_providers::sandbox_config_from_config_dir(&config).is_none()
             && !crate::sandbox_exec::has_remote_sandbox_provider(Some(&data))
             && crate::sandbox_providers::SylphxProviderConfig::resolve(Some(&data))
