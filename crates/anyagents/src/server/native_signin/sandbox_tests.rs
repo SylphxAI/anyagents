@@ -266,32 +266,35 @@ fn drain_steps(lines: &mut mpsc::Receiver<String>) -> Vec<(String, String)> {
 async fn current_native_pty_transcripts_emit_actionable_steps() {
     let (output, mut lines) = mpsc::channel(16);
     let claude = Spec::for_harness("claude-code").unwrap();
-    let mut transcript = Transcript::default();
-    let prefix = format!(
-        "Opening browser to sign in…\r\nIf the browser didn't open, visit:\r\n\x1b]8;;{CLAUDE_REQUEST}"
-    );
-    transcript.update(&claude, &prefix, &output).await;
-    assert!(drain_steps(&mut lines).is_empty(), "partial OSC-8");
-    let raw = format!("{prefix}\x07{CLAUDE_REQUEST}\x1b]8;;\x07\r\nPaste code here if prompted > ");
-    transcript.update(&claude, &raw, &output).await;
-    assert_eq!(
-        drain_steps(&mut lines),
-        [
-            ("link".into(), CLAUDE_REQUEST.into()),
-            (
-                "prompt".into(),
-                "Finish signing in in your browser, then paste the authorization code below."
-                    .into()
-            ),
-            ("input".into(), String::new()),
-        ]
-    );
-    assert!(matches!(
-        transcript.relay("fixture-code"),
-        Ok(Relay::Terminal { .. })
-    ));
-    transcript.update(&claude, &raw, &output).await;
-    assert!(drain_steps(&mut lines).is_empty());
+    for suffix in ["", "67"] {
+        let link = format!("{CLAUDE_REQUEST}{suffix}");
+        let mut transcript = Transcript::default();
+        let prefix = format!(
+            "Opening browser to sign in…\r\nIf the browser didn't open, visit:\r\n\x1b]8;;{link}"
+        );
+        transcript.update(&claude, &prefix, &output).await;
+        assert!(drain_steps(&mut lines).is_empty(), "partial OSC-8");
+        let raw = format!("{prefix}\x07{link}\x1b]8;;\x07\r\nPaste code here if prompted > ");
+        transcript.update(&claude, &raw, &output).await;
+        assert_eq!(
+            drain_steps(&mut lines),
+            [
+                ("link".into(), link.clone()),
+                (
+                    "prompt".into(),
+                    "Finish signing in in your browser, then paste the authorization code below."
+                        .into()
+                ),
+                ("input".into(), String::new()),
+            ]
+        );
+        assert!(matches!(
+            transcript.relay("fixture-code"),
+            Ok(Relay::Terminal { .. })
+        ));
+        transcript.update(&claude, &raw, &output).await;
+        assert!(drain_steps(&mut lines).is_empty());
+    }
 
     let agy = Spec::for_harness("agy").unwrap();
     let mut transcript = Transcript::default();
@@ -309,15 +312,17 @@ async fn current_native_pty_transcripts_emit_actionable_steps() {
     );
 
     let codex = Spec::for_harness("codex").unwrap();
-    let mut transcript = Transcript::default();
-    transcript.update(&codex, "  1. Open this link in your browser and sign in to your account\r\n     https://auth.openai.com/codex/device\r\n\r\n  2. Enter this one-time code (expires in 15 minutes)\r\n     U81Q-J76WZ\r\n", &output).await;
-    assert_eq!(
-        drain_steps(&mut lines),
-        [
-            ("link".into(), "https://auth.openai.com/codex/device".into()),
-            ("code".into(), "U81Q-J76WZ".into())
-        ]
-    );
+    for code in ["U81Q-J76WZ", "U81Q-J76WZ9"] {
+        let mut transcript = Transcript::default();
+        transcript.update(&codex, &format!("  1. Open this link in your browser and sign in to your account\r\n     https://auth.openai.com/codex/device\r\n\r\n  2. Enter this one-time code (expires in 15 minutes)\r\n     {code}\r\n"), &output).await;
+        assert_eq!(
+            drain_steps(&mut lines),
+            [
+                ("link".into(), "https://auth.openai.com/codex/device".into()),
+                ("code".into(), code.into())
+            ]
+        );
+    }
 }
 
 #[tokio::test]
@@ -333,8 +338,14 @@ async fn short_oauth_query_is_only_accepted_at_claude_authorize_routes() {
         format!("https://claude.ai/oauth/authorize?{token}&state=fixture"),
         format!("https://claude.ai/oauth/authorize?code={}", &token[5..]),
         format!("https://claude.ai/oauth/authorize?{}%2F", &token[3..]),
-        format!("https://claude.ai/oauth/authorize?{}", &token[1..]),
+        format!("https://claude.ai/oauth/authorize?{}", &token[..23]),
+        format!(
+            "https://claude.ai/oauth/authorize?{token}{}",
+            "x".repeat(214)
+        ),
+        format!("https://claude.ai/oauth/authorize?{token}="),
         "https://claude.ai/oauth/authorize?".to_owned(),
+        format!("https://claude.ai/oauth/authorize?{token}%20suffix"),
         "https://claude.ai/oauth/authorize?state".to_owned(),
     ] {
         let mut transcript = Transcript::default();
