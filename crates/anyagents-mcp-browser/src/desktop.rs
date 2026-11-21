@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_workstation::{
-    BrowserConfig, DesktopSession, FingerprintDefaults, Profile, SessionConfig, TakeoverConfig,
+    BrowserConfig, DesktopSession, FingerprintDefaults, Profile, SessionConfig,
 };
-use url::Url;
 
 use crate::chromium::is_headless_shell_binary;
 use crate::config::{BrowserMode, BrowserServerConfig};
@@ -161,7 +160,6 @@ pub(crate) async fn launch_desktop_instance(
     proxy: Option<BrowserProxy>,
     binary: PathBuf,
     tools: &DesktopTools,
-    public_url: Option<Url>,
 ) -> Result<BrowserInstance, BrowserError> {
     let ws = prepare_profile_workspace(config, requested_profile).await?;
     let proxy_handle = match &proxy {
@@ -181,21 +179,10 @@ pub(crate) async fn launch_desktop_instance(
     apply_locale_defaults(&mut cfg.fingerprint_defaults, config);
     cfg.human_idle_timeout = None;
     cfg.compositor = tools.compositor.clone();
-    cfg.takeover = match &tools.vnc {
-        Some(vnc) => {
-            cfg.vnc = vnc.clone();
-            let bind = std::env::var("ANYAGENTS_TAKEOVER_BIND")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| TakeoverConfig::default().bind);
-            Some(TakeoverConfig {
-                bind,
-                public_url,
-                token: None,
-            })
-        }
-        None => None,
-    };
+    cfg.takeover = None;
+    if let Some(vnc) = &tools.vnc {
+        cfg.vnc = vnc.clone();
+    }
     let session = Arc::new(DesktopSession::start(cfg).await?);
     let _ = session.lease(DESKTOP_PRINCIPAL)?;
     Ok(BrowserInstance {

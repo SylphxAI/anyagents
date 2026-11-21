@@ -4,13 +4,11 @@
 //! External binaries (`sway`, `wayvnc`) are resolved from explicit system paths
 //! without ambient `$PATH` lookup (ADR 0005).
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use agent_workstation::{HandBack, Holder, TakeoverStatus};
+use agent_workstation::{HandBack, Holder, TakeoverConfig, TakeoverStatus};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use url::Url;
 
 use crate::chromium::{discover_chromium, is_executable_file};
@@ -141,61 +139,83 @@ pub fn simple_payload(meta: Option<&TakeoverState>, running: bool) -> Value {
     })
 }
 
-impl BrowserSession {
-    // EOF retains only a live reverse tunnel. Waiting here is cancel-safe: no
-    // browser state is modified, so an arriving client can take over custody.
-    #[cfg(target_os = "linux")]
-    pub(crate) async fn wait_for_detached_end(&self) {
-        let mut inner = self.inner.lock().await;
-        let Some(inst) = inner.as_mut() else { return };
-        if !inst.takeover.active || !inst.is_alive() {
-            return;
-        }
-        let Some(tunnel) = &inst.takeover_tunnel else {
-            return;
-        };
-        let mut done = tunnel.completion();
-        let BrowserBackend::Desktop { session, .. } = &inst.backend else {
-            return;
-        };
-        let session = Arc::clone(session);
-        let baseline = inst.takeover.awaited_hand_backs;
-        drop(inner);
-        let gate = session.gate();
-        let mut holder = gate.subscribe();
-        loop {
-            if gate.hand_backs() > baseline
-                || session.is_closed()
-                || !session.takeover_status().browser_running
-            {
-                return;
-            }
-            tokio::select! {
-                _ = done.changed() => return,
-                _ = holder.changed() => {},
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-            }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedDesktop {
+    None,
+    Viewing,
+    Reclaimable,
+}
+
+impl BrowserInstance {
+    fn human_handed_back(&self) -> bool {
+        self.takeover.active
+            && matches!(&self.backend, BrowserBackend::Desktop { session, .. }
+                if session.gate().hand_backs() > self.takeover.awaited_hand_backs)
+    }
+
+    fn tunnel_ended(&self) -> bool {
+        self.takeover_tunnel
+            .as_ref()
+            .is_some_and(TakeoverTunnelHandle::is_finished)
+    }
+
+    async fn reap_viewer(&mut self) {
+        if self.human_handed_back() {
+            self.detach_takeover(None).await;
         }
     }
 
-    // Reconcile a hand-back or expired tunnel before serving any MCP tool.
+    async fn detach_takeover(&mut self, note: Option<String>) -> bool {
+        if let Some(tunnel) = &self.takeover_tunnel {
+            tunnel.quiesce();
+        }
+        let had_takeover = std::mem::replace(&mut self.takeover.active, false);
+        let detached = match &self.backend {
+            BrowserBackend::Desktop { session, .. } => session.detach_takeover(note).await,
+            BrowserBackend::Headless { .. } => false,
+        };
+        if let Some(tunnel) = self.takeover_tunnel.take() {
+            tunnel.stop().await;
+        }
+        detached || had_takeover
+    }
+}
+
+impl BrowserSession {
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn detached_desktop(&self) -> DetachedDesktop {
+        self.reap_takeover().await;
+        match self.inner.lock().await.as_ref() {
+            Some(inst) if inst.takeover.mode == TakeoverMode::WayvncNovnc => {
+                if !inst.takeover.active {
+                    DetachedDesktop::Reclaimable
+                } else if inst.takeover_tunnel.is_some() {
+                    DetachedDesktop::Viewing
+                } else {
+                    // A local-only viewer has no reverse tunnel lease to
+                    // bound its lifetime after the MCP client disconnects.
+                    DetachedDesktop::None
+                }
+            }
+            _ => DetachedDesktop::None,
+        }
+    }
+
+    // Revoke a finished viewer before admitting another tool without replacing
+    // the desktop. A dead browser, unlike a completed hand-back, is finalized.
     pub(crate) async fn reap_takeover(&self) {
         let mut inner = self.inner.lock().await;
         let Some(inst) = inner.as_mut() else { return };
-        let Some(tunnel) = &inst.takeover_tunnel else {
-            return;
-        };
-        if tunnel.is_finished() {
-            if let Some(mut inst) = inner.take() {
-                finalize_instance(&mut inst).await;
-            }
-        } else if let BrowserBackend::Desktop { session, .. } = &inst.backend
-            && session.gate().hand_backs() > inst.takeover.awaited_hand_backs
+        // Coordinator can terminate the old relay immediately after /release.
+        // A gate hand-back takes precedence, but a tunnel that ends without
+        // one (TTL, terminal transport error) cannot retain a private desktop.
+        let tunnel_ended = inst.tunnel_ended();
+        inst.reap_viewer().await;
+        if (!inst.is_alive() || (tunnel_ended && inst.takeover.active))
+            && let Some(mut dead) = inner.take()
         {
-            inst.takeover.active = false;
-            if let Some(tunnel) = inst.takeover_tunnel.take() {
-                tunnel.stop().await;
-            }
+            finalize_instance(&mut dead).await;
         }
     }
 
@@ -219,28 +239,20 @@ impl BrowserSession {
             )
         {
             let mut g = self.inner.lock().await;
-            let cur_prof = g.as_ref().and_then(|i| i.active_profile.clone());
-            let same_p = prof.is_none() || cur_prof == prof;
-            let target_p = prof
-                .clone()
-                .or_else(|| same_p.then_some(cur_prof.clone()).flatten());
-            let effective_prof = target_p.as_deref().or(self.config.profile.as_deref());
-            drop(g);
+            let current_profile = g.as_ref().and_then(|i| i.active_profile.as_deref());
+            let target_profile = prof.as_deref().or(current_profile).map(str::to_owned);
+            let effective_profile = target_profile.as_deref().or(self.config.profile.as_deref());
             let desired_proxy =
-                resolve_session_proxy(&self.config, effective_prof, proxy_ov.as_ref()).await?;
-            g = self.inner.lock().await;
-            let alive = g.as_mut().is_some_and(BrowserInstance::is_alive);
-            let same_proxy =
-                proxy_ov.is_none() || g.as_ref().map(|i| &i.active_proxy) == Some(&desired_proxy);
-            let reuse = alive
-                && same_p
-                && same_proxy
-                && g.as_ref()
-                    .is_some_and(|i| matches!(i.backend, BrowserBackend::Desktop { .. }));
+                resolve_session_proxy(&self.config, effective_profile, proxy_ov.as_ref()).await?;
+            let same_profile = prof.is_none() || prof.as_deref() == current_profile;
+            let reuse = same_profile
+                && g.as_mut().is_some_and(|inst| {
+                    inst.is_alive()
+                        && (proxy_ov.is_none() || inst.active_proxy == desired_proxy)
+                        && matches!(inst.backend, BrowserBackend::Desktop { .. })
+                });
             if !reuse {
-                let old = g.take();
-                drop(g);
-                if let Some(mut old) = old {
+                if let Some(mut old) = g.take() {
                     finalize_instance(&mut old).await;
                 }
                 let bin = discover_chromium(self.config.chromium_bin.as_deref())
@@ -249,101 +261,29 @@ impl BrowserSession {
                     compositor: sway,
                     vnc: Some(vnc),
                 };
-                let inst = launch_desktop_instance(
-                    &self.config,
-                    target_p.as_deref(),
-                    desired_proxy,
-                    bin,
-                    &tools,
-                    pub_url.clone(),
-                )
-                .await?;
-                g = self.inner.lock().await;
-                *g = Some(inst);
-            }
-            let awaited = g
-                .as_ref()
-                .and_then(|inst| match &inst.backend {
-                    BrowserBackend::Desktop { session, .. } => Some(session.gate().hand_backs()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let mut tunnel_error: Option<String> = None;
-            if let Some(u) = pub_url {
-                let old_tunnel = g.as_mut().and_then(|i| i.takeover_tunnel.take());
-                if let Some(inst) = g.as_mut()
-                    && let BrowserBackend::Desktop { ref session, .. } = inst.backend
-                {
-                    let _ = session.set_takeover_public_url(u);
-                }
-                if let Some(old_tunnel) = old_tunnel {
-                    drop(g);
-                    old_tunnel.stop().await;
-                    g = self.inner.lock().await;
-                }
-            } else {
-                let needs_tunnel = g.as_ref().is_some_and(|i| i.takeover_tunnel.is_none());
-                if needs_tunnel
-                    && let Ok(Some(api_url)) = resolve_api_url(&self.config)
-                    && let Some(auth) = resolve_coordinator_auth(self.config.agent_token.as_deref())
-                {
-                    let target = g.as_ref().and_then(|inst| {
-                        let BrowserBackend::Desktop { ref session, .. } = inst.backend else {
-                            return None;
-                        };
-                        let addr = session.takeover_addr()?;
-                        let tok = session
-                            .takeover_url()
-                            .and_then(|u| extract_takeover_token(u.as_str()))?;
-                        Some((Arc::clone(session), addr, tok))
-                    });
-                    if let Some((session_ref, local_addr, takeover_token)) = target {
-                        drop(g);
-                        let cfg = TunnelConfig::new(api_url, auth, local_addr, takeover_token);
-                        match TakeoverTunnelHandle::start(cfg).await {
-                            Ok(handle) => {
-                                g = self.inner.lock().await;
-                                let same_session = g.as_ref().is_some_and(|inst| {
-                                    matches!(
-                                        &inst.backend,
-                                        BrowserBackend::Desktop { session, .. }
-                                            if Arc::ptr_eq(session, &session_ref)
-                                    )
-                                });
-                                if same_session {
-                                    if let Ok(base_url) = Url::parse(handle.public_base_url()) {
-                                        let _ = session_ref.set_takeover_public_url(base_url);
-                                    }
-                                    if let Some(inst) = g.as_mut() {
-                                        inst.takeover_tunnel = Some(handle);
-                                    }
-                                } else {
-                                    drop(g);
-                                    handle.stop().await;
-                                    g = self.inner.lock().await;
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "anyagents-mcp-browser: takeover reverse-tunnel unavailable ({err}); falling back to local URL"
-                                );
-                                tunnel_error = Some(err);
-                                g = self.inner.lock().await;
-                            }
-                        }
-                    }
-                }
+                *g = Some(
+                    launch_desktop_instance(
+                        &self.config,
+                        target_profile.as_deref(),
+                        desired_proxy,
+                        bin,
+                        &tools,
+                    )
+                    .await?,
+                );
             }
             let inst = g.as_mut().expect("desktop ready");
-            let BrowserBackend::Desktop { ref session, .. } = inst.backend else {
+            inst.reap_viewer().await;
+            let BrowserBackend::Desktop { session, .. } = &inst.backend else {
                 unreachable!()
             };
-            if session.takeover_url().is_none() {
-                return Err(BrowserError::new(
-                    "TAKEOVER_UNAVAILABLE",
-                    "missing takeover URL",
-                ));
-            }
+            // Reusing an active viewer must not swallow a concurrent hand-back
+            // by advancing the baseline. Only a fresh viewer gets a new one.
+            let awaited = if inst.takeover.active {
+                inst.takeover.awaited_hand_backs
+            } else {
+                session.gate().hand_backs()
+            };
             let mut cur = None;
             if matches!(session.gate().holder(), Holder::Agent) {
                 let a = session.lease(DESKTOP_PRINCIPAL)?;
@@ -351,6 +291,48 @@ impl BrowserSession {
                     a.navigate(u).await?;
                 }
                 cur = a.current_url().await.ok();
+            }
+            session
+                .start_takeover(TakeoverConfig {
+                    bind: std::env::var("ANYAGENTS_TAKEOVER_BIND")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| TakeoverConfig::default().bind),
+                    public_url: pub_url.clone(),
+                    token: None,
+                })
+                .await?;
+
+            let mut tunnel_error = None;
+            if let Some(base) = pub_url {
+                session.set_takeover_public_url(base)?;
+                if let Some(old) = inst.takeover_tunnel.take() {
+                    old.stop().await;
+                }
+            } else if inst.takeover_tunnel.is_none()
+                && let Ok(Some(api_url)) = resolve_api_url(&self.config)
+                && let Some(auth) = resolve_coordinator_auth(self.config.agent_token.as_deref())
+                && let Some(addr) = session.takeover_addr()
+                && let Some(token) = session
+                    .takeover_url()
+                    .and_then(|u| extract_takeover_token(u.as_str()))
+            {
+                match TakeoverTunnelHandle::start(TunnelConfig::new(api_url, auth, addr, token))
+                    .await
+                {
+                    Ok(handle) => {
+                        if let Ok(base) = Url::parse(handle.public_base_url()) {
+                            let _ = session.set_takeover_public_url(base);
+                        }
+                        inst.takeover_tunnel = Some(handle);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "browser takeover reverse tunnel unavailable ({err}); falling back to local URL"
+                        );
+                        tunnel_error = Some(err);
+                    }
+                }
             }
             inst.takeover
                 .mark(TakeoverMode::WayvncNovnc, awaited, req.reason);
@@ -417,11 +399,6 @@ impl BrowserSession {
         };
         let alive = inst.is_alive();
         if kind == "stop" || kind == "release" {
-            let note = req.reason.unwrap_or_else(|| kind.into());
-            let g_rel = match &inst.backend {
-                BrowserBackend::Desktop { session, .. } => session.gate().release(Some(note)),
-                _ => false,
-            };
             if kind == "stop" && matches!(inst.backend, BrowserBackend::Desktop { .. }) {
                 drop(g);
                 let o = self.close_with_sync().await;
@@ -434,18 +411,15 @@ impl BrowserSession {
             let changed = if kind == "stop" {
                 std::mem::take(&mut inst.takeover).mode != TakeoverMode::None
             } else {
-                g_rel || std::mem::replace(&mut inst.takeover.active, false)
+                inst.detach_takeover(req.reason.or_else(|| Some("release".into())))
+                    .await
             };
             let status = if kind == "stop" {
                 "stopped"
             } else {
                 "released"
             };
-            inst.takeover.active = false;
-            if let Some(tunnel) = inst.takeover_tunnel.take() {
-                tunnel.stop().await;
-            }
-            let mut p = json!({"status": status, "active": false, "holder": "agent", "browser_running": alive});
+            let mut p = json!({"status": status, "active": false, "holder": "agent", "browser_running": inst.is_alive()});
             p[status] = json!(changed);
             return Ok(p);
         }
@@ -454,8 +428,12 @@ impl BrowserSession {
                 let gate = session.gate();
                 let done = gate.hand_backs() > inst.takeover.awaited_hand_backs
                     || (!inst.takeover.active && matches!(gate.holder(), Holder::Agent));
-                inst.takeover.active &= !done;
-                let st = session.takeover_status();
+                // Status is observation, not cleanup. If the human released
+                // after the pre-tool reap, leave it armed for the next reap.
+                let mut st = session.takeover_status();
+                if done {
+                    st.takeover_url = None;
+                }
                 let mut p = desktop_payload(&st, &inst.takeover, done);
                 p["profile"] = json!(inst.active_profile);
                 p["tunnel_active"] = json!(inst.takeover_tunnel.is_some());

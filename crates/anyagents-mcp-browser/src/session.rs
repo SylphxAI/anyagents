@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use agent_workstation::browser::Web;
 use agent_workstation::cdp::Cdp;
-use agent_workstation::{DesktopSession, Holder, PageImage, Secret, SecretResolver, Snapshot, Tab};
+use agent_workstation::{DesktopSession, PageImage, Secret, SecretResolver, Snapshot, Tab};
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, MutexGuard};
@@ -153,9 +153,7 @@ impl BrowserInstance {
         match &mut self.backend {
             BrowserBackend::Headless { child, .. } => matches!(child.try_wait(), Ok(None)),
             BrowserBackend::Desktop { session, .. } => {
-                !session.is_closed()
-                    && (session.takeover_status().browser_running
-                        || matches!(session.gate().holder(), Holder::Human { .. }))
+                !session.is_closed() && session.takeover_status().browser_running
             }
         }
     }
@@ -657,7 +655,6 @@ pub(crate) async fn launch_instance(
                 proxy.clone(),
                 binary.clone(),
                 &tools,
-                None,
             )
             .await;
             match launched {
