@@ -29,6 +29,52 @@ fn pg_url() -> Option<String> {
 }
 
 #[test]
+fn postgres_schedule_claim_invalidates_only_the_consumed_slot_receipt() {
+    let Some(url) = pg_url() else {
+        eprintln!("skipping PostgreSQL schedule test: ANYAGENTS_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _guard = test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_postgres(&url, dir.path()).unwrap();
+    let owner = store
+        .create_agent(NewAgent::new(format!("fixture_{}", uuid_tag()), "test"))
+        .unwrap();
+    let sched = store
+        .create_schedule(NewSchedule {
+            agent_id: owner.id.clone(),
+            kind: "watch".into(),
+            spec: "file:signal".into(),
+            prompt: "scheduled wake".into(),
+            interval_ms: None,
+            next_fire_at_ms: None,
+            watch_baseline: None,
+        })
+        .unwrap();
+    let row = || store.get_schedule(&sched.id).unwrap().unwrap();
+    let attach = |due, receipt| {
+        store
+            .set_schedule_external_timer_id_for_slot(&sched.id, due, receipt)
+            .unwrap()
+    };
+    let claim = |expected, next| {
+        store
+            .claim_schedule_tick(&sched.id, expected, "active", next, None, None, None)
+            .unwrap()
+    };
+    assert!(attach(None, "initial"));
+    assert!(claim(None, None));
+    assert_eq!(row().external_timer_id.as_deref(), Some("initial"));
+    assert!(claim(None, Some(1_000)));
+    assert_eq!(row().external_timer_id, None);
+    assert!(!attach(None, "late"));
+    assert!(attach(Some(1_000), "current"));
+    assert!(!claim(None, Some(2_000)));
+    assert_eq!(row().next_fire_at_ms, Some(1_000));
+    assert_eq!(row().external_timer_id.as_deref(), Some("current"));
+}
+
+#[test]
 fn postgres_persistent_webhook_wakes_serialize_retries_and_survive_reopen() {
     let Some(url) = pg_url() else {
         eprintln!("skipping PostgreSQL webhook test: ANYAGENTS_TEST_POSTGRES_URL not set");
