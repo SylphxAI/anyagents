@@ -32,7 +32,7 @@ pub mod secrets_store;
 pub mod stateless;
 pub mod storage;
 mod store;
-pub use store::knowledge;
+pub use store::{TakeoverLink, knowledge};
 
 pub use address::{Address, AddressError};
 pub use anyagents_harness::{
