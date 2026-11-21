@@ -325,3 +325,30 @@ async fn non_404_volume_failure_keeps_archived_identity_and_binding_for_retry() 
     assert_eq!(f.delete().await["deleted"], true);
     f.calls(&["release", "delete", "delete", "delete", "delete"]);
 }
+
+#[tokio::test]
+async fn offline_archive_applies_the_same_fail_closed_remote_policy() {
+    for (lifecycle, live, reaped, calls) in [
+        ("standing", true, false, &["release"][..]),
+        ("task", true, true, &["probe", "release", "delete"][..]),
+        ("task", false, false, &[][..]),
+    ] {
+        let f = Fixture::new(
+            lifecycle,
+            live,
+            probe(0, "clean and pushed"),
+            StatusCode::OK,
+        )
+        .await;
+        let store = f.state.store.clone();
+        let name = f.agent.name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::agent::archive::archive_offline(&store, store.data_dir(), &name).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.agent.state, "archived");
+        assert_eq!(result.volume.unwrap().remote_volume_reaped, reaped);
+        f.calls(calls);
+    }
+}
