@@ -26,11 +26,11 @@ use crate::telegram::MediaUpload;
 
 use super::{ApiError, AppState, spawn_store};
 
-const MAX_BYTES: usize = 25 * 1024 * 1024;
+use anyagents_harness::media::PRIVATE_MEDIA_MAX_BYTES as MAX_BYTES;
 const MULTIPART_OVERHEAD: usize = 64 * 1024;
 const URI_PREFIX: &str = "media://";
-const LOCAL_DIR: &str = "private-media";
-pub(super) const UPLOAD_HELP: &str = "Upload the file to $ANYAGENTS_API_URL/v1/media with Bearer $ANYAGENTS_REMOTE_SESSION_TOKEN (or the token from $ANYAGENTS_MCP_TOKEN_FILE), then use the returned media://<id> in media.source.";
+const STORAGE_NAMESPACE: &str = "private-media";
+pub(super) const UPLOAD_HELP: &str = "Upload the file to $ANYAGENTS_API_URL/v1/media with the remote MCP token as Bearer auth (read $ANYAGENTS_MCP_TOKEN_FILE if set), then use the returned media://<id> in media.source.";
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -354,10 +354,10 @@ fn persist(
     } else {
         None
     };
-    // Use the same S3/PG backends as inbound media, but no legacy reads.
-    let relative = format!("uploads/{id}");
+    // Keep storage separate from the legacy inbound namespace.
+    let relative = format!("{agent}/{id}");
     if let Some(s3) = s3 {
-        let key = s3_media::media_s3_key(agent.as_str(), &relative);
+        let key = format!("{STORAGE_NAMESPACE}/{relative}");
         if let Some(key_ref) = &master {
             s3.put_encrypted_object(&key, bytes, mime, Some(key_ref))?;
         } else {
@@ -366,12 +366,7 @@ fn persist(
     } else if store.is_postgres() {
         store
             .blob_store_with_key(master.clone())
-            .put_deployment_blob(
-                "media",
-                &format!("{agent}/{relative}"),
-                bytes,
-                master.is_some(),
-            )?;
+            .put_deployment_blob(STORAGE_NAMESPACE, &relative, bytes, master.is_some())?;
     } else {
         write_local(store.data_dir(), agent, &id, bytes)?;
     }
@@ -383,9 +378,9 @@ fn read(
     agent: &AgentId,
     id: &str,
 ) -> Result<Option<Vec<u8>>, anyagents_core::Error> {
-    let relative = format!("uploads/{id}");
+    let relative = format!("{agent}/{id}");
     if let Some(s3) = S3Store::from_env()? {
-        let key = s3_media::media_s3_key(agent.as_str(), &relative);
+        let key = format!("{STORAGE_NAMESPACE}/{relative}");
         let s3 = s3.with_max_object_bytes(MAX_BYTES + 4096);
         return s3
             .get_object(&key)?
@@ -401,7 +396,7 @@ fn read(
     if store.is_postgres() {
         return Ok(store
             .blob_store_with_key(MasterKey::from_env()?)
-            .get_deployment_blob("media", &format!("{agent}/{relative}"))?
+            .get_deployment_blob(STORAGE_NAMESPACE, &relative)?
             .map(|blob| blob.content));
     }
     match read_local(store.data_dir(), agent, id) {
@@ -413,7 +408,7 @@ fn read(
 
 fn write_local(data: &Path, agent: &AgentId, id: &str, bytes: &[u8]) -> io::Result<()> {
     let data = open_root(data)?;
-    let root = private_media_dir(&data, OsStr::new(LOCAL_DIR), None, false)?;
+    let root = private_media_dir(&data, OsStr::new(STORAGE_NAMESPACE), None, false)?;
     let dir = private_media_dir(&root, OsStr::new(agent.as_str()), None, false)?;
     let name = std::ffi::CString::new(id)?;
     let fd = unsafe {
@@ -443,7 +438,7 @@ fn write_local(data: &Path, agent: &AgentId, id: &str, bytes: &[u8]) -> io::Resu
 fn read_local(data: &Path, agent: &AgentId, id: &str) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
     let data = open_root(data)?;
-    let root = open_child(&data, OsStr::new(LOCAL_DIR), true)?;
+    let root = open_child(&data, OsStr::new(STORAGE_NAMESPACE), true)?;
     let dir = open_child(&root, OsStr::new(agent.as_str()), true)?;
     let file = open_child(&dir, OsStr::new(id), false)?;
     for entry in [&root, &dir, &file] {
