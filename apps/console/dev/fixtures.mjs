@@ -113,7 +113,7 @@ const accounts = [
   ['google-antigravity', 'acct-06', 'beacon.kb@example.test', '5h: 100% left · 7d: 97% left (pro)', ['beacon-kb-writer']],
   ['google-antigravity', 'acct-07', 'spare.seat-07@example.test', 'oauth expired', []],
   ['google-antigravity', 'acct-08', 'locale.team@example.test', '5h: 55% left ↻2h05m · 7d: 61% left (pro)', ['beacon-triage-locale']],
-  ['anthropic', 'max-01', 'atlas.director@example.test', '5h: 90% left ↻1h02m · 7d: 64% left ↻4d11h · opus: 51% left (max)', ['atlas-director', 'atlas-planner']],
+  ['anthropic', 'max-01', 'atlas.director@example.test', '5h: 84% left ↻1h02m · 7d: 33% left ↻4d11h · opus: 0% left ↻4d11h (max)', ['atlas-director', 'atlas-planner']],
   ['anthropic', 'max-02', 'counsel.desk@example.test', '5h: 76% left ↻3h50m · 7d: 58% left · opus: 44% left (max)', ['iris-counsel', 'iris-contracts']],
   ['anthropic', 'max-03', 'research.pod@example.test', '5h: 12% left ↻0h48m · 7d: 35% left · opus: 22% left (max)', ['cobalt-prototype']],
   ['anthropic', 'pro-04', 'growth.writer@example.test', 'oauth expired', ['fjord-growth', 'fjord-seo']],

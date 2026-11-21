@@ -1,9 +1,10 @@
 import { For, Show, createMemo, createSignal } from 'solid-js';
 import { ChevronRight, Plus, RefreshCw, SearchX } from 'lucide-solid';
 import { ago, plural } from '../format';
-import { accountMatches, needsQuota, statusMeta } from '../lib/providers';
+import { accountMatches, LOW_QUOTA, needsQuota, statusMeta } from '../lib/providers';
 import type { Account, ProviderGroup } from '../lib/providers';
 import { windowLabel } from '../lib/quota';
+import type { QuotaBucket } from '../lib/quota';
 import { agentHref } from '../route';
 import { useConsole } from '../state';
 import type { Profile } from '../types';
@@ -17,8 +18,8 @@ export function AccountsPage() {
   const [query, setQuery] = createSignal('');
   const [collapsed, setCollapsed] = createSignal<ReadonlySet<string>>(new Set());
   const expired = () => accounts().filter(account => account.status === 'expired').length;
-  const low = () => accounts().filter(needsQuota).length;
-  const healthy = () => accounts().length - expired() - low();
+  const warnings = () => accounts().filter(needsQuota).length;
+  const healthy = () => accounts().length - expired() - warnings();
   const checkedAt = () => {
     const age = profiles.data()?.find(profile => profile.usage_age_ms != null)?.usage_age_ms;
     return age != null && profiles.updated() ? profiles.updated()! - age : undefined;
@@ -41,7 +42,7 @@ export function AccountsPage() {
       <span><span class="num strong">{accounts().length}</span> accounts</span>
       <span><Dot tone="ok" /><span class="num strong">{healthy()}</span> healthy</span>
       <span class={expired() ? 'tone-bad' : undefined}><Dot tone={expired() ? 'bad' : 'muted'} /><span class="num strong">{expired()}</span> OAuth expired</span>
-      <span class={low() ? 'tone-warn' : undefined}><Dot tone={low() ? 'warn' : 'muted'} /><span class="num strong">{low()}</span> low quota</span>
+      <span class={warnings() ? 'tone-warn' : undefined}><Dot tone={warnings() ? 'warn' : 'muted'} /><span class="num strong">{warnings()}</span> quota warnings</span>
       <span class="summary-spacer" />
       <Show when={checkedAt()}><span class="subtle">Quotas checked <span class="num">{ago(checkedAt())}</span></span></Show>
     </div>
@@ -49,7 +50,7 @@ export function AccountsPage() {
       <Segmented label="Account filter" value={filter()} onChange={setFilter} options={[
         { value: 'all', label: 'All', count: accounts().length },
         { value: 'expired', label: 'OAuth expired', count: expired(), tone: 'bad' },
-        { value: 'quota', label: 'Low / zero quota', count: low(), tone: 'warn' },
+        { value: 'quota', label: 'Quota warnings', count: warnings(), tone: 'warn' },
       ]} />
       <SearchField value={query()} onChange={setQuery} placeholder="Search accounts, providers, agents…" label="Search accounts" />
     </div>
@@ -60,7 +61,7 @@ export function AccountsPage() {
       Sign in with a provider subscription or add an API key so agents can run.</Empty></Show>
     <Show when={profiles.data() && accounts().length > 0 && visible().length === 0}><Empty compact icon={<SearchX size={18} />} title="No matching accounts"
       action={<button type="button" class="btn sm" onClick={() => { setFilter('all'); setQuery(''); }}>Clear filters</button>}>
-      {filter() === 'expired' ? 'Every OAuth sign-in is current.' : filter() === 'quota' ? 'No account is low on quota.' : <>Nothing matches “{query()}”.</>}</Empty></Show>
+      {filter() === 'expired' ? 'Every OAuth sign-in is current.' : filter() === 'quota' ? 'No accounts have quota warnings.' : <>Nothing matches “{query()}”.</>}</Empty></Show>
     <div class="provider-list">
       <For each={visible()}>{entry => <ProviderSection group={entry.group} shown={entry.shown} query={query()}
         open={filtering() || !collapsed().has(entry.group.provider)} toggle={() => toggle(entry.group.provider)} />}</For>
@@ -77,9 +78,13 @@ function ProviderSection(props: { group: ProviderGroup<Profile>; shown: Account<
         <span class="provider-name">{props.group.name}</span>
         <span class="subtle num">{plural(props.group.accounts.length, 'account')}</span>
         <Show when={props.group.expired > 0}><Pill tone="bad">{props.group.expired} expired</Pill></Show>
-        <Show when={props.group.low > 0}><Pill tone="warn">{props.group.low} low</Pill></Show>
-        <span class="provider-spacer" />
-        <Show when={props.group.averageLeft != null}><span class="subtle">avg <span class="num strong-muted">{props.group.averageLeft}%</span> left</span></Show>
+        <Show when={props.group.quotaWarnings > 0}><Pill tone="warn">{plural(props.group.quotaWarnings, 'quota warning')}</Pill></Show>
+        <Show when={props.group.averages.length}><span class="provider-averages subtle">
+          <span>Avg. left</span>
+          <For each={props.group.averages}>{bucket => <span class="provider-average">
+            {windowLabel(bucket.label)} <span class="num strong-muted">{bucket.left}%</span>
+          </span>}</For>
+        </span></Show>
       </button>
     </h2>
     <Show when={props.open}><div class="table-wrap" id={id}><table class="table accounts-table">
@@ -106,17 +111,19 @@ function AccountRow(props: { account: Account<Profile>; query: string }) {
       </div>
     </td>
     <td class="col-status"><Pill tone={statusMeta[account().status].tone} dot>{statusMeta[account().status].label}</Pill>
-      <Show when={reading().limited && reading().limitedReset}><div class="subtle small num">resets in {reading().limitedReset}</div></Show></td>
+      <Show when={account().status === 'limited' && reading().limitedReset}><div class="subtle small num">resets in {reading().limitedReset}</div></Show></td>
     <td class="col-quota">
-      <Show when={reading().windows.length} fallback={reading().balance ? <span class="mono">{reading().balance}</span>
+      <Show when={reading().windows.length || reading().modelPools.length} fallback={reading().balance ? <span class="mono">{reading().balance}</span>
         : reading().note ? <span class="subtle">{reading().note}</span>
-        : <span class="subtle">{expired() ? 'Sign in again to read quota' : account().oauth ? 'No reading yet' : 'Not reported for API keys'}</span>}>
-        <div class={'quotas' + (expired() ? ' stale' : '')} title={expired() ? 'Last known quota before the sign-in expired' : undefined}>
-          <For each={reading().windows.slice(0, 4)}>{window => <span class="quota" title={window.reset ? windowLabel(window.label) + ' window resets in ' + window.reset : undefined}>
-            <span class="quota-label">{windowLabel(window.label)}</span>
-            <Meter value={window.left} label={windowLabel(window.label) + ' quota remaining'} />
-            <span class={'quota-value num' + (window.left === 0 ? ' tone-bad' : window.left < 20 ? ' tone-warn' : '')}>{window.left}%</span>
-          </span>}</For>
+        : <span class="subtle">{expired() ? 'Sign in again to read quota' : reading().limited ? 'No quota reading reported' : account().oauth ? 'No reading yet' : 'Not reported for API keys'}</span>}>
+        <div class={'quota-breakdown' + (expired() ? ' stale' : '')} title={expired() ? 'Last known quota before the sign-in expired' : undefined}>
+          <Show when={reading().windows.length}><div class="quotas" role="group" aria-label="Account limits">
+            <For each={reading().windows}>{bucket => <QuotaMeter bucket={bucket} />}</For>
+          </div></Show>
+          <Show when={reading().modelPools.length}><div class="quotas model-pools" role="group" aria-label="Model pools">
+            <span class="subtle small" aria-hidden="true">Models</span>
+            <For each={reading().modelPools}>{bucket => <QuotaMeter bucket={bucket} />}</For>
+          </div></Show>
         </div>
       </Show>
     </td>
@@ -130,4 +137,14 @@ function AccountRow(props: { account: Account<Profile>; query: string }) {
         <RefreshCw size={13} />{expired() ? 'Sign in again' : 'Refresh'}</button>
     </Show></td>
   </tr>;
+}
+
+function QuotaMeter(props: { bucket: QuotaBucket }) {
+  const label = () => windowLabel(props.bucket.label);
+  const left = () => props.bucket.left;
+  return <span class="quota" title={props.bucket.reset ? label() + ' quota resets in ' + props.bucket.reset : undefined}>
+    <span class="quota-label">{label()}</span>
+    <span class={'quota-value num' + (left() === 0 ? ' tone-bad' : left() < LOW_QUOTA ? ' tone-warn' : '')}>{left()}%</span>
+    <Meter value={left()} label={label() + ' quota remaining'} />
+  </span>;
 }

@@ -17,9 +17,9 @@ export function OverviewPage() {
   const { fleet, accounts, versions, issues, profiles, roster, connect } = useConsole();
   const [showAll, setShowAll] = createSignal(false);
   const expired = createMemo(() => accounts().filter(account => account.status === 'expired'));
-  const low = createMemo(() => accounts().filter(needsQuota));
+  const quotaWarnings = createMemo(() => accounts().filter(needsQuota));
   const outdated = createMemo(() => (versions.data()?.agents ?? []).filter(agent => agent.upgrade_status === 'outdated_idle'));
-  const healthy = () => accounts().length - expired().length - low().length;
+  const healthy = () => accounts().length - expired().length - quotaWarnings().length;
   const attention = () => fleet().errored.length + expired().length;
   const loading = () => !roster.data();
 
@@ -50,10 +50,10 @@ export function OverviewPage() {
       detail: () => 'Drain at the turn boundary to move them onto the desired image.',
       action: () => <a class="btn sm" href="#versions">Review updates</a>,
     }] : []),
-    ...(low().length ? [{
-      key: 'low', tone: 'warn' as const, icon: () => <Gauge size={15} />,
-      title: () => <span class="strong">{plural(low().length, 'account')} low on quota</span>,
-      detail: () => low().slice(0, 3).map(account => account.identity).join(', ') + (low().length > 3 ? ' and ' + (low().length - 3) + ' more' : ''),
+    ...(quotaWarnings().length ? [{
+      key: 'quota-warnings', tone: 'warn' as const, icon: () => <Gauge size={15} />,
+      title: () => <span class="strong">{plural(quotaWarnings().length, 'account')} with quota warnings</span>,
+      detail: () => quotaWarnings().slice(0, 3).map(account => account.identity).join(', ') + (quotaWarnings().length > 3 ? ' and ' + (quotaWarnings().length - 3) + ' more' : ''),
       action: () => <a class="btn sm" href="#accounts">View accounts</a>,
     }] : []),
   ]);
@@ -71,7 +71,7 @@ export function OverviewPage() {
       { label: 'Needs attention', value: loading() ? '—' : attention(), tone: attention() ? 'bad' : undefined,
         detail: attention() ? [fleet().errored.length && plural(fleet().errored.length, 'errored agent'), expired().length && plural(expired().length, 'expired account')].filter(Boolean).join(' · ') : 'Nothing is blocked' },
       { label: 'Accounts healthy', value: profiles.data() ? <>{healthy()}<span class="stat-of"> / {accounts().length}</span></> : '—', href: '#accounts',
-        detail: expired().length ? <span class="tone-bad">{expired().length} OAuth expired</span> : low().length ? <span class="tone-warn">{low().length} low on quota</span> : profiles.data() ? 'All signed in' : 'Loading…' },
+        detail: expired().length ? <span class="tone-bad">{expired().length} OAuth expired</span> : quotaWarnings().length ? <span class="tone-warn">{plural(quotaWarnings().length, 'quota warning')}</span> : profiles.data() ? 'All signed in' : 'Loading…' },
     ]} />
 
     <Section title="Action required" meta={items().length ? <Pill tone={items().some(item => item.tone === 'bad') ? 'bad' : 'warn'}>{items().length}</Pill> : undefined}>
