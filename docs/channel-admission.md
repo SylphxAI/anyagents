@@ -14,6 +14,20 @@ If neither list is configured, the daemon can set `ANYAGENTS_TELEGRAM_ALLOWED_ID
 
 The same policy applies to webhooks, polling, and delivery to peer bots. Denied updates advance the update cursor but do not link a chat or deliver a message. This policy does not restrict outbound sends.
 
+## Receiver-scoped ingress blocks
+
+The coordinator checks Telegram ingress rules after the channel caller allowlist and before durable mailbox delivery, for both polling and webhooks. The same check runs separately for each agent receiving a group relay. A blocked delivery adds no mailbox entry and does not wake that agent. Allowed external input includes a host-generated `sender_awareness` header; display names and message text never confer authority.
+
+Set `ANYAGENTS_TELEGRAM_OWNER_IDS`, `ANYAGENTS_TELEGRAM_ADMIN_IDS`, or `ANYAGENTS_TELEGRAM_TRUSTED_IDS` to JSON arrays of positive Telegram user IDs on the coordinator. Unset arrays are empty; malformed settings reject ingress and block creation rather than risk misclassifying a protected sender. Owner and admin messages bypass receiver blocks, not the separate caller allowlist. Authenticated agent-to-agent delivery is not subject to external blocks. Trusted external users are distinct from protected senders and may be blocked.
+
+Agents manage their own rules with the `ingress_guard` MCP tool. Operators use `GET /admin/api/agents/{id}/ingress-blocks` to list, `POST` to block, and `DELETE` to unblock. For example, send this JSON to block a sender:
+
+```json
+{"op":"block_sender","target":{"channel":"telegram","scope":{"kind":"sender","sender_id":"123456789"}},"reason":"Repeated spam"}
+```
+
+Use the same target with `"op":"unblock_sender"` to remove the rule. Use `{"op":"list_blocks"}` in MCP. For a known group, use `{"kind":"chat","chat_id":"-1009876543210"}` as the scope. Omit `expires_at_ms` for a permanent rule or supply a future Unix timestamp in milliseconds. A permanent group block may also make an exclusively assigned bot leave. Leaving is best-effort and skipped if it could cut off configured protected users; unblocking does not rejoin a group.
+
 ## Bootstrap a root agent from a pre-created seat
 
 Pre-create a non-root OS user named `seat-<name>` and configure `ANYAGENTS_SOCKET_GID`. On a confined server, send `POST /v1/agents` with the operator token in `x-anyagents-operator`:

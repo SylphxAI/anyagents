@@ -26,6 +26,9 @@ members = [
     "tests/invariants",
 ]
 
+[workspace.dependencies]
+agent-ingress = { git = "https://github.com/SylphxAI/agent-kit", rev = "2dd25c1445140df00c443a49bb028fae5d0de305" }
+
 [workspace.package]
 version = "0.1.9"
 edition = "2024"

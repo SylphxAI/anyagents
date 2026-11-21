@@ -76,7 +76,6 @@ pub use storage::{
     agent_scratch_build_dir, agent_scratch_tmp_dir, configured_git_pool_dir,
     configured_scratch_dir, configured_state_dir, configured_workspaces_dir, storage_env_enabled,
 };
-pub use store::holds_store_writer;
 pub use store::{
     Ack, Agent, AgentLock, AgentQueryMetadata, AgentSchedule, AgentSummary, BillingMode, Channel,
     ConversationTurn, DEFAULT_ARCHIVE_ROSTER_LIMIT, Group, GroupAction, GroupActor, GroupSummary,
@@ -102,6 +101,7 @@ pub use store::{
     AgentTurnSnapshot, ErroredTurn, MAX_ERRORED_TURNS, SYSTEM_SENDER, TurnErrors,
     is_session_turn_error,
 };
+pub use store::{IngressBlocks, holds_store_writer};
 pub use store::{
     NewTurnTranscriptEvent, TurnTranscriptEvent, TurnTranscriptSearchHit,
     VALID_TRANSCRIPT_EVENT_ROLES, normalize_transcript_event_role,

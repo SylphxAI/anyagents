@@ -1,11 +1,16 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
+use agent_ingress::{
+    BlockMatch, BlockScope, IngressBlockRule, IngressBlockStore, SenderRelationship,
+    ValidatedBlockRule,
+};
 use anyagents_core::host_index::{HostIndex, IndexMetadata, MemoryScope};
 use anyagents_core::raw_segment::RawSegment;
 use anyagents_core::redaction::{Actor, Request as RedactRequest, Span, SpanUnit};
 use anyagents_core::{
-    BillingMode, HistorySearchQuery, Incoming, NewAgent, NewSchedule, NewUsage, Origin,
-    ReceiveOutcome, RuntimeChange, RuntimeState, Store, read_children_roster, read_root_roster,
+    BillingMode, HistorySearchQuery, Incoming, IngressBlocks, NewAgent, NewSchedule, NewUsage,
+    Origin, ReceiveOutcome, RuntimeChange, RuntimeState, Store, read_children_roster,
+    read_root_roster,
 };
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -529,6 +534,33 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         })
         .unwrap();
 
+    let ingress_rule = IngressBlockRule {
+        rule_id: "migration-fixture".into(),
+        target: BlockMatch {
+            channel: "telegram:fixture".into(),
+            scope: BlockScope::Sender {
+                sender_id: "42".into(),
+            },
+        },
+        reason: Some("fixture reason".into()),
+        blocked_by: "fixture operator".into(),
+        created_at_ms: 1_700_000_000_000,
+        expires_at_ms: Some(1_700_000_010_000),
+    };
+    let validated = ValidatedBlockRule::new(
+        ingress_rule.clone(),
+        &ingress_rule.target,
+        SenderRelationship::Stranger,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(IngressBlocks::new(&src_store, &child.id).block(validated))
+        .unwrap();
+
     // Populate SQLite HostIndex too.
     let seg_path = src_dir.path().join("raw/seg1.raw");
     let seg = RawSegment::open(&seg_path).unwrap();
@@ -580,6 +612,12 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
             .any(|t| t.pg_table == "host_index.host_documents" && t.sqlite_rows == 1)
     );
     assert!(report.reconciled_archived_runtime >= 1);
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|t| t.pg_table == "public.ingress_blocks" && t.sqlite_rows == 1)
+    );
 
     let pg_dir = tempfile::tempdir().unwrap();
     let pg_store = Store::open_postgres(&url, pg_dir.path()).unwrap();
@@ -590,6 +628,11 @@ fn sqlite_to_postgres_migration_preserves_data_and_sequences() {
         anyagents_core::ExecutionRuntime::Cloud
     );
     assert_eq!(migrated_child.remote_budget_micros, Some(5_000_000));
+    assert_eq!(
+        rt.block_on(IngressBlocks::new(&pg_store, &child.id).list_blocks())
+            .unwrap(),
+        [ingress_rule]
+    );
 
     // Verify NUL sanitization on migrated text and IDENTITY sequence advancement after migration.
     let inbox = pg_store.inbox(&child.id, None).unwrap();

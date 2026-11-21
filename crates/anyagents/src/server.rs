@@ -37,6 +37,7 @@ mod console_html;
 mod file_cache;
 mod hybrid;
 mod in_flight;
+mod ingress_blocks;
 mod knowledge;
 #[cfg(test)]
 mod latency_tests;
@@ -191,6 +192,7 @@ fn mount_authenticated_api_routes(router: Router<AppState>) -> Router<AppState> 
         .merge(schedules::router())
         .merge(messaging::router())
         .merge(runtime_issues::agent_router())
+        .merge(ingress_blocks::agent_router())
         .merge(channels_groups::router())
         .merge(roles::router())
         .merge(ops::router())

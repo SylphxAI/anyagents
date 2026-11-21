@@ -37,6 +37,7 @@ pub(super) fn api_error(
         | "getMe"
         | "getChat"
         | "getChatMember"
+        | "leaveChat"
         | "setChatTitle"
         | "setChatDescription"
         | SET_CHAT_PHOTO

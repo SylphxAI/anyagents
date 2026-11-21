@@ -43,7 +43,6 @@ async fn telegram_webhook(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let store = Arc::clone(&state.store);
-    let channel_for_dispatch = channel_id.clone();
     let target_agents = spawn_store(move || {
         crate::telegram::receive_webhook(
             &store,
@@ -65,22 +64,7 @@ async fn telegram_webhook(
             crate::telegram::WebhookError::Store(why) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why)
             }
-        })?;
-        let agents = if serverless::is_serverless_mode() {
-            store
-                .list_channels()
-                .ok()
-                .and_then(|channels| {
-                    channels
-                        .into_iter()
-                        .find(|c| c.id.as_str() == channel_for_dispatch)
-                        .map(|c| c.agents)
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        Ok(agents)
+        })
     })
     .await?;
     if serverless::is_serverless_mode() {
