@@ -424,11 +424,39 @@ fn parse_fire_payload(raw_body: &[u8]) -> (Option<String>, Option<i64>) {
     (schedule_id, intended_at_ms)
 }
 
+// Pace callbacks independently of startup submissions. In particular, a slow
+// dispatch must not consume a submission slot needed to restore other timers.
+static REMOTE_FIRES: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::timer::REMOTE_TIMER_CONCURRENCY);
+
 async fn execute_fire(
     state: AppState,
     schedule_id: String,
     intended_at_ms: Option<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if !state.timer_backend.is_remote() {
+        return execute_admitted_fire(state, schedule_id, intended_at_ms).await;
+    }
+    let permit = REMOTE_FIRES
+        .acquire()
+        .await
+        .map_err(|err| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    let call = super::in_flight::carry();
+    // An admitted fire may have claimed durable work or started blocking I/O
+    // before its HTTP client disconnects. Keep its slot until that work ends.
+    tokio::spawn(async move {
+        let (_permit, _call) = (permit, call);
+        execute_admitted_fire(state, schedule_id, intended_at_ms).await
+    })
+    .await
+    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+}
+
+async fn execute_admitted_fire(
+    state: AppState,
+    schedule_id: String,
+    intended_at_ms: Option<i64>,
+) -> Result<Json<crate::timer::FireResult>, ApiError> {
     if super::serverless_maintenance::is_system_timer_id(&schedule_id) {
         let result = super::serverless_maintenance::fire_system_timer(
             Arc::clone(&state.store),

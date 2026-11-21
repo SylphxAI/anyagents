@@ -32,6 +32,9 @@ pub fn timer_local_fallback_enabled() -> bool {
         })
 }
 
+/// Per-coordinator limit for remote startup arms and remote fire callbacks.
+pub(crate) const REMOTE_TIMER_CONCURRENCY: usize = 4;
+
 /// Hexagonal port for scheduling and cancelling exact one-shot schedule triggers
 /// with sub-second precision (millisecond epoch timestamps).
 pub trait TimerBackend: Send + Sync {
@@ -45,12 +48,27 @@ pub trait TimerBackend: Send + Sync {
         fire_at_ms: i64,
     ) -> Result<Option<String>, String>;
 
+    /// Restore a timer at startup. Remote adapters may retry transient failures
+    /// with the same timer identity; local adapters need no retry policy.
+    fn restore_one_shot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.schedule_one_shot(schedule_id, fire_at_ms)
+    }
+
     /// Cancel a pending trigger for `schedule_id`, using the persisted
     /// `external_run_id` when available.
     fn cancel(&self, schedule_id: &str, external_run_id: Option<&str>) -> Result<(), String>;
 
     /// Returns `true` when this backend is a no-op placeholder that never fires timers.
     fn is_noop(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend submits timers over the network.
+    fn is_remote(&self) -> bool {
         false
     }
 

@@ -11,7 +11,8 @@
 
 use std::io::Read as _;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use url::Url;
@@ -23,6 +24,9 @@ pub const ENV_TIMER_SCHEDULER_TOKEN: &str = "ANYAGENTS_TIMER_SCHEDULER_TOKEN";
 pub const ENV_TIMER_SCHEDULER_MODE: &str = "ANYAGENTS_TIMER_SCHEDULER_MODE";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const RESTORE_REQUEST_SPACING: Duration = Duration::from_millis(40);
+const RESTORE_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(200), Duration::from_millis(400)];
 
 /// Wire protocol spoken with the configured external timer scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +82,7 @@ pub struct ExternalWebhookTimerBackend {
     token: Option<String>,
     mode: ExternalSchedulerMode,
     public_url: String,
+    next_restore_request: Arc<Mutex<Instant>>,
 }
 
 impl ExternalWebhookTimerBackend {
@@ -98,6 +103,7 @@ impl ExternalWebhookTimerBackend {
                 .filter(|t| !t.is_empty()),
             mode,
             public_url: public_url.into().trim().trim_end_matches('/').to_string(),
+            next_restore_request: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -169,15 +175,12 @@ impl ExternalWebhookTimerBackend {
     }
 }
 
-impl TimerBackend for ExternalWebhookTimerBackend {
-    fn backend_kind(&self) -> &'static str {
-        "external_webhook"
-    }
-
-    fn schedule_one_shot(
+impl ExternalWebhookTimerBackend {
+    fn post_timer(
         &self,
         schedule_id: &str,
         fire_at_ms: i64,
+        restoring: bool,
     ) -> Result<Option<String>, String> {
         let clean_id = schedule_id.trim();
         if clean_id.is_empty() {
@@ -216,16 +219,44 @@ impl TimerBackend for ExternalWebhookTimerBackend {
         let body_bytes =
             serde_json::to_vec(&payload).map_err(|err| format!("serialize timer body: {err}"))?;
         let agent = Self::http_agent();
-        let mut req = agent
-            .post(&target_url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json");
-        if let Some(ref tok) = self.token {
-            req = req.header("authorization", &format!("Bearer {tok}"));
+        let mut retry_delays = if restoring {
+            &RESTORE_RETRY_DELAYS[..]
+        } else {
+            &[]
         }
-        let mut resp = req
-            .send(&body_bytes[..])
-            .map_err(|err| format!("timer schedule POST failed ({target_url}): {err}"))?;
+        .iter();
+        let mut resp = loop {
+            let mut req = agent
+                .post(&target_url)
+                .header("content-type", "application/json")
+                .header("accept", "application/json");
+            if let Some(ref tok) = self.token {
+                req = req.header("authorization", &format!("Bearer {tok}"));
+            }
+            if restoring {
+                // Gate starts, not network I/O. Retries share the gate so a
+                // scheduler recovering from a stall is not hit by a retry wave.
+                let mut next = self
+                    .next_restore_request
+                    .lock()
+                    .map_err(|err| err.to_string())?;
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                *next = Instant::now() + RESTORE_REQUEST_SPACING;
+            }
+            match req.send(&body_bytes[..]) {
+                Ok(resp) if resp.status().as_u16() != 503 || retry_delays.len() == 0 => break resp,
+                Ok(_) => {}
+                Err(ureq::Error::Timeout(_)) if retry_delays.len() != 0 => {}
+                Err(err) => {
+                    return Err(format!("timer schedule POST failed for {clean_id}: {err}"));
+                }
+            }
+            // Retry the exact same payload/run ID. A timeout can mean that the
+            // scheduler accepted the first attempt; a conflict is idempotent success.
+            if let Some(delay) = retry_delays.next() {
+                std::thread::sleep(*delay);
+            }
+        };
         let status = resp.status().as_u16();
         let mut raw = Vec::new();
         let _ = resp
@@ -256,6 +287,32 @@ impl TimerBackend for ExternalWebhookTimerBackend {
             .unwrap_or(run_id);
 
         Ok(Some(resolved_id))
+    }
+}
+
+impl TimerBackend for ExternalWebhookTimerBackend {
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn backend_kind(&self) -> &'static str {
+        "external_webhook"
+    }
+
+    fn schedule_one_shot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.post_timer(schedule_id, fire_at_ms, false)
+    }
+
+    fn restore_one_shot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        self.post_timer(schedule_id, fire_at_ms, true)
     }
 
     fn cancel(&self, _schedule_id: &str, external_run_id: Option<&str>) -> Result<(), String> {
@@ -404,6 +461,45 @@ mod tests {
             ),
             ExternalSchedulerMode::Webhook
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_retries_unavailable_with_identical_run_id_and_accepts_conflict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let app = Router::new().fallback(any(move |uri: Uri, body: Bytes| {
+            observed.lock().unwrap().push((uri, body));
+            let status = match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::CONFLICT,
+            };
+            async move { status }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = ExternalWebhookTimerBackend::new(
+            format!("http://{addr}/runs"),
+            None,
+            ExternalSchedulerMode::DelayedRun,
+            "https://coordinator.example.test",
+        );
+        let due = 1_800_000_000_000;
+        let result =
+            tokio::task::spawn_blocking(move || backend.restore_one_shot("test-schedule", due))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some(deterministic_run_id("test-schedule", due).as_str())
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

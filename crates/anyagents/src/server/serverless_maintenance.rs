@@ -34,7 +34,11 @@ pub(crate) const SYS_RECONCILE_PREFIX: &str = "sys:reconcile:";
 
 const SYS_TIMERS_BLOB_NS: &str = "markers";
 const MIN_LEASE_RENEW_LEAD_MS: i64 = 5_000;
-const OVERDUE_SCHEDULE_CATCHUP_DELAY_MS: i64 = 1_000;
+#[path = "startup_timers.rs"]
+mod startup_timers;
+
+#[cfg(test)]
+use startup_timers::OVERDUE_SCHEDULE_CATCHUP_DELAY_MS;
 /// Bounded exponential backoff delays for transient serverless cold-wake / dispatch retries:
 /// `15s -> 30s -> 60s` (3 attempts max, never an infinite hot loop).
 pub(crate) const DISPATCH_RETRY_BACKOFF_MS: &[i64] = &[15_000, 30_000, 60_000];
@@ -115,6 +119,17 @@ pub(crate) fn arm_system_timer(
     timer_id: &str,
     fire_at_ms: i64,
 ) -> Result<Option<String>, String> {
+    arm_system_timer_inner(store, backend, agent_id, timer_id, fire_at_ms, false)
+}
+
+fn arm_system_timer_inner(
+    store: &Store,
+    backend: &dyn TimerBackend,
+    agent_id: &AgentId,
+    timer_id: &str,
+    fire_at_ms: i64,
+    restoring: bool,
+) -> Result<Option<String>, String> {
     let blob_path = sys_timer_blob_path(timer_id);
     let previous_ext_id = store
         .blob_store()
@@ -125,7 +140,11 @@ pub(crate) fn arm_system_timer(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let ext_id = backend.schedule_one_shot(timer_id, fire_at_ms)?;
+    let ext_id = if restoring {
+        backend.restore_one_shot(timer_id, fire_at_ms)?
+    } else {
+        backend.schedule_one_shot(timer_id, fire_at_ms)?
+    };
 
     if let Some(ref prev) = previous_ext_id
         && ext_id.as_deref() != Some(prev.as_str())
@@ -1081,6 +1100,7 @@ pub(crate) async fn startup_reconcile_serverless(
 ) -> Result<StartupReconcileReport, String> {
     let store_b = Arc::clone(&store);
     let tb_b = Arc::clone(&timer_backend);
+    let runtime = tokio::runtime::Handle::current();
     let (mut report, pending_agents) = tokio::task::spawn_blocking(
         move || -> Result<(StartupReconcileReport, Vec<AgentId>), String> {
             let _lease = if store_b.is_postgres() {
@@ -1090,7 +1110,7 @@ pub(crate) async fn startup_reconcile_serverless(
                 ) {
                     Ok(Some(guard)) => Some(guard),
                     Ok(None) => return Ok((StartupReconcileReport::default(), Vec::new())),
-                    Err(_) => None,
+                    Err(err) => return Err(format!("acquire startup reconcile lease: {err}")),
                 }
             } else {
                 None
@@ -1130,167 +1150,15 @@ pub(crate) async fn startup_reconcile_serverless(
                 }
             }
 
-            if let Ok(live_agents) = store_b.list_live_agents() {
-                for agent in live_agents {
-                    if let Ok(turns) = store_b.remote_turn_store().list_active_for_agent(&agent.id)
-                    {
-                        for turn in turns {
-                            if turn.harness_kind == "sandbox" {
-                                let deadline = turn
-                                    .last_event_at_ms
-                                    .saturating_add(sandbox_stale_threshold_ms());
-                                arm_turn_timeout_timer(
-                                    &store_b,
-                                    tb_b.as_ref(),
-                                    &turn.agent_id,
-                                    &turn.turn_id,
-                                    deadline,
-                                );
-                                report.timers_rearmed += 1;
-                            } else {
-                                let poll_at = turn.next_poll_at_ms.unwrap_or_else(|| {
-                                    now.saturating_add(DEFAULT_CLOUD_POLL_DELAY_MS)
-                                });
-                                arm_cloud_poll_timer(
-                                    &store_b,
-                                    tb_b.as_ref(),
-                                    &turn.agent_id,
-                                    &turn.turn_id,
-                                    poll_at,
-                                );
-                                report.timers_rearmed += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. Re-arm lease renewal timers for active ready sandbox bindings.
-            if let Ok(ready) = store_b.sandbox_binding_store().list_active_ready() {
-                for binding in ready {
-                    if binding_is_active(&store_b, &binding) {
-                        arm_lease_renew_timer(
-                            &store_b,
-                            tb_b.as_ref(),
-                            &binding.agent_id,
-                            binding.lease_expires_at_ms,
-                            now,
-                        );
-                        report.timers_rearmed += 1;
-                    }
-                }
-            }
-
-            // 3. Rehydrate active user schedules (`every`, `at`, `watch`) onto the active
-            //    TimerBackend so coordinator deploys/restarts never strand existing schedules.
-            if !tb_b.is_noop()
-                && let Ok(active_schedules) = store_b.list_schedules(None, true)
-            {
-                let catchup_at = now.saturating_add(OVERDUE_SCHEDULE_CATCHUP_DELAY_MS);
-                for sched in &active_schedules {
-                    if sched.state != "active" {
-                        continue;
-                    }
-                    let owner_archived_or_missing = match store_b.agent(&sched.agent_id) {
-                        Ok(agent) => {
-                            agent.state == "archived"
-                                || super::is_explicitly_archived(store_b.data_dir(), &agent)
-                        }
-                        Err(anyagents_core::Error::AgentNotFound(_)) => true,
-                        Err(_) => false,
-                    };
-                    if owner_archived_or_missing {
-                        continue;
-                    }
-                    match sched.kind.as_str() {
-                        "at" | "every" => {
-                            let Some(due_ms) = sched.next_fire_at_ms else {
-                                continue;
-                            };
-                            if due_ms <= now {
-                                let fire_at = due_ms.max(catchup_at);
-                                match crate::timer::arm_schedule_timer_at(
-                                    &store_b,
-                                    tb_b.as_ref(),
-                                    sched,
-                                    fire_at,
-                                ) {
-                                    Ok(_) => report.overdue_schedules_rearmed += 1,
-                                    Err(err) => eprintln!(
-                                        "anyagents-serverless: failed to re-arm overdue schedule {}: {err}",
-                                        sched.id
-                                    ),
-                                }
-                            } else {
-                                match crate::timer::arm_schedule_timer(
-                                    &store_b,
-                                    tb_b.as_ref(),
-                                    sched,
-                                ) {
-                                    Ok(_) => report.schedules_rearmed += 1,
-                                    Err(err) => eprintln!(
-                                        "anyagents-serverless: failed to re-arm schedule {}: {err}",
-                                        sched.id
-                                    ),
-                                }
-                            }
-                        }
-                        "watch" => {
-                            if matches!(
-                                crate::schedule::parse_watch_spec(&sched.spec),
-                                Ok(crate::schedule::WatchTarget::Webhook { .. })
-                            ) {
-                                continue;
-                            }
-                            match sched.next_fire_at_ms {
-                                Some(due_ms) if due_ms <= now => {
-                                    let fire_at = due_ms.max(catchup_at);
-                                    match crate::timer::arm_schedule_timer_at(
-                                        &store_b,
-                                        tb_b.as_ref(),
-                                        sched,
-                                        fire_at,
-                                    ) {
-                                        Ok(_) => report.overdue_schedules_rearmed += 1,
-                                        Err(err) => eprintln!(
-                                            "anyagents-serverless: failed to re-arm overdue watch {}: {err}",
-                                            sched.id
-                                        ),
-                                    }
-                                }
-                                Some(_) => {
-                                    match crate::timer::arm_schedule_timer(
-                                        &store_b,
-                                        tb_b.as_ref(),
-                                        sched,
-                                    ) {
-                                        Ok(_) => report.schedules_rearmed += 1,
-                                        Err(err) => eprintln!(
-                                            "anyagents-serverless: failed to re-arm watch {}: {err}",
-                                            sched.id
-                                        ),
-                                    }
-                                }
-                                None => {
-                                    match crate::timer::arm_schedule_timer_at(
-                                        &store_b,
-                                        tb_b.as_ref(),
-                                        sched,
-                                        catchup_at,
-                                    ) {
-                                        Ok(_) => report.schedules_rearmed += 1,
-                                        Err(err) => eprintln!(
-                                            "anyagents-serverless: failed to re-arm watch probe {}: {err}",
-                                            sched.id
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            // Drain both maintenance and user timers with one bounded worker pool.
+            // The blocking parent owns the lease even if the caller stops awaiting.
+            let counts = runtime.block_on(startup_timers::rearm(
+                Arc::clone(&store_b),
+                Arc::clone(&tb_b),
+            ));
+            report.schedules_rearmed = counts.future;
+            report.overdue_schedules_rearmed = counts.catchup;
+            report.timers_rearmed = counts.system;
 
             // 4. Reconcile orphaned open turns and gather running agents with undelivered mail.
             report.stale_open_turns_cleared = if store_b.is_postgres() {
