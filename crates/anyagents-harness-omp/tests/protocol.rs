@@ -389,6 +389,7 @@ for raw in sys.stdin:
         marker = text.splitlines()[0]
         payload = "omp-steer-payload" if "omp-steer-payload" in text else text.splitlines()[-1]
         if marker == "anyagents-message:m_refused_no_cmd":
+            wait_gate("allow_refusal")
             # Omit `command` to verify error response still clears `unadmitted`.
             emit({"type": "response", "id": rid, "success": False, "error": "busy"})
             continue
@@ -512,6 +513,8 @@ for raw in sys.stdin:
     // Error response WITHOUT `command` field must return Deferred cleanly (no deadlock!).
     let m_ref = mk("m_refused_no_cmd", "refused");
     assert_eq!(harness.deliver(&m_ref).unwrap(), DeliverOutcome::InFlight);
+    // The mock waits so its refusal cannot race the initial InFlight observation.
+    std::fs::write(root.join("allow_refusal"), "1").unwrap();
     until("m_refused_no_cmd returned as Deferred", || {
         harness.deliver(&m_ref).unwrap() == DeliverOutcome::Deferred
     });
