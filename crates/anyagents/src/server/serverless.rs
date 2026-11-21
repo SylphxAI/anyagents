@@ -1229,6 +1229,8 @@ pub(crate) struct GuestEventPayload {
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub timestamp_ms: Option<i64>,
@@ -1252,6 +1254,9 @@ pub(crate) struct GuestEventPayload {
     pub proof: Option<String>,
     #[serde(default)]
     pub consumed_steers: Option<Vec<anyagents_guest::steer::ConsumedSteer>>,
+    /// Live unmasked raw turn transcript entries emitted mid-turn by `anyagents-guest`.
+    #[serde(default)]
+    pub entries: Option<Vec<anyagents_guest::transcript_relay::GuestTranscriptEntry>>,
     #[serde(default)]
     pub result_text: Option<String>,
     #[serde(default)]
@@ -1916,6 +1921,75 @@ pub(crate) async fn guest_events_route(
                         0usize,
                     ))
                 }
+                "transcript_entries" => {
+                    let harness_label = payload
+                        .harness
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            turn.metadata_json
+                                .as_ref()
+                                .and_then(|m| m.get("agent_harness").and_then(Value::as_str))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| turn.harness_kind.clone());
+                    let raw_entries = payload.entries.unwrap_or_default();
+                    let received = raw_entries.len();
+                    let new_events: Vec<anyagents_core::NewTurnTranscriptEvent> = raw_entries
+                        .into_iter()
+                        .filter(|e| !e.source.trim().is_empty())
+                        .map(|e| anyagents_core::NewTurnTranscriptEvent {
+                            agent_id: turn.agent_id.clone(),
+                            turn_id: turn.turn_id.clone(),
+                            session_id: e.session_id.or_else(|| payload.session_id.clone()),
+                            harness: harness_label.clone(),
+                            source: e.source,
+                            seq: e.seq,
+                            timestamp_ms: if e.timestamp_ms > 0 {
+                                e.timestamp_ms
+                            } else {
+                                ts
+                            },
+                            role: e.role,
+                            tool_name: e.tool_name,
+                            tool_call_id: e.tool_call_id,
+                            text: e.text,
+                            raw_json: e.raw_json,
+                        })
+                        .collect();
+                    // Lossless raw transcript log: store unmasked; access is gated by
+                    // `conversation_visibility` (self, descendants, operator only).
+                    let inserted = store
+                        .append_turn_transcript_events(&new_events)
+                        .map_err(ApiError::from_store)?;
+                    let _ = store
+                        .remote_turn_store()
+                        .record_event(
+                            &turn.turn_id,
+                            &RemoteTurnEventUpdate {
+                                status: Some("running".to_string()),
+                                cursor: None,
+                                remote_run_id: None,
+                                last_event_at_ms: ts,
+                                next_poll_at_ms: None,
+                            },
+                        )
+                        .map_err(ApiError::from_store)?;
+                    Ok((
+                        Json(json!({
+                            "ok": true,
+                            "turn_id": turn.turn_id,
+                            "event_type": "transcript_entries",
+                            "received": received,
+                            "inserted": inserted,
+                        })),
+                        None,
+                        None,
+                        0usize,
+                    ))
+                }
                 "steer_accepted" => {
                     let resp = super::serverless_steer::handle_guest_steer_accepted(
                         &store, &turn, &payload, ts,
@@ -2151,6 +2225,71 @@ fn headers_to_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Deterministic per-turn sequence base for cloud events sharing `source = "spiron/cloud"`.
+/// Allocates 43 hash bits per turn (8.8 trillion distinct buckets) and 20 bits of
+/// within-turn monotonic local sequence (up to 1,048,575 events per turn) inside a
+/// positive 63-bit `i64`, preventing cross-turn collisions on `UNIQUE (agent_id, source, seq)`
+/// even when multiple turns start within the same millisecond.
+fn cloud_turn_seq_base(turn: &PendingRemoteTurn) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in turn.turn_id.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    const TURN_BUCKET_MASK: u64 = (1u64 << 43) - 1;
+    ((h & TURN_BUCKET_MASK) as i64) << 20
+}
+
+const MAX_CLOUD_LOCAL_SEQ: i64 = (1i64 << 20) - 1;
+
+/// Idempotently persist unmasked raw cloud turn transcript events (`spiron/cloud`
+/// or `<harness>/cloud`) into `turn_transcript_events`.
+pub(super) fn persist_cloud_transcript_events(
+    store: &Store,
+    turn: &PendingRemoteTurn,
+    events: &[crate::serverless_cloud::CloudTranscriptEvent],
+) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+    let harness_label = turn
+        .metadata_json
+        .as_ref()
+        .and_then(|m| m.get("agent_harness").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| turn.harness_kind.clone());
+    let session_id = turn
+        .metadata_json
+        .as_ref()
+        .and_then(|m| m.get("remote_agent_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| turn.remote_run_id.clone());
+    let source = if turn.harness_kind.eq_ignore_ascii_case("spiron") {
+        "spiron/cloud".to_string()
+    } else {
+        format!("{}/cloud", turn.harness_kind)
+    };
+    let base = cloud_turn_seq_base(turn);
+    let rows: Vec<anyagents_core::NewTurnTranscriptEvent> = events
+        .iter()
+        .map(|ev| anyagents_core::NewTurnTranscriptEvent {
+            agent_id: turn.agent_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            session_id: session_id.clone(),
+            harness: harness_label.clone(),
+            source: source.clone(),
+            seq: base.saturating_add(ev.seq.clamp(0, MAX_CLOUD_LOCAL_SEQ)),
+            timestamp_ms: ev.timestamp_ms,
+            role: ev.role.clone(),
+            tool_name: ev.tool_name.clone(),
+            tool_call_id: ev.tool_call_id.clone(),
+            text: ev.text.clone(),
+            raw_json: ev.raw_json.clone(),
+        })
+        .collect();
+    store.append_turn_transcript_events(&rows).unwrap_or(0)
+}
+
 /// `POST /v1/internal/cloud/events`: authenticated push webhook ingress for Spiron and
 /// vendor-neutral HTTP cloud harnesses.
 ///
@@ -2286,6 +2425,7 @@ pub(crate) async fn cloud_events_route(
         }
 
         let now = now_ms();
+        let _ = persist_cloud_transcript_events(&store, &turn, &event.transcript_events);
         if event.status.is_terminal() {
             let settled = settle_remote_turn_and_deliver(
                 &store,
@@ -4490,5 +4630,476 @@ done
         let kept = store.sandbox_binding(&agent.id).unwrap().unwrap();
         assert_eq!(kept.lease_id.as_deref(), Some("sbx-live-1"));
         assert_eq!(kept.lease_state, "ready");
+    }
+
+    #[tokio::test]
+    async fn live_raw_turn_transcript_events_persist_mid_turn_unmasked_and_enforce_visibility() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("cap-key-live-transcript-test-0123456789abcdef")
+            .unwrap();
+
+        let op_token = "op-live-transcript-token-0123456789abcdef";
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(super::super::ProcessRunner)),
+            auth: crate::auth::Mode::Confined {
+                operator_digest: Some(crate::auth::operator_digest(op_token)),
+            },
+            identity: Arc::new(crate::identity::ServingIdentity::capture()),
+            profiles: Default::default(),
+            timer_backend: Arc::new(crate::timer::NoopTimerBackend),
+        };
+        let app = super::super::build_router(state);
+
+        let parent = store
+            .create_agent(NewAgent::new("tx-parent", "agy"))
+            .unwrap();
+        let mut child_spec = NewAgent::new("tx-child", "agy");
+        child_spec.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(child_spec).unwrap();
+        let peer = store.create_agent(NewAgent::new("tx-peer", "agy")).unwrap();
+
+        let parent_cap = store.issue_capability(&parent.id).unwrap();
+        let child_cap = store.issue_capability(&child.id).unwrap();
+        let peer_cap = store.issue_capability(&peer.id).unwrap();
+
+        let turn_id = generate_turn_id();
+        let callback_token = generate_callback_token();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: turn_id.clone(),
+                agent_id: child.id.clone(),
+                harness_kind: "sandbox".into(),
+                provider_kind: Some("http".into()),
+                remote_run_id: Some("pid:4242".into()),
+                callback_token_hash: hash_callback_token(&callback_token),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(json!({ "agent_harness": "agy" })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        // Register a secret canary in the process masker to verify raw transcript storage
+        // remains lossless and unmasked (masking belongs at external egress, not raw logs).
+        let raw_secret = "sk-live-midturn-unmasked-canary-5544332211";
+        anyagents_core::masking::register_secret_values([raw_secret]);
+
+        let entries_body = json!({
+            "event_type": "transcript_entries",
+            "turn_id": turn_id,
+            "agent_id": child.id.as_str(),
+            "harness": "agy",
+            "session_id": "conv-live-99",
+            "timestamp_ms": 1_795_000_001_000_i64,
+            "entries": [
+                {
+                    "source": ".gemini/antigravity-cli/brain/conv-live-99/.system_generated/logs/transcript_full.jsonl",
+                    "seq": 1024,
+                    "timestamp_ms": 1_795_000_001_100_i64,
+                    "role": "thinking",
+                    "text": format!("Inspecting live secret {raw_secret} before deploy"),
+                    "raw_json": format!(r#"{{"type":"PLANNER_RESPONSE","thinking":"Inspecting live secret {raw_secret} before deploy"}}"#)
+                },
+                {
+                    "source": ".gemini/antigravity-cli/brain/conv-live-99/.system_generated/logs/transcript_full.jsonl",
+                    "seq": 1025,
+                    "timestamp_ms": 1_795_000_001_200_i64,
+                    "role": "tool_call",
+                    "tool_name": "run_command",
+                    "tool_call_id": "call_1",
+                    "text": format!("[tool_call:run_command] curl -H 'Bearer {raw_secret}' https://api.example.invalid"),
+                    "raw_json": format!(r#"{{"type":"PLANNER_RESPONSE","tool_calls":[{{"id":"call_1","name":"run_command","arguments":"{raw_secret}"}}]}}"#)
+                },
+                {
+                    "source": ".gemini/antigravity-cli/brain/conv-live-99/.system_generated/logs/transcript_full.jsonl",
+                    "seq": 2048,
+                    "timestamp_ms": 1_795_000_001_300_i64,
+                    "role": "tool_result",
+                    "tool_name": "run_command",
+                    "tool_call_id": "call_1",
+                    "text": "200 OK midturn output",
+                    "raw_json": r#"{"type":"TOOL_RESULT","call_id":"call_1","output":"200 OK midturn output"}"#
+                },
+                {
+                    "source": ".gemini/antigravity-cli/brain/conv-live-99/.system_generated/logs/transcript_full.jsonl",
+                    "seq": 3072,
+                    "timestamp_ms": 1_795_000_001_400_i64,
+                    "role": "assistant",
+                    "text": "Deployment check still running",
+                    "raw_json": r#"{"type":"PLANNER_RESPONSE","content":"Deployment check still running"}"#
+                }
+            ]
+        });
+
+        // 1. Invalid callback bearer token is rejected (401).
+        let bad_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/guest/events")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::from(serde_json::to_vec(&entries_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Valid callback token persists all 4 entries mid-turn BEFORE turn_complete.
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/guest/events")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {callback_token}"))
+                    .body(Body::from(serde_json::to_vec(&entries_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let ok_json: Value =
+            serde_json::from_slice(&ok_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(ok_json["inserted"], 4);
+
+        // 3. Duplicate replay is idempotent (`inserted == 0`).
+        let replay_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/guest/events")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {callback_token}"))
+                    .body(Body::from(serde_json::to_vec(&entries_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+        let replay_json: Value =
+            serde_json::from_slice(&replay_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(replay_json["inserted"], 0);
+
+        // Confirm turn is STILL in-flight (not completed yet).
+        assert_eq!(
+            store
+                .remote_turn_store()
+                .get_turn(&turn_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+
+        let get_json = |uri: String, hdr_k: &'static str, hdr_v: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(&uri)
+                            .header(hdr_k, hdr_v)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, val)
+            }
+        };
+
+        // 4. Mid-turn conversation search (scope=transcripts, only_tools, query, role, turn_id)
+        //    and GET /v1/agents/{name}/turns/{turn_id}/events work for self, parent, and operator.
+        for (hdr_k, hdr_v) in [
+            (crate::operator::AGENT_HEADER, child_cap.clone()),
+            (crate::operator::AGENT_HEADER, parent_cap.clone()),
+            (crate::operator::HEADER, op_token.to_string()),
+        ] {
+            let (st, conv) = get_json(
+                format!("/v1/agents/tx-child/conversation?scope=transcripts&query={raw_secret}"),
+                hdr_k,
+                hdr_v.clone(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let turns = conv["turns"].as_array().unwrap();
+            assert_eq!(turns.len(), 2, "conv: {conv}");
+            assert!(
+                turns
+                    .iter()
+                    .all(|t| t["text"].as_str().unwrap().contains(raw_secret))
+            );
+
+            let (st, tools) = get_json(
+                "/v1/agents/tx-child/conversation?scope=transcripts&only_tools=true&tool_name=run_command".to_string(),
+                hdr_k,
+                hdr_v.clone(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let tool_turns = tools["turns"].as_array().unwrap();
+            assert_eq!(tool_turns.len(), 2, "tools: {tools}");
+            assert!(
+                tool_turns
+                    .iter()
+                    .all(|t| t["tool_name"].as_str() == Some("run_command"))
+            );
+
+            let (st, ev_resp) = get_json(
+                format!("/v1/agents/tx-child/turns/{turn_id}/events"),
+                hdr_k,
+                hdr_v.clone(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let events = ev_resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[0]["role"], "thinking");
+            assert!(events[0]["text"].as_str().unwrap().contains(raw_secret));
+            assert!(events[0]["raw_json"].as_str().unwrap().contains(raw_secret));
+            assert_eq!(events[1]["role"], "tool_call");
+            assert_eq!(events[2]["role"], "tool_result");
+            assert_eq!(events[3]["role"], "assistant");
+        }
+
+        // Verify after_seq pagination & /v1/history for parent.
+        let (st, paged) = get_json(
+            format!("/v1/agents/tx-child/turns/{turn_id}/events?after_seq=1025"),
+            crate::operator::AGENT_HEADER,
+            parent_cap.clone(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(paged["events"].as_array().unwrap().len(), 2);
+
+        let (st, hist) = get_json(
+            format!("/v1/history?scope=transcripts&query={raw_secret}"),
+            crate::operator::AGENT_HEADER,
+            parent_cap,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(hist["turns"].as_array().unwrap().len(), 2);
+
+        // 5. Unauthorized non-ancestor peer is strictly denied (403) and sees zero hits in /v1/history.
+        let (st, _) = get_json(
+            "/v1/agents/tx-child/conversation?scope=transcripts".to_string(),
+            crate::operator::AGENT_HEADER,
+            peer_cap.clone(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        let (st, _) = get_json(
+            format!("/v1/agents/tx-child/turns/{turn_id}/events"),
+            crate::operator::AGENT_HEADER,
+            peer_cap.clone(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        let (st, peer_hist) = get_json(
+            format!("/v1/history?scope=transcripts&query={raw_secret}"),
+            crate::operator::AGENT_HEADER,
+            peer_cap,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(peer_hist["turns"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spiron_cloud_webhook_and_poll_capture_raw_transcript_events_idempotently() {
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("spiron-cloud-log", "spiron-cloud"))
+            .unwrap();
+
+        let state = make_app_state(Arc::clone(&store), dir.path());
+        let app = super::super::build_router(state);
+
+        let turn_id = generate_turn_id();
+        let cb_token = generate_callback_token();
+        store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: turn_id.clone(),
+                agent_id: agent.id.clone(),
+                harness_kind: "spiron".into(),
+                provider_kind: Some("spiron".into()),
+                remote_run_id: Some("task-cloud-1".into()),
+                callback_token_hash: hash_callback_token(&cb_token),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(json!({ "agent_harness": "spiron-cloud" })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        // 1. Send mid-turn Spiron cloud webhook events (thinking + tool_call + duplicate replay).
+        let raw_secret = "sk-live-spiron-cloud-canary-112233";
+        let webhooks = [
+            json!({
+                "event": "thinking",
+                "data": {
+                    "task_id": "task-cloud-1",
+                    "turn_id": turn_id,
+                    "cursor": "1",
+                    "thinking": format!("Cloud reasoning with {raw_secret}")
+                }
+            }),
+            json!({
+                "event": "tool_call",
+                "data": {
+                    "task_id": "task-cloud-1",
+                    "turn_id": turn_id,
+                    "cursor": "2",
+                    "call_id": "sc_1",
+                    "tool_name": "web_search",
+                    "arguments": {"q": raw_secret}
+                }
+            }),
+            json!({
+                "event": "tool_result",
+                "data": {
+                    "task_id": "task-cloud-1",
+                    "turn_id": turn_id,
+                    "cursor": "3",
+                    "call_id": "sc_1",
+                    "tool_name": "web_search",
+                    "output": "search result ok"
+                }
+            }),
+        ];
+        for body in webhooks.iter().chain(std::iter::once(&webhooks[0])) {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/internal/cloud/events?driver=spiron")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {cb_token}"))
+                        .body(Body::from(serde_json::to_vec(body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let stored = store
+            .list_turn_transcript_events(&agent.id, &turn_id, None, 100)
+            .unwrap();
+        assert_eq!(stored.len(), 3, "duplicate webhook must remain idempotent");
+        assert!(stored.iter().all(|e| e.source == "spiron/cloud"));
+        assert_eq!(stored[0].role, "thinking");
+        assert!(stored[0].text.contains(raw_secret));
+        assert_eq!(stored[1].role, "tool_call");
+        assert_eq!(stored[1].tool_name.as_deref(), Some("web_search"));
+        assert_eq!(stored[2].role, "tool_result");
+        assert_eq!(stored[2].tool_name.as_deref(), Some("web_search"));
+
+        // Settle turn_1 so the single-active-turn invariant allows creating turn_2 on the same agent,
+        // and reuse local SSE ids 1..=3 on turn_2 to verify cross-turn seq isolation on "spiron/cloud".
+        store
+            .remote_turn_store()
+            .settle_turn(
+                &turn_id,
+                &SettleRemoteTurn {
+                    status: "completed".into(),
+                    result_text: Some("done".into()),
+                    error_text: None,
+                    usage_json: None,
+                    cursor: None,
+                    settled_at_ms: anyagents_core::now_ms(),
+                },
+            )
+            .unwrap();
+
+        // 2. Also verify Spiron SSE poll captures mid-turn events into turn_transcript_events.
+        let mock_sse = axum::Router::new()
+            .route(
+                "/v1/message-receipts/task-poll-2",
+                axum::routing::get(|| async { Json(json!({"status": "working"})) }),
+            )
+            .route(
+                "/v1/message-receipts/task-poll-2/events",
+                axum::routing::get(|| async {
+                    let body = concat!(
+                        "id: 1\nevent: thinking\ndata: {\"thinking\":\"poll thinking\"}\n\n",
+                        "id: 2\nevent: tool_call\ndata: {\"call_id\":\"pc_1\",\"tool_name\":\"bash\",\"args\":\"pwd\"}\n\n",
+                        "id: 3\nevent: tool_result\ndata: {\"call_id\":\"pc_1\",\"output\":\"/app\"}\n\n",
+                    );
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task =
+            tokio::spawn(async move { axum::serve(listener, mock_sse).await.unwrap() });
+
+        let turn_id_2 = generate_turn_id();
+        let turn_2 = store
+            .remote_turn_store()
+            .create_turn(&NewRemoteTurn {
+                turn_id: turn_id_2.clone(),
+                agent_id: agent.id.clone(),
+                harness_kind: "spiron".into(),
+                provider_kind: Some("spiron".into()),
+                remote_run_id: Some("task-poll-2".into()),
+                callback_token_hash: hash_callback_token("unused-poll-tok"),
+                cursor: None,
+                status: "running".into(),
+                metadata_json: Some(json!({
+                    "agent_harness": "spiron-cloud",
+                    "cloud_endpoint": format!("http://{addr}"),
+                })),
+                next_poll_at_ms: None,
+            })
+            .unwrap();
+
+        let outcome = super::super::serverless_maintenance::poll_cloud_turn_once(
+            Arc::clone(&store),
+            Arc::new(crate::timer::NoopTimerBackend),
+            turn_2,
+            false,
+        )
+        .await
+        .unwrap();
+        server_task.abort();
+        assert!(matches!(
+            outcome,
+            super::super::serverless_maintenance::CloudPollOutcome::StillRunning { .. }
+        ));
+
+        let polled_events = store
+            .list_turn_transcript_events(&agent.id, &turn_id_2, None, 100)
+            .unwrap();
+        assert_eq!(polled_events.len(), 3);
+        assert!(polled_events.iter().all(|e| e.source == "spiron/cloud"));
+        assert_eq!(polled_events[0].role, "thinking");
+        assert_eq!(polled_events[1].role, "tool_call");
+        assert_eq!(polled_events[1].tool_name.as_deref(), Some("bash"));
+        assert_eq!(polled_events[2].role, "tool_result");
+        assert_eq!(polled_events[2].tool_name.as_deref(), Some("bash"));
+        assert!(polled_events[2].text.contains("/app"));
     }
 }

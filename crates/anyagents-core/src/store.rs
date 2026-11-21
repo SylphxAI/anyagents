@@ -126,6 +126,7 @@ mod steer_ops;
 #[cfg(test)]
 mod tests;
 mod topology;
+mod transcript_events;
 mod turn_errors;
 mod turn_events;
 mod types;
@@ -166,6 +167,10 @@ pub use runtime::{
 };
 pub use runtime_issues::{
     RuntimeComponent, RuntimeIssue, RuntimeIssueReport, RuntimeIssueSource, RuntimeIssueStatus,
+};
+pub use transcript_events::{
+    NewTurnTranscriptEvent, TurnTranscriptEvent, TurnTranscriptSearchHit,
+    VALID_TRANSCRIPT_EVENT_ROLES, normalize_transcript_event_role,
 };
 pub use turn_errors::{ErroredTurn, MAX_ERRORED_TURNS, TurnErrors, is_session_turn_error};
 pub use turn_events::AgentTurnSnapshot;

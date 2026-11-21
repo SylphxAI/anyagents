@@ -11,7 +11,7 @@
 //!   `GET /turns/{id}`, `POST /turns/{id}:cancel`, webhook callback) supporting any
 //!   third-party cloud agent harness (Codex Cloud, Claude Cloud, Devin, custom SaaS).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
 use std::time::Duration;
 
@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod spiron_poll;
+mod transcript_events;
+
+pub use transcript_events::CloudTranscriptEvent;
+pub(crate) use transcript_events::parse_cloud_transcript_event;
+use transcript_events::parse_webhook_transcript_events;
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_NEXT_POLL_MS: u64 = 5_000;
@@ -121,6 +126,8 @@ pub struct CloudTurnPollResult {
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_events: Vec<CloudTranscriptEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_poll_after_ms: Option<u64>,
 }
@@ -192,6 +199,8 @@ pub struct CloudWebhookEvent {
     pub steer_seq: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_proof: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_events: Vec<CloudTranscriptEvent>,
 }
 
 /// Universal async driver contract for pure serverless cloud agent harnesses.
@@ -847,6 +856,7 @@ impl CloudTurnDriver for SpironServerlessDriver {
                 usage,
                 cursor: events.cursor,
                 deltas: events.deltas,
+                transcript_events: events.transcript_events,
                 next_poll_after_ms: (!state.is_terminal()).then_some(DEFAULT_NEXT_POLL_MS),
             })
         })
@@ -955,6 +965,8 @@ impl CloudTurnDriver for SpironServerlessDriver {
 
         let (steer_message_id, steer_seq, steer_proof) =
             extract_webhook_steer_fields(data, &payload, &event_type);
+        let transcript_events =
+            parse_webhook_transcript_events(&event_type, cursor.as_deref(), &payload);
 
         Ok(CloudWebhookEvent {
             turn_id,
@@ -969,6 +981,7 @@ impl CloudTurnDriver for SpironServerlessDriver {
             steer_message_id,
             steer_seq,
             steer_proof,
+            transcript_events,
         })
     }
 }
@@ -1144,12 +1157,32 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut next_seq = cursor_owned
+                .as_deref()
+                .and_then(|c| c.trim().parse::<i64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(0);
             let next_cursor = resp
                 .get("next_cursor")
                 .or_else(|| resp.get("cursor"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or(cursor_owned);
+            let mut transcript_events = Vec::new();
+            if let Some(arr) = resp.get("events").and_then(Value::as_array) {
+                let mut call_names = HashMap::new();
+                for item in arr {
+                    if let Some(te) = parse_cloud_transcript_event(
+                        None,
+                        item.get("id").and_then(Value::as_str),
+                        &mut next_seq,
+                        &mut call_names,
+                        item,
+                    ) {
+                        transcript_events.push(te);
+                    }
+                }
+            }
             Ok(CloudTurnPollResult {
                 remote_run_id: run_id,
                 status: state,
@@ -1158,6 +1191,7 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
                 usage: resp.get("usage").cloned(),
                 cursor: next_cursor,
                 deltas,
+                transcript_events,
                 next_poll_after_ms: (!state.is_terminal()).then_some(DEFAULT_NEXT_POLL_MS),
             })
         })
@@ -1247,6 +1281,14 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
         let (steer_message_id, steer_seq, steer_proof) =
             extract_webhook_steer_fields(data, &payload, &event_type);
 
+        let cursor = data
+            .get("cursor")
+            .or_else(|| payload.get("cursor"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let transcript_events =
+            parse_webhook_transcript_events(&event_type, cursor.as_deref(), &payload);
+
         Ok(CloudWebhookEvent {
             turn_id,
             remote_run_id,
@@ -1256,14 +1298,11 @@ impl CloudTurnDriver for GenericHttpCloudDriver {
             result_text: extract_result_string(data).or_else(|| extract_result_string(&payload)),
             error_text: extract_error_string(data).or_else(|| extract_error_string(&payload)),
             usage: data.get("usage").or_else(|| payload.get("usage")).cloned(),
-            cursor: data
-                .get("cursor")
-                .or_else(|| payload.get("cursor"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            cursor,
             steer_message_id,
             steer_seq,
             steer_proof,
+            transcript_events,
         })
     }
 }

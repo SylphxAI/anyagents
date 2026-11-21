@@ -497,6 +497,13 @@ pub struct HistorySearchQuery {
     pub only_tools: bool,
     /// Optional tool name filter (e.g. `"browser"`, `"agents"`, `"schedule"`, `"send"`, `"bash"`).
     pub tool_name: Option<String>,
+    /// Optional turn identifier filter for live/completed raw turn transcript events.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Optional transcript role filter (`"user"`, `"assistant"`, `"thinking"`, `"tool_call"`,
+    /// `"tool_result"`, `"system"`, `"raw"`).
+    #[serde(default)]
+    pub role: Option<String>,
     /// Lower timestamp bound (`timestamp_ms > since_ms`).
     pub since_ms: Option<i64>,
     /// Upper timestamp bound (`timestamp_ms <= until_ms`).
@@ -532,6 +539,8 @@ impl Default for HistorySearchQuery {
             include_tools: true,
             only_tools: false,
             tool_name: None,
+            turn_id: None,
+            role: None,
             since_ms: None,
             until_ms: None,
             from_seq: None,

@@ -1,12 +1,14 @@
 //! Bounded receipt event replay for the Spiron HTTP driver.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::{
-    CloudTurnState, build_http_agent, extract_error_string, extract_result_string, map_status_str,
+    CloudTranscriptEvent, CloudTurnState, build_http_agent, extract_error_string,
+    extract_result_string, map_status_str, parse_cloud_transcript_event,
 };
 
 const MAX_EVENT_BYTES: u64 = 2 * 1024 * 1024;
@@ -21,11 +23,19 @@ pub(super) struct PollEvents {
     pub(super) error: Option<String>,
     pub(super) usage: Option<Value>,
     pub(super) deltas: Vec<String>,
+    pub(super) transcript_events: Vec<CloudTranscriptEvent>,
     pub(super) snapshot: bool,
+    next_seq: i64,
+    call_names: HashMap<String, String>,
 }
 
 impl PollEvents {
     pub(super) fn new(cursor: Option<String>) -> Self {
+        let next_seq = cursor
+            .as_deref()
+            .and_then(|c| c.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(0);
         Self {
             cursor,
             terminal: None,
@@ -33,7 +43,10 @@ impl PollEvents {
             error: None,
             usage: None,
             deltas: Vec::new(),
+            transcript_events: Vec::new(),
             snapshot: false,
+            next_seq,
+            call_names: HashMap::new(),
         }
     }
 
@@ -150,6 +163,15 @@ impl PollEvents {
             .filter(|s| !s.is_empty())
             .or_else(|| field(item, "event"))
             .or_else(|| field(item, "type"));
+        if let Some(te) = parse_cloud_transcript_event(
+            event,
+            cursor,
+            &mut self.next_seq,
+            &mut self.call_names,
+            item,
+        ) {
+            self.transcript_events.push(te);
+        }
         match event {
             Some("message.completed") => {
                 // A completion lacking its own reply should not mask a later failure.

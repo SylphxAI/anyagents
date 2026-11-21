@@ -46,7 +46,7 @@ pub mod sqlite_to_pg;
 pub use pg_migrations::{
     PG_ACTIVE_TURN_UNIQUE_SQL, PG_AGENT_RUNTIME_SQL, PG_BROWSER_PROFILE_GRANTS_SQL,
     PG_DEPLOYMENT_SECRETS_SQL, PG_INIT_SQL, PG_LATEST_VERSION, PG_SERVERLESS_TURNS_SQL,
-    PG_STATELESS_SQL,
+    PG_STATELESS_SQL, PG_TURN_TRANSCRIPT_EVENTS_SQL,
 };
 pub use sqlite_to_pg::{
     MigrateToPostgresOptions, MigrateToPostgresReport, TableMigrationStat,

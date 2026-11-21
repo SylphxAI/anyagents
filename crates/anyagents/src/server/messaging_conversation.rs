@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use crate::api::{
     ConversationResponse, ConversationTurnView, InboxResponse, MessageView, OperatorInboxResponse,
+    TurnEventsResponse, TurnTranscriptEventView,
 };
 use crate::auth::Principal;
 
@@ -124,6 +125,7 @@ pub(super) struct Since {
 
 #[derive(Default, Deserialize)]
 pub(super) struct ConversationQuery {
+    pub(super) agent: Option<String>,
     pub(super) all: Option<bool>,
     pub(super) raw_id: Option<String>,
     pub(super) raw_sha256: Option<String>,
@@ -149,6 +151,8 @@ pub(super) struct ConversationQuery {
     pub(super) include_tools: Option<bool>,
     pub(super) only_tools: Option<bool>,
     pub(super) tool_name: Option<String>,
+    pub(super) turn_id: Option<String>,
+    pub(super) role: Option<String>,
     pub(super) sort: Option<String>,
     pub(super) radius: Option<usize>,
     pub(super) limit: Option<usize>,
@@ -158,6 +162,12 @@ pub(super) struct ConversationQuery {
     pub(super) queries: Option<String>,
     #[serde(default)]
     pub(super) exclude: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct TurnEventsQuery {
+    pub(super) after_seq: Option<i64>,
+    pub(super) limit: Option<usize>,
 }
 
 pub(super) async fn inbox(
@@ -429,6 +439,7 @@ pub(super) async fn conversation_route(
                         tool_name: None,
                         tool_names: Vec::new(),
                         role: Some("memory".into()),
+                        turn_id: None,
                     }],
                 }));
             }
@@ -514,6 +525,7 @@ pub(super) async fn conversation_route(
                     tool_name: None,
                     tool_names: Vec::new(),
                     role: Some("memory".into()),
+                    turn_id: None,
                 }
             } else {
                 let body_text = query.content.as_deref().unwrap_or_default();
@@ -570,6 +582,7 @@ pub(super) async fn conversation_route(
                     tool_name: None,
                     tool_names: Vec::new(),
                     role: Some("memory".into()),
+                    turn_id: None,
                 }
             };
             return Ok(Json(ConversationResponse {
@@ -692,6 +705,7 @@ pub(super) async fn conversation_route(
                     tool_name: hit.metadata.tool_name,
                     tool_names: hit.metadata.tool_names,
                     role: hit.metadata.role,
+                    turn_id: None,
                 }],
             }));
         }
@@ -720,6 +734,19 @@ pub(super) async fn conversation_route(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+        let clean_turn_id = query
+            .turn_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let clean_role = query
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let transcript_only_filter = clean_turn_id.is_some() || clean_role.is_some();
         let has_structured_search = clean_q.is_some()
             || !extra_queries.is_empty()
             || !exclude_terms.is_empty()
@@ -731,6 +758,7 @@ pub(super) async fn conversation_route(
             || query.include_tools == Some(false)
             || query.only_tools == Some(true)
             || query.tool_name.is_some()
+            || transcript_only_filter
             || query.sort.is_some()
             || query.radius.is_some_and(|r| r > 0);
         let is_all = name.eq_ignore_ascii_case("all") || name == "*";
@@ -745,6 +773,8 @@ pub(super) async fn conversation_route(
             include_tools: query.include_tools.unwrap_or(true),
             only_tools: query.only_tools.unwrap_or(false),
             tool_name: query.tool_name.clone(),
+            turn_id: clean_turn_id.clone(),
+            role: clean_role.clone(),
             since_ms: query.since_ms,
             until_ms: query.until_ms,
             from_seq: query.from_seq,
@@ -762,13 +792,14 @@ pub(super) async fn conversation_route(
         } else {
             Some(state.store.agent_by_name(&name))
         };
-        let should_search_host_files = should_search_host_files_for_request(
-            state.store.is_postgres(),
-            query.scope,
-            has_structured_search,
-            file_request.only_tools,
-            file_request.tool_name.is_some(),
-        );
+        let should_search_host_files = !transcript_only_filter
+            && should_search_host_files_for_request(
+                state.store.is_postgres(),
+                query.scope,
+                has_structured_search,
+                file_request.only_tools,
+                file_request.tool_name.is_some(),
+            );
         let host_file_authorized: Vec<String> = if !should_search_host_files {
             Vec::new()
         } else if !is_all {
@@ -862,8 +893,27 @@ pub(super) async fn conversation_route(
             });
         }
 
+        let should_search_turn_events = query.scope
+            != anyagents_core::host_index::MemoryScope::Memory
+            && (query.scope == anyagents_core::host_index::MemoryScope::Transcripts
+                || has_structured_search);
+        let transcript_event_hits = if should_search_turn_events {
+            let mut te_req = file_request.clone();
+            if query.all == Some(true) {
+                te_req.limit = 0;
+            }
+            state
+                .store
+                .search_turn_transcript_event_hits(&te_req)
+                .map_err(ApiError::from_store)?
+        } else {
+            Vec::new()
+        };
+
         let (agent_name, agent_id_str, raw_turns) =
-            if query.scope == anyagents_core::host_index::MemoryScope::Memory {
+            if query.scope == anyagents_core::host_index::MemoryScope::Memory
+                || transcript_only_filter
+            {
                 if is_all {
                     ("all".into(), "all".into(), Vec::new())
                 } else {
@@ -885,6 +935,8 @@ pub(super) async fn conversation_route(
                     include_tools: query.include_tools.unwrap_or(true),
                     only_tools: query.only_tools.unwrap_or(false),
                     tool_name: query.tool_name.clone(),
+                    turn_id: clean_turn_id,
+                    role: clean_role,
                     since_ms: query.since_ms,
                     until_ms: query.until_ms,
                     from_seq: query.from_seq,
@@ -900,7 +952,7 @@ pub(super) async fn conversation_route(
                 };
                 let turns = state
                     .store
-                    .search_history(&search_req)
+                    .search_mailbox_history(&search_req)
                     .map_err(ApiError::from_store)?;
                 let (aname, aid) = if is_all {
                     ("all".to_string(), "all".to_string())
@@ -949,6 +1001,7 @@ pub(super) async fn conversation_route(
                 tool_name: None,
                 tool_names: Vec::new(),
                 role: None,
+                turn_id: None,
                 id: t.id,
                 direction: t.direction,
                 from: t.from,
@@ -963,6 +1016,45 @@ pub(super) async fn conversation_route(
             .enumerate()
             .map(|(rank, t)| (1.0 / (30.0 + rank as f64), t))
             .collect();
+        for (rank, hit) in transcript_event_hits.into_iter().enumerate() {
+            let direction = if hit.event.role == "user" {
+                "in".to_string()
+            } else {
+                "out".to_string()
+            };
+            let from = if hit.event.role == "user" {
+                "user".to_string()
+            } else {
+                format!("agent:{}", hit.agent_name)
+            };
+            let to = if hit.event.role == "user" {
+                format!("agent:{}", hit.agent_name)
+            } else {
+                format!("turn:{}", hit.event.turn_id)
+            };
+            let tool_names: Vec<String> = hit.event.tool_name.clone().into_iter().collect();
+            ranked.push((
+                1.0 / (30.0 + rank as f64),
+                ConversationTurnView {
+                    seq: hit.event.seq,
+                    raw_bytes: None,
+                    id: format!("tte_{}", hit.event.rowid),
+                    direction,
+                    from,
+                    to,
+                    reply_to: Some(format!("turn:{}", hit.event.turn_id)),
+                    text: hit.event.text,
+                    timestamp_ms: Some(hit.event.timestamp_ms),
+                    source: Some("transcripts".into()),
+                    raw: None,
+                    window: None,
+                    tool_name: hit.event.tool_name,
+                    tool_names,
+                    role: Some(hit.event.role),
+                    turn_id: Some(hit.event.turn_id),
+                },
+            ));
+        }
         for (rank, (hit, bytes)) in file_hits.into_iter().enumerate() {
             let reply_to = (hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory)
                 .then(|| {
@@ -998,6 +1090,7 @@ pub(super) async fn conversation_route(
                     tool_name: hit.metadata.tool_name,
                     tool_names: hit.metadata.tool_names,
                     role: hit.metadata.role,
+                    turn_id: None,
                 },
             ));
         }
@@ -1033,6 +1126,82 @@ pub(super) async fn conversation_route(
             agent_id: agent_id_str,
             turns,
             retrieval,
+        }))
+    })
+    .await
+}
+
+/// `GET /v1/history`: unified conversation & raw transcript search across
+/// authorized agents (defaults to `agent=all`, strictly enforcing
+/// `conversation_visibility`).
+pub(super) async fn history_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<Json<ConversationResponse>, ApiError> {
+    let target = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("all")
+        .to_string();
+    conversation_route(principal, State(state), AxumPath(target), Query(query)).await
+}
+
+/// `GET /v1/agents/{name}/turns/{turn_id}/events`: ordered live or completed
+/// raw step stream for one turn, strictly gated by `conversation_visibility`
+/// (`self`, `descendants`, and `Operator` only; peers receive `403`).
+pub(super) async fn turn_events_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath((name, turn_id)): AxumPath<(String, String)>,
+    Query(query): Query<TurnEventsQuery>,
+) -> Result<Json<TurnEventsResponse>, ApiError> {
+    let clean_turn_id = turn_id.trim().to_string();
+    if clean_turn_id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "missing turn_id"));
+    }
+    let limit = query.limit.unwrap_or(500).clamp(1, 2_000);
+    let after_seq = query.after_seq;
+    spawn_store(move || {
+        let (resolved_name, visible_agent_ids) =
+            conversation_visibility(&state.store, &principal, &name)?;
+        if resolved_name.eq_ignore_ascii_case("all") || resolved_name == "*" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "turn events require a specific agent name",
+            ));
+        }
+        let target = state
+            .store
+            .agent_by_name(
+                resolved_name
+                    .strip_prefix("agent:")
+                    .unwrap_or(&resolved_name),
+            )
+            .map_err(ApiError::from_store)?;
+        if let Some(visible) = visible_agent_ids.as_ref()
+            && !visible
+                .iter()
+                .any(|v| v == target.id.as_str() || v == &target.name)
+        {
+            return Err(ApiError::forbidden(
+                "cannot read private turn transcript events of another agent",
+            ));
+        }
+        let events = state
+            .store
+            .list_turn_transcript_events(&target.id, &clean_turn_id, after_seq, limit)
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(TurnTranscriptEventView::from)
+            .collect();
+        Ok(Json(TurnEventsResponse {
+            agent: target.name,
+            agent_id: target.id.to_string(),
+            turn_id: clean_turn_id,
+            events,
         }))
     })
     .await

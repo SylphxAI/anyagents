@@ -588,11 +588,24 @@ pub(crate) fn build_direct_search_sql(spec: &DirectSearchSpec<'_>) -> (String, V
     (sql, sp.params)
 }
 
-/// Direct PostgreSQL implementation of [`Store::search_history`].
-pub(super) fn pg_search_history(
+/// Direct PostgreSQL implementation of [`Store::search_mailbox_history`].
+pub(super) fn pg_search_mailbox_history(
     store: &Store,
     req: &HistorySearchQuery,
 ) -> Result<Vec<ConversationTurn>, Error> {
+    if req
+        .turn_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+        || req
+            .role
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Ok(Vec::new());
+    }
     if req
         .visible_agent_ids
         .as_deref()
@@ -822,6 +835,19 @@ pub(super) fn pg_search_history(
         }
     }
     Ok(hits)
+}
+
+/// Direct PostgreSQL implementation of [`Store::search_history`], combining
+/// canonical mailbox rows with live raw `turn_transcript_events`.
+pub(super) fn pg_search_history(
+    store: &Store,
+    req: &HistorySearchQuery,
+) -> Result<Vec<ConversationTurn>, Error> {
+    let mailbox = pg_search_mailbox_history(store, req)?;
+    let events = store.search_turn_transcript_events(req)?;
+    Ok(super::history::merge_history_search_turns(
+        mailbox, events, req,
+    ))
 }
 
 #[cfg(test)]

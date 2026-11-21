@@ -523,6 +523,14 @@ fn execute_turn_foreground(
         prune_legacy_agy_tool_guard(state_dir);
     }
     let pre_turn_auth = snapshot_syncable_auth_files(state_dir);
+    let mut transcript_relay = crate::transcript_relay::TranscriptRelay::new(
+        state_dir,
+        &harness_name,
+        &args.turn_id,
+        &args.agent_id,
+        callback_url,
+        callback_token,
+    );
 
     let mut adapter = match launch_guest_harness(
         &harness_name,
@@ -644,6 +652,7 @@ fn execute_turn_foreground(
         hb_guard.stop();
         clear_activity_snapshot(state_dir);
         adapter.stop();
+        transcript_relay.flush_all(sid.as_deref());
         let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
         send_turn_failed(
             callback_url,
@@ -698,10 +707,8 @@ fn execute_turn_foreground(
                 last_persisted_sid = Some(sid.clone());
                 watchdog.touch();
             }
-            hb_guard.set_phase(
-                live_sid.or_else(|| initial_sid.clone()),
-                turn_state_label(health.turn_state),
-            );
+            let active_sid = live_sid.or_else(|| initial_sid.clone());
+            hb_guard.set_phase(active_sid.clone(), turn_state_label(health.turn_state));
 
             // Stream incremental deltas if harness accumulated new output.
             // Throttle `opencode` delta polling because `answer_for` invokes `opencode api`.
@@ -761,6 +768,9 @@ fn execute_turn_foreground(
                 watchdog.touch();
             }
             if progress_tracker.poll_changed() {
+                watchdog.touch();
+            }
+            if transcript_relay.tick(active_sid.as_deref()) {
                 watchdog.touch();
             }
 
@@ -847,8 +857,10 @@ fn execute_turn_foreground(
         GuestActivitySnapshot::capture_current(&harness_name, Some(sid.clone()), "idle", 0, 0);
     clear_activity_snapshot(state_dir);
     adapter.stop();
-    // Drain proofs once more after `adapter.stop()` flushed any trailing stdout frames.
+    // Drain proofs once more after `adapter.stop()` flushed any trailing stdout frames,
+    // and flush any trailing native transcript entries before terminal settlement.
     steer_pump.drain_final_proofs(adapter.as_ref());
+    transcript_relay.flush_all(Some(&sid));
     let synced_auth = collect_changed_syncable_auth_files(state_dir, &pre_turn_auth);
 
     if let Some(err_msg) = err_override {

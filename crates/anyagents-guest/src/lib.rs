@@ -18,6 +18,7 @@ pub mod mcp_bootstrap;
 mod mcp_proxy;
 mod media;
 pub mod steer;
+pub mod transcript_relay;
 pub mod turn;
 mod workspace_delta;
 

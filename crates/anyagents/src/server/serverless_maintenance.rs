@@ -475,7 +475,14 @@ pub(crate) async fn poll_cloud_turn_once(
             let tb_close = Arc::clone(&timer_backend);
             let tid = turn.turn_id.clone();
             let aid = turn.agent_id.clone();
+            let turn_for_log = turn.clone();
+            let transcript_events = polled.transcript_events;
             let settled_now = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                let _ = super::serverless::persist_cloud_transcript_events(
+                    &store_settle,
+                    &turn_for_log,
+                    &transcript_events,
+                );
                 let res = settle_remote_turn_and_deliver(
                     &store_settle,
                     &tid,
@@ -513,7 +520,14 @@ pub(crate) async fn poll_cloud_turn_once(
             let tid = turn.turn_id.clone();
             let aid = turn.agent_id.clone();
             let cur = polled.cursor;
+            let turn_for_log = turn.clone();
+            let transcript_events = polled.transcript_events;
             let _ = tokio::task::spawn_blocking(move || {
+                let _ = super::serverless::persist_cloud_transcript_events(
+                    &store_next,
+                    &turn_for_log,
+                    &transcript_events,
+                );
                 let _ = store_next.remote_turn_store().schedule_next_poll(
                     &tid,
                     Some(next_at),

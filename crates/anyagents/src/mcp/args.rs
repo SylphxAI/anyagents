@@ -95,6 +95,13 @@ pub(super) struct ConversationArgs {
     /// Optional tool name filter (e.g. `"browser"`, `"agents"`, `"schedule"`, `"send"`).
     #[serde(default)]
     pub(super) tool_name: Option<String>,
+    /// Optional turn identifier filter for live or completed turn transcript events.
+    #[serde(default)]
+    pub(super) turn_id: Option<String>,
+    /// Optional transcript role filter (`"user"`, `"assistant"`, `"thinking"`, `"tool_call"`,
+    /// `"tool_result"`, `"system"`, `"raw"`).
+    #[serde(default)]
+    pub(super) role: Option<String>,
     /// Optional lower timestamp bound in milliseconds (`timestamp_ms > since_ms`).
     #[serde(default)]
     pub(super) since_ms: Option<i64>,

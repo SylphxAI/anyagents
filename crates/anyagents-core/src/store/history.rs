@@ -288,15 +288,41 @@ impl Store {
 
     /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
     ///
-    /// Searches `rag_chunks` and `rag_chunks_fts` across `req.agent` (`None` or `"all"` searches all agents)
-    /// combining SQLite FTS5 BM25 (hybrid ASCII + CJK bigrams/unigrams), exact phrase/substring boost,
-    /// multi-query coverage (`query` + `queries`), negative term filtering (`exclude`), tool history
-    /// toggles (`include_tools`, `only_tools`, `tool_name`), range bounds (`since_ms`, `until_ms`,
-    /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
-    /// context expansion (`radius`).
+    /// Searches both canonical mailbox/tool history and live append-only raw
+    /// `turn_transcript_events` across `req.agent` (`None` or `"all"` searches all
+    /// authorized agents), respecting `visible_agent_ids`, `turn_id`, `role`,
+    /// `only_tools`, `include_tools`, `tool_name`, range bounds, and `sort`.
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
         if self.is_postgres() {
             return super::pg_conversation::pg_search_history(self, req);
+        }
+        let mailbox = self.search_mailbox_history(req)?;
+        let events = self.search_turn_transcript_events(req)?;
+        Ok(merge_history_search_turns(mailbox, events, req))
+    }
+
+    /// Search only canonical mailbox and `rag_chunks` tool history (excluding
+    /// `turn_transcript_events`). Used by API routes that fetch rich
+    /// [`crate::TurnTranscriptSearchHit`] records directly to avoid duplicate work.
+    pub fn search_mailbox_history(
+        &self,
+        req: &HistorySearchQuery,
+    ) -> Result<Vec<ConversationTurn>, Error> {
+        if req
+            .turn_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+            || req
+                .role
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+        {
+            return Ok(Vec::new());
+        }
+        if self.is_postgres() {
+            return super::pg_conversation::pg_search_mailbox_history(self, req);
         }
         self.sync_memory_index()?;
         let conn = self.read_conn();
@@ -1306,4 +1332,63 @@ pub(super) fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> 
     .into_iter()
     .flatten()
     .any(|field| matches_peer_field(field, peer))
+}
+
+fn parse_turn_score(turn: &ConversationTurn) -> f64 {
+    turn.reply_to
+        .as_deref()
+        .and_then(|s| s.strip_prefix("score="))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|tok| tok.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+pub(super) fn merge_history_search_turns(
+    mut mailbox: Vec<ConversationTurn>,
+    events: Vec<ConversationTurn>,
+    req: &HistorySearchQuery,
+) -> Vec<ConversationTurn> {
+    if events.is_empty() {
+        return mailbox;
+    }
+    if mailbox.is_empty() {
+        return events;
+    }
+    mailbox.extend(events);
+    let has_query = req
+        .query
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+        || req.queries.iter().any(|q| !q.trim().is_empty());
+    match req.sort {
+        HistorySort::Relevance if has_query => {
+            mailbox.sort_by(|a, b| {
+                parse_turn_score(b)
+                    .total_cmp(&parse_turn_score(a))
+                    .then_with(|| b.timestamp_ms.cmp(&a.timestamp_ms))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+        HistorySort::Oldest => {
+            mailbox.sort_by(|a, b| {
+                a.timestamp_ms
+                    .cmp(&b.timestamp_ms)
+                    .then_with(|| a.seq.cmp(&b.seq))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
+        HistorySort::Newest | HistorySort::Relevance => {
+            mailbox.sort_by(|a, b| {
+                b.timestamp_ms
+                    .cmp(&a.timestamp_ms)
+                    .then_with(|| b.seq.cmp(&a.seq))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+        }
+    }
+    if req.limit > 0 && req.radius == 0 && mailbox.len() > req.limit {
+        mailbox.truncate(req.limit);
+    }
+    mailbox
 }
