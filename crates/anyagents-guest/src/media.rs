@@ -212,7 +212,12 @@ fn materialize_media_ref(
     } else {
         format!("{}/v1/media/{basename}", api_base?)
     };
-    download_media(&url, &basename, media_dir, token, agent_id)
+    let private_upload = raw_ref.strip_prefix("/v1/media/").is_some_and(|tail| {
+        tail.split_once("/uploads/").is_some_and(|(owner, id)| {
+            Some(owner) == agent_id && !id.is_empty() && !id.contains('/')
+        })
+    });
+    download_media(&url, &basename, media_dir, token, agent_id, private_upload)
 }
 
 fn download_media(
@@ -221,6 +226,7 @@ fn download_media(
     media_dir: &Path,
     token: Option<&str>,
     agent_id: Option<&str>,
+    private_upload: bool,
 ) -> Option<PathBuf> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(30)))
@@ -242,7 +248,15 @@ fn download_media(
         .map(sanitize_filename)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback_name.to_string());
-    let bytes = resp.into_body().read_to_vec().ok()?;
+    let mut body = resp.into_body();
+    let bytes = if private_upload {
+        body.with_config()
+            .limit(anyagents_harness::media::PRIVATE_MEDIA_MAX_BYTES as u64)
+            .read_to_vec()
+            .ok()?
+    } else {
+        body.read_to_vec().ok()?
+    };
     if bytes.is_empty() {
         return None;
     }

@@ -175,20 +175,27 @@ pub(super) fn refuse_host_placement_over_http(
     Ok(())
 }
 
-/// Over HTTP MCP a media attachment is a URL. A local path would have the
-/// server read a host file as its own user and upload it, and a bare name may
-/// resolve against the server's working directory.
+/// Over HTTP MCP an attachment is an HTTP(S) URL or a private media reference.
+/// A local path or a bare Telegram file ID must never be interpreted on the host.
 pub(super) fn refuse_host_media_over_http(body: &SendRequest) -> Result<(), ApiError> {
     if let Some(media) = &body.media {
-        let source = media.source.trim();
-        if !(source.starts_with("https://") || source.starts_with("http://")) {
-            return Err(ApiError::forbidden(
-                "a call over HTTP MCP attaches media by `https://` URL only; a local path or file id \
-                 would be read on this host",
-            ));
-        }
+        require_remote_media_source(&media.source)?;
     }
     Ok(())
+}
+
+pub(super) fn require_remote_media_source(source: &str) -> Result<(), ApiError> {
+    use super::private_media::{UPLOAD_HELP, source_id};
+    let source = source.trim();
+    if source_id(source)?.is_some()
+        || source.starts_with("http://")
+        || source.starts_with("https://")
+    {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(format!(
+        "HTTP MCP accepts HTTP(S) URLs or private media references, not host paths or Telegram file IDs. {UPLOAD_HELP}"
+    )))
 }
 
 /// A harness that runs off this host can only call back through

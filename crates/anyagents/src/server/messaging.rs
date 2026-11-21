@@ -1199,6 +1199,13 @@ pub(super) fn media_upload(
         return Ok(None);
     };
     let source = media.source.trim();
+    if let Some(id) = super::private_media::source_id(source)? {
+        let caller = plan
+            .principal_id
+            .as_ref()
+            .ok_or_else(|| ApiError::forbidden("private media requires an authenticated agent"))?;
+        return super::private_media::load(store, caller, id).map(Some);
+    }
     if !crate::telegram::is_local_media(source) {
         return Ok(None);
     }

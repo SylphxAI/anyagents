@@ -193,3 +193,5 @@ Any custom sandbox controller (Kubernetes, Firecracker, Fly Machines, Nomad, or 
 
 7. **`GET /v1/health`**
    - Response (`200`): `{ "healthy": true, "message": "ok" }`.
+
+See [Send a file from a remote sandbox](sandbox-media.md) for private outbound attachments over MCP.

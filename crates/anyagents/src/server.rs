@@ -48,6 +48,7 @@ mod native_signin;
 pub(crate) mod oidc_bearer;
 mod ops;
 pub(crate) mod outbound_history;
+mod private_media;
 mod profile_models;
 mod profiles;
 mod quota_rotation;
@@ -113,8 +114,8 @@ use types::{require_operator, spawn_store};
 /// The public listener (`[server] public_listen`): the only surface a network
 /// peer reaches once it is configured. It serves readiness, Telegram webhooks
 /// (each verified by its channel's secret token) and MCP for remote session
-/// tokens only; every other path is 404. Which credentials it accepts is
-/// decided by the listener the request arrived on, never by a source address
+/// tokens only, plus authenticated private media transfer. Other paths are
+/// 404. Credential policy depends on the listener, never on a source address
 /// or a forwarding header.
 pub(crate) fn build_public_router(state: AppState) -> Router {
     ops::public_health_router()
@@ -133,6 +134,7 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         )
         .merge(timer_fire::router())
         .merge(knowledge::sandbox_router())
+        .merge(private_media::router())
         .fallback(ops::public_not_found)
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
@@ -167,7 +169,8 @@ fn build_webhook_router(state: AppState) -> Router {
         post(serverless::cloud_events_route),
     )
     .merge(timer_fire::router())
-    .merge(knowledge::sandbox_router());
+    .merge(knowledge::sandbox_router())
+    .merge(private_media::router());
     let router = if expose_console {
         admin_ui::mount_admin_routes(mount_authenticated_api_routes(base))
     } else {
@@ -215,6 +218,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .merge(timer_fire::router())
         .merge(knowledge::sandbox_router())
+        .merge(private_media::router())
         .with_state(state.clone())
         .merge(crate::gateway::http_router_for_store(Arc::clone(
             &state.store,

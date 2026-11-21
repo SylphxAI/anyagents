@@ -567,7 +567,7 @@ fn calls_over_http_mcp_cannot_start_or_read_on_the_host() {
                         }),
                     )
                     .await,
-                    "by `https://` URL only",
+                    "not host paths or Telegram file IDs",
                 );
             }
             // A URL attachment and an ordinary send still work.

@@ -10,7 +10,9 @@ use axum::{
 
 use crate::api::{InteractRequest, InteractResponse};
 use crate::auth::Principal;
-use crate::server::types::{ApiError, AppState, spawn_store, via_http_mcp};
+use crate::server::types::{
+    ApiError, AppState, require_remote_media_source, spawn_store, via_http_mcp,
+};
 
 pub(in crate::server) async fn interact_route(
     principal: Principal,
@@ -22,7 +24,7 @@ pub(in crate::server) async fn interact_route(
         && body.action.trim().eq_ignore_ascii_case("set_chat_photo")
         && let Some(media) = &body.media
     {
-        require_http_photo_source(&media.source)?;
+        require_remote_media_source(&media.source)?;
     }
     let actor_name = match &principal {
         Principal::Agent { name, .. } => name.clone(),
@@ -42,13 +44,4 @@ pub(in crate::server) async fn interact_route(
     };
     let store = Arc::clone(&state.store);
     spawn_store(move || super::interact_sync(&store, &principal, &actor_name, body)).await
-}
-
-fn require_http_photo_source(source: &str) -> Result<(), ApiError> {
-    if !url::Url::parse(source.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
-        return Err(ApiError::forbidden(
-            "over HTTP MCP, set_chat_photo requires a direct public HTTP(S) image URL, not a host file path",
-        ));
-    }
-    Ok(())
 }

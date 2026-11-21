@@ -517,6 +517,17 @@ fn recipient_media_text(
     let (Some(media), Some(upload)) = (&body.media, upload) else {
         return Ok((format_internal_send_text(body), None));
     };
+    let cfg_dir = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+    if media.source.trim().starts_with("media://")
+        && crate::remote::runs_off_host_in(store, agent, &cfg_dir)
+    {
+        let href = super::private_media::copy_for_recipient(store, &agent.id, upload)?;
+        let line = format!("[Media ({}): {href}]", media.kind);
+        return Ok((
+            format_internal_send_text_with_attachment(body, Some(&line)),
+            None,
+        ));
+    }
     let uid = crate::sandbox::seat_for_agent(agent.id.as_str()).map(|(_, uid, _, _)| uid);
     if uid.is_none() && crate::sandbox::seats_configured() {
         return Err(anyagents_core::Error::PermissionDenied(

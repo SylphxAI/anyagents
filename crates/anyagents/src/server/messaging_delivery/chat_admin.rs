@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyagents_core::Store;
+use anyagents_core::{AgentId, Store};
 use axum::http::StatusCode;
 
 use crate::agent_file::FileAuthority;
@@ -33,10 +33,7 @@ pub(super) fn apply(
     let change = match action.as_str() {
         "set_chat_title" => Change::Title(title(body.text.as_deref())?),
         "set_chat_description" => Change::Description(description(body.text.as_deref())?),
-        "set_chat_photo" => Change::Photo(photo(
-            &FileAuthority::of_agent_id(store, agent_id),
-            body.media.as_ref(),
-        )?),
+        "set_chat_photo" => Change::Photo(photo(store, agent_id, body.media.as_ref())?),
         _ => {
             return Err(bad_request(
                 "unsupported Telegram chat administration action",
@@ -84,14 +81,18 @@ fn description(text: Option<&str>) -> Result<&str, ApiError> {
         .ok_or_else(|| bad_request("set_chat_description requires text of 0–255 characters (use an empty string to clear it)"))
 }
 
-fn photo(authority: &FileAuthority, media: Option<&SendMedia>) -> Result<Photo, ApiError> {
+fn photo(store: &Store, agent_id: &AgentId, media: Option<&SendMedia>) -> Result<Photo, ApiError> {
     let source = media.filter(|media| media.kind.trim().eq_ignore_ascii_case("photo"))
         .map(|media| media.source.trim()).filter(|source| !source.is_empty())
-        .ok_or_else(|| bad_request("set_chat_photo requires media.kind=photo and media.source=local JPEG/PNG path or public HTTP(S) image URL"))?;
+        .ok_or_else(|| bad_request("set_chat_photo requires media.kind=photo and media.source=a JPEG/PNG media:// reference, local path, or public HTTP(S) image URL"))?;
+    if let Some(id) = super::super::private_media::source_id(source)? {
+        let upload = super::super::private_media::load(store, agent_id, id)?;
+        return Photo::from_upload(upload).map_err(ApiError::from_store);
+    }
     if let Ok(url) = url::Url::parse(source) {
         return Photo::download(&url).map_err(ApiError::from_store);
     }
-    let bytes = authority
+    let bytes = FileAuthority::of_agent_id(store, agent_id)
         .read(Path::new(source), Photo::MAX_BYTES)
         .map_err(|why| ApiError::forbidden(format!("chat photo not read: {why}")))?;
     Photo::from_bytes(bytes).map_err(ApiError::from_store)

@@ -14,6 +14,9 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, imageops::Filt
 /// The directory inside the data directory that holds the server's copies.
 pub const MEDIA_DIR: &str = "media";
 
+/// Largest file accepted by the coordinator private attachment API.
+pub const PRIVATE_MEDIA_MAX_BYTES: usize = 25 * 1024 * 1024;
+
 /// The longest edge of an image a model is given. Every provider the fleet
 /// reaches takes it: Anthropic refuses an edge over 8,000 pixels, and over
 /// 2,000 once a request holds more than 20 images; OpenAI and Gemini scale

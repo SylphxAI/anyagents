@@ -291,7 +291,7 @@ pub(crate) fn is_valid_takeover_session_id(seg: &str) -> bool {
 }
 
 /// Whether a request method and path are explicitly admitted for remote session
-/// tokens (`aars_*`): sandbox browser-profile sync, media retrieval, and
+/// tokens (`aars_*`): sandbox browser-profile sync, media transfer, and
 /// outbound takeover reverse-tunnel registration only. Every other internal
 /// coordinator API route refuses remote session tokens fail-closed.
 fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
@@ -312,16 +312,18 @@ fn allows_remote_session_path(method: &axum::http::Method, path: &str) -> bool {
                 || is_profile_archive
                 || is_takeover_tunnel
                 || path.strip_prefix("/v1/media/").is_some_and(|rest| {
-                    let mut parts = rest.split('/');
-                    let first = parts.next().is_some_and(|s| !s.is_empty());
-                    let second = match parts.next() {
-                        None => true,
-                        Some(s) => !s.is_empty(),
-                    };
-                    first && second && parts.next().is_none()
+                    let parts: Vec<_> = rest.split('/').collect();
+                    match parts.as_slice() {
+                        [file] => !file.is_empty(),
+                        [agent, file] | [agent, "uploads", file] => {
+                            !agent.is_empty() && !file.is_empty()
+                        }
+                        _ => false,
+                    }
                 })
         }
         axum::http::Method::PUT => is_profile_archive,
+        axum::http::Method::POST => path == "/v1/media",
         _ => false,
     }
 }
