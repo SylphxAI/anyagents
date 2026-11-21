@@ -20,7 +20,7 @@ The coordinator checks Telegram ingress rules after the channel caller allowlist
 
 Set `ANYAGENTS_TELEGRAM_OWNER_IDS`, `ANYAGENTS_TELEGRAM_ADMIN_IDS`, or `ANYAGENTS_TELEGRAM_TRUSTED_IDS` to JSON arrays of positive Telegram user IDs on the coordinator. Unset arrays are empty; malformed settings reject ingress and block creation rather than risk misclassifying a protected sender. Owner and admin messages bypass receiver blocks, not the separate caller allowlist. Authenticated agent-to-agent delivery is not subject to external blocks. Trusted external users are distinct from protected senders and may be blocked.
 
-Agents manage their own rules with the `ingress_guard` MCP tool. Operators use `GET /admin/api/agents/{id}/ingress-blocks` to list, `POST` to block, and `DELETE` to unblock. For example, send this JSON to block a sender:
+Agents manage their own rules with the `ingress_guard` MCP tool. Operators can open **Settings → Ingress Guard**, then choose the receiving agent to manage active blocks. The operator API uses `GET /admin/api/agents/{id}/ingress-blocks` to list, `POST` to block, and `DELETE` to unblock. For example, send this JSON to block a sender:
 
 ```json
 {"op":"block_sender","target":{"channel":"telegram","scope":{"kind":"sender","sender_id":"123456789"}},"reason":"Repeated spam"}

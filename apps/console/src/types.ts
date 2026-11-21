@@ -97,7 +97,7 @@ export type Route =
   | { page: 'versions' }
   | { page: 'issues' }
   | { page: 'settings'; tab: SettingsTab };
-export type SettingsTab = 'channels' | 'secrets' | 'automations' | 'usage';
+export type SettingsTab = 'channels' | 'ingress' | 'secrets' | 'automations' | 'usage';
 export type Page = Route['page'];
 
 export const harnesses = ['agy', 'claude-code', 'codex', 'cursor', 'muse', 'omp', 'opencode'];
