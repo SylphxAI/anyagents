@@ -884,7 +884,7 @@ fn check_roster_contract(state: &AppState) {
         };
         let first =
             list(json!({"action":"list","parent":"self","state":"running","limit":1})).await;
-        assert_eq!(names(&first), [alias.clone()]);
+        assert_eq!(names(&first), [alias.as_str()]);
         assert_eq!(first["archived_count"], 1);
         assert_eq!(first["summary"]["total"], 2);
         assert_eq!(first["summary"]["running"], 2);
@@ -895,10 +895,10 @@ fn check_roster_contract(state: &AppState) {
         let second =
             list(json!({"action":"list","parent":"self","state":"running","limit":1,"cursor":1}))
                 .await;
-        assert_eq!(names(&second), [b.name.clone()]);
+        assert_eq!(names(&second), [b.name.as_str()]);
         assert!(second["next_cursor"].is_null());
         let archived = list(json!({"action":"list","parent":"self","state":"archived"})).await;
-        assert_eq!(names(&archived), [old.name.clone()]);
+        assert_eq!(names(&archived), [old.name.as_str()]);
         let idle = list(json!({"action":"list","parent":"self","state":"idle"})).await;
         assert!(names(&idle).contains(&old.name));
         let all = list(json!({"action":"list","parent":"subagents","state":"all"})).await;
@@ -912,12 +912,12 @@ fn check_roster_contract(state: &AppState) {
             ]
         );
         let roots = list(json!({"action":"list","parent":"root"})).await;
-        assert_eq!(names(&roots), [caller.name.clone()]);
+        assert_eq!(names(&roots), [caller.name.as_str()]);
         let found = list(
             json!({"action":"list","parent":"self","include_descendants":true,"query":nested.name}),
         )
         .await;
-        assert_eq!(names(&found), [nested.name.clone()]);
+        assert_eq!(names(&found), [nested.name.as_str()]);
         assert_eq!(found["summary"]["total"], 3);
         assert_eq!(found["summary"]["matched"], 1);
         assert_eq!(found["agents"][0]["relationship"], "descendant");
