@@ -115,7 +115,20 @@ impl LocalTokioTimerBackend {
         }
     }
 
+    #[cfg(test)]
     fn arm(&self, schedule_id: &str, fire_at_ms: i64) -> Result<JoinHandle<()>, String> {
+        Ok(self
+            .arm_delivery(schedule_id, fire_at_ms, None, fire_at_ms)?
+            .unwrap())
+    }
+
+    fn arm_delivery(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        slot_guard: Option<Option<i64>>,
+        intended_at_ms: i64,
+    ) -> Result<Option<JoinHandle<()>>, String> {
         let id = schedule_id.trim().to_string();
         if id.is_empty() {
             return Err("schedule_id cannot be empty".to_string());
@@ -123,6 +136,18 @@ impl LocalTokioTimerBackend {
         // An already-due task can run on another runtime worker immediately.
         // Hold the registration lock until its handle is published.
         let mut guard = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        // Check under the registration lock. A late retry must not replace a
+        // newer local timer registered by a concurrent claim or cancellation.
+        if let Some(expected_due) = slot_guard
+            && !self
+                .inner
+                .store
+                .get_schedule(&id)
+                .map_err(|err| err.to_string())?
+                .is_some_and(|row| row.state == "active" && row.next_fire_at_ms == expected_due)
+        {
+            return Ok(None);
+        }
         let generation = self.inner.next_gen.fetch_add(1, Ordering::Relaxed);
         let weak: Weak<LocalTimerInner> = Arc::downgrade(&self.inner);
         let task_id = id.clone();
@@ -179,7 +204,7 @@ impl LocalTokioTimerBackend {
                         &health,
                         &backend,
                         &sid,
-                        Some(fire_at_ms),
+                        Some(intended_at_ms),
                         fired_at_ms,
                     ) {
                         eprintln!("anyagents-timer: local fire failed for {sid}: {err}");
@@ -192,7 +217,7 @@ impl LocalTokioTimerBackend {
         if let Some((_, previous)) = guard.insert(id, (generation, join.abort_handle())) {
             previous.abort();
         }
-        Ok(join)
+        Ok(Some(join))
     }
 }
 
@@ -206,7 +231,28 @@ impl TimerBackend for LocalTokioTimerBackend {
         schedule_id: &str,
         fire_at_ms: i64,
     ) -> Result<Option<String>, String> {
-        drop(self.arm(schedule_id, fire_at_ms)?);
+        drop(self.arm_delivery(schedule_id, fire_at_ms, None, fire_at_ms)?);
+        Ok(None)
+    }
+
+    fn restore_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        drop(self.arm_delivery(schedule_id, fire_at_ms, None, intended_at_ms)?);
+        Ok(None)
+    }
+
+    fn schedule_slot(
+        &self,
+        schedule_id: &str,
+        fire_at_ms: i64,
+        expected_due: Option<i64>,
+        intended_at_ms: i64,
+    ) -> Result<Option<String>, String> {
+        drop(self.arm_delivery(schedule_id, fire_at_ms, Some(expected_due), intended_at_ms)?);
         Ok(None)
     }
 
@@ -256,6 +302,48 @@ mod tests {
                 watch_baseline: None,
             })
             .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_delivery_rearms_after_contention_for_all_schedule_kinds() {
+        use crate::timer::retry_tests::due_schedule;
+
+        for kind in ["at", "every", "watch"] {
+            let (_dir, store, agent, backend) = fixture();
+            let sched = due_schedule(&store, &agent, kind, EPOCH);
+            let lock = store.try_lock_agent_lifecycle(&agent.id).unwrap();
+            backend.arm(&sched.id, EPOCH).unwrap().await.unwrap();
+            assert_eq!(backend.wake_count(), 1);
+            assert_eq!(backend.pending_count(), 1);
+            assert!(store.inbox(&agent.id, None).unwrap().is_empty());
+            assert_eq!(
+                store
+                    .get_schedule(&sched.id)
+                    .unwrap()
+                    .unwrap()
+                    .next_fire_at_ms,
+                sched.next_fire_at_ms
+            );
+            drop(lock);
+
+            // Tokio's paused clock runs the replacement without wall time sleeps.
+            timeout(Duration::from_secs(12), async {
+                loop {
+                    if store.inbox(&agent.id, None).unwrap().len() == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(backend.wake_count(), 2);
+            assert_eq!(store.inbox(&agent.id, None).unwrap().len(), 1);
+            assert_eq!(
+                store.get_schedule(&sched.id).unwrap().unwrap().state,
+                if kind == "every" { "active" } else { "fired" }
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

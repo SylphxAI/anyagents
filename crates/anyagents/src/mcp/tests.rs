@@ -386,6 +386,7 @@ mod spawn_args_tests {
         AgentView {
             has_open_turn: false,
             open_turn_age_ms: None,
+            idle_task_volume_age_ms: None,
             profile: None,
             id: id.to_string(),
             name: name.to_string(),
@@ -581,7 +582,8 @@ mod spawn_args_tests {
                 let mut agents = population.clone();
                 let summary = filter_and_summarize_agent_list(&mut agents, None, Some(100), cursor);
                 let value = serde_json::json!({key: agents, "summary": summary});
-                let page = bound_agent_list(value, key, cursor).unwrap();
+                let page =
+                    bound_agent_list(value, key, cursor, AgentListProjection::Legacy).unwrap();
                 let encoded = encoded_agent_list_result(&page).unwrap();
                 let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
                 assert_eq!(wire["structuredContent"], page);
@@ -639,7 +641,7 @@ mod spawn_args_tests {
             "summary": {"matched": 1}
         });
         assert!(
-            bound_agent_list(oversized, "agents", None)
+            bound_agent_list(oversized, "agents", None, AgentListProjection::Legacy)
                 .unwrap_err()
                 .contains("one agent summary exceeds")
         );

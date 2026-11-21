@@ -883,7 +883,7 @@ fn check_roster_contract(state: &AppState) {
                 .collect::<Vec<_>>()
         };
         let first =
-            list(json!({"action":"list","parent":"self","state":"running","limit":1})).await;
+            list(json!({"action":"list","parent":"self","state":"running","limit":1,"detail":"full"})).await;
         assert_eq!(names(&first), [alias.as_str()]);
         assert_eq!(first["archived_count"], 1);
         assert_eq!(first["summary"]["total"], 2);
@@ -891,7 +891,7 @@ fn check_roster_contract(state: &AppState) {
         assert_eq!(first["next_cursor"], 1);
         assert_eq!(first["agents"][0]["relationship"], "child");
         assert_eq!(first["agents"][0]["can_message"], true);
-        assert!(first["agents"][0]["instructions"].is_null());
+        assert!(first["agents"][0]["instructions"].as_str().unwrap().ends_with("private fixture instructions"));
         let second =
             list(json!({"action":"list","parent":"self","state":"running","limit":1,"cursor":1}))
                 .await;
@@ -914,7 +914,7 @@ fn check_roster_contract(state: &AppState) {
         let roots = list(json!({"action":"list","parent":"root"})).await;
         assert_eq!(names(&roots), [caller.name.as_str()]);
         let found = list(
-            json!({"action":"list","parent":"self","include_descendants":true,"query":nested.name}),
+            json!({"action":"list","parent":"self","include_descendants":true,"query":nested.name,"detail":"full"}),
         )
         .await;
         assert_eq!(names(&found), [nested.name.as_str()]);
@@ -1043,4 +1043,90 @@ fn roster_mcp_high_cardinality() {
             "roster p95 exceeded 100ms: {samples:?}"
         );
     }
+}
+
+#[test]
+fn compact_roster_retains_55_workers_and_flags_only_quiescent_task_volumes() {
+    use super::helpers::{post_mcp_as, tool_call};
+    use anyagents_core::stateless::SandboxBinding;
+    use serde_json::json;
+
+    let _env = env_lock();
+    let dir = crate::test_tempdir();
+    let state = archetype_validation_state(dir.path());
+    let (token, caller) = roster_mcp_fixture(&state, "fleet");
+    let with_volume = |agent: &Agent, idle_ms| {
+        let mut binding = SandboxBinding::new(agent.id.clone(), "http");
+        binding.volume_id = "opaque-volume-identifier".into();
+        binding.lease_state = "ready".into();
+        binding.lease_id = Some("mock-lease".into());
+        binding.idle_since_ms = Some(anyagents_core::now_ms() - idle_ms);
+        state
+            .store
+            .sandbox_binding_store()
+            .upsert(&binding)
+            .unwrap();
+    };
+    let workers: Vec<_> = (0..55)
+        .map(|i| {
+            roster_fixture_agent(
+                &state.store,
+                format!("fleet-worker-{i:02}"),
+                Some(&caller),
+                "running",
+            )
+        })
+        .collect();
+    with_volume(&workers[0], 31 * 60_000);
+    with_volume(&workers[1], 29 * 60_000);
+    with_volume(&caller, 31 * 60_000); // Standing agent.
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (status, body) = post_mcp_as(
+            &state,
+            &token,
+            None,
+            tool_call("agents", json!({"action":"list"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let bytes = serde_json::to_vec(&body).unwrap().len();
+        eprintln!("56-agent compact JSON-RPC response: {bytes} bytes");
+        assert!(bytes < 15_000, "{bytes} bytes");
+        let list = &body["result"]["structuredContent"];
+        assert_eq!(list["agents"].as_array().unwrap().len(), 56);
+        assert_eq!(list["summary"]["idle_task_volumes"], 1);
+        assert!(list["next_cursor"].is_null());
+        let rows = list["agents"].as_array().unwrap();
+        let row =
+            |id: &anyagents_core::AgentId| rows.iter().find(|r| r["id"] == id.as_str()).unwrap();
+        assert!(
+            row(&workers[0].id)["idle_task_volume_age_ms"]
+                .as_i64()
+                .unwrap()
+                > 30 * 60_000
+        );
+        assert!(row(&workers[1].id)["idle_task_volume_age_ms"].is_null());
+        assert!(row(&caller.id)["idle_task_volume_age_ms"].is_null());
+        assert!(!body.to_string().contains("opaque-volume-identifier"));
+        let full = call_roster(
+            &state,
+            &token,
+            json!({"action":"list","query":workers[0].name,"detail":"full"}),
+        )
+        .await;
+        assert_eq!(full["agents"][0]["harness"], workers[0].harness);
+        assert_eq!(full["agents"][0]["relationship"], "child");
+        assert_eq!(full["summary"]["idle_task_volumes"], 1);
+    });
+    assert_eq!(
+        state
+            .store
+            .sandbox_binding(&workers[0].id)
+            .unwrap()
+            .unwrap()
+            .volume_id,
+        "opaque-volume-identifier"
+    );
 }

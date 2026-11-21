@@ -90,6 +90,7 @@ pub fn fire_webhook_event(
                 &prompt,
                 &format!("schedule:{}:webhook:{topic}:{delivery_id}", sched.id),
                 now,
+                false,
             )
         };
         if fired && !dispatch.fired_agents.contains(&agent.id) {

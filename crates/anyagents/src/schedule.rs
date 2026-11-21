@@ -1286,27 +1286,11 @@ struct Step {
     deadline: i64,
 }
 
-/// Evaluate a single `watch` schedule without scanning unrelated rows.
-/// Returns `(fired, next_probe_at_ms)`.
-pub(crate) fn evaluate_single_watch_schedule(
-    store: &Store,
-    health: &HealthBoard,
-    sched: &AgentSchedule,
-    now: i64,
-) -> (bool, Option<i64>) {
-    let mut entry = Entry {
-        sched: sched.clone(),
-        watch: parse_watch_spec(&sched.spec).ok(),
-        check_at: i64::MAX,
-        idle_target: None,
-        local_file: false,
-    };
-    let out = evaluate_watch_entry(store, health, &mut entry, false, &HashSet::new(), now);
-    (
-        out.fired,
-        (entry.check_at < i64::MAX).then_some(entry.check_at),
-    )
-}
+mod watch_probe;
+pub(crate) use watch_probe::evaluate_locked_watch_schedule;
+#[cfg(test)]
+use watch_probe::evaluate_single_watch_schedule;
+use watch_probe::{claim_and_deliver_scheduled_wake, evaluate_watch_entry};
 
 /// Evaluate due schedules during an operator-initiated maintenance pass.
 pub(crate) fn evaluate_maintenance_schedules(
@@ -2011,7 +1995,15 @@ fn evaluate_entry(
 ) -> EntryOutcome {
     match entry.sched.kind.as_str() {
         "at" | "every" => evaluate_timer(store, entry, now),
-        "watch" => evaluate_watch_entry(store, health, entry, event_driven, local_fallback, now),
+        "watch" => evaluate_watch_entry(
+            store,
+            health,
+            entry,
+            event_driven,
+            local_fallback,
+            now,
+            None,
+        ),
         _ => {
             entry.check_at = i64::MAX;
             EntryOutcome::default()
@@ -2050,144 +2042,6 @@ fn evaluate_timer(store: &Store, entry: &mut Entry, now: i64) -> EntryOutcome {
     }
 }
 
-/// When a watch is probed next after a look at `now`.
-fn watch_probe_at(
-    watch: Option<&WatchTarget>,
-    event_driven: bool,
-    local_fallback: &HashSet<WatchTarget>,
-    now: i64,
-) -> i64 {
-    match watch {
-        // A spec never changes, and webhook watches are push-triggered only.
-        None | Some(WatchTarget::Webhook { .. }) => i64::MAX,
-        Some(target @ (WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. })) => {
-            github::next_probe_at(target, now).max(now.saturating_add(RETRY_MS))
-        }
-        Some(WatchTarget::AgentIdle { .. }) => {
-            if event_driven {
-                i64::MAX
-            } else {
-                now.saturating_add(LOCAL_WATCH_PROBE_MS)
-            }
-        }
-        Some(target @ (WatchTarget::PathChanged { .. } | WatchTarget::ProcessExit { .. })) => {
-            if event_driven && !local_fallback.contains(target) {
-                i64::MAX
-            } else {
-                now.saturating_add(LOCAL_WATCH_PROBE_MS)
-            }
-        }
-    }
-}
-
-fn evaluate_watch_entry(
-    store: &Store,
-    health: &HealthBoard,
-    entry: &mut Entry,
-    event_driven: bool,
-    local_fallback: &HashSet<WatchTarget>,
-    now: i64,
-) -> EntryOutcome {
-    let (eval, next_probe) = if let Some(WatchTarget::PathChanged { path }) = &entry.watch {
-        let (eval, local) = file::evaluate(store, &entry.sched, path, now);
-        let next = if local {
-            watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now)
-        } else {
-            now.saturating_add(file::PROBE_INTERVAL_MS)
-        };
-        (eval, next)
-    } else {
-        (
-            evaluate_watch(
-                store,
-                health,
-                &entry.sched,
-                entry.watch.as_ref(),
-                &mut entry.idle_target,
-                now,
-            ),
-            watch_probe_at(entry.watch.as_ref(), event_driven, local_fallback, now),
-        )
-    };
-    entry.check_at = next_probe;
-    let recheck_at = now.saturating_add(LOCAL_WATCH_PROBE_MS);
-    let sched = &entry.sched;
-    let changed = eval
-        .baseline
-        .as_ref()
-        .is_some_and(|b| Some(b) != sched.watch_baseline.as_ref())
-        || eval
-            .observed
-            .as_ref()
-            .is_some_and(|o| Some(o) != sched.last_observed.as_ref());
-    if !eval.triggered && !changed {
-        return EntryOutcome::default();
-    }
-    let agent = match schedule_owner(store, sched) {
-        Owner::Live(agent) => agent,
-        Owner::Gone => return cancel_for_gone_owner(store, sched),
-        Owner::Unknown => {
-            entry.check_at = entry.check_at.min(recheck_at);
-            return EntryOutcome::default();
-        }
-    };
-    if !eval.triggered {
-        if let Err(err) = store.update_schedule_watch_observation(
-            &sched.id,
-            eval.baseline.as_deref(),
-            eval.observed.as_deref(),
-        ) {
-            eprintln!("Schedule {} observation write failed: {err}", sched.id);
-        }
-        return EntryOutcome::WROTE;
-    }
-    let Some(previous_pending) = previous_wake_pending(store, &agent, sched) else {
-        entry.check_at = entry.check_at.min(recheck_at);
-        return EntryOutcome::default();
-    };
-    if previous_pending {
-        // Record the latest observation without consuming the transition or
-        // moving the baseline; it is written once the pending wake is taken.
-        entry.check_at = entry.check_at.min(recheck_at);
-        if eval.observed.is_some() && eval.observed != sched.last_observed {
-            if let Err(err) = store.update_schedule_watch_observation(
-                &sched.id,
-                sched.watch_baseline.as_deref(),
-                eval.observed.as_deref(),
-            ) {
-                eprintln!("Schedule {} observation write failed: {err}", sched.id);
-            }
-            return EntryOutcome::WROTE;
-        }
-        return EntryOutcome::default();
-    }
-    let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
-        (
-            format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
-            format!("schedule:{}:watch:{tr}:{now}", sched.id),
-        )
-    } else {
-        (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
-    };
-    let fired = claim_and_deliver_scheduled_wake(
-        store,
-        &agent,
-        sched,
-        None,
-        eval.next_state,
-        None,
-        eval.baseline.as_deref(),
-        eval.observed.as_deref(),
-        &wake_prompt,
-        &source_key,
-        now,
-    );
-    if !fired {
-        entry.check_at = entry.check_at.min(now.saturating_add(RETRY_MS));
-    }
-    EntryOutcome { fired, wrote: true }
-}
-
 #[cfg(test)]
 fn deliver_scheduled_wake(
     store: &Store,
@@ -2208,67 +2062,8 @@ fn deliver_scheduled_wake(
         &sched.prompt,
         source_key,
         now,
+        false,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn claim_and_deliver_scheduled_wake(
-    store: &Store,
-    agent: &Agent,
-    sched: &AgentSchedule,
-    expected_due: Option<i64>,
-    next_state: &str,
-    next_due: Option<i64>,
-    baseline: Option<&str>,
-    observed: Option<&str>,
-    prompt: &str,
-    source_key: &str,
-    now: i64,
-) -> bool {
-    let result = (|| -> Result<bool, anyagents_core::Error> {
-        // Fresh lifecycle and external retirement are serialized with archive.
-        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
-            return Ok(false);
-        };
-        let agent = store.agent(&agent.id)?;
-        if agent.state == "archived"
-            || crate::server::is_explicitly_archived(store.data_dir(), &agent)
-        {
-            return Ok(false);
-        }
-        let delivered = store.claim_schedule_tick_with_wake(
-            &sched.id,
-            expected_due,
-            next_state,
-            next_due,
-            Some(now),
-            baseline,
-            observed,
-            &agent.id,
-            Incoming {
-                text: prompt.into(),
-                sender: Some(schedule_sender(&sched.id)),
-                source_time_ms: Some(now),
-                source_key: Some(source_key.into()),
-                reply_to: None,
-                quote: None,
-                origin: None,
-                received_at_ms: Some(now),
-            },
-        )?;
-        if delivered {
-            crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
-            crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
-        }
-        Ok(delivered)
-    })();
-    match result {
-        Ok(delivered) => delivered,
-        Err(err) => {
-            eprintln!("Schedule {} not consumed: {err}", sched.id);
-            false
-        }
-    }
 }
 
 /// Whether the schedule's previous wake still waits in the owner's mailbox, or

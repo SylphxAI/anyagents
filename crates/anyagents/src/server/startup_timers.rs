@@ -179,7 +179,8 @@ fn rearm_user(
     let now = now_ms();
     let due = sched.next_fire_at_ms.filter(|&due| due > now);
     let fire_at = due.unwrap_or_else(|| catchup_at(backend, last_catchup, now));
-    if let Some(run_id) = backend.restore_one_shot(&sched.id, fire_at)? {
+    let intended_at = sched.next_fire_at_ms.unwrap_or(fire_at);
+    if let Some(run_id) = backend.restore_slot(&sched.id, fire_at, intended_at)? {
         // A cancellation or a callback may have advanced the row while the
         // POST was in flight. Never overwrite a newer slot with this receipt.
         if !store
@@ -280,7 +281,7 @@ mod tests {
     use super::*;
 
     struct GatedBackend {
-        started: mpsc::UnboundedSender<(String, i64)>,
+        started: mpsc::UnboundedSender<(String, i64, i64)>,
         released: Mutex<bool>,
         gate: Condvar,
         in_flight: AtomicUsize,
@@ -310,9 +311,20 @@ mod tests {
         }
 
         fn schedule_one_shot(&self, id: &str, deadline: i64) -> Result<Option<String>, String> {
+            self.restore_slot(id, deadline, deadline)
+        }
+
+        fn restore_slot(
+            &self,
+            id: &str,
+            deadline: i64,
+            intended: i64,
+        ) -> Result<Option<String>, String> {
             let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
-            self.started.send((id.to_owned(), deadline)).unwrap();
+            self.started
+                .send((id.to_owned(), deadline, intended))
+                .unwrap();
             drop(
                 self.gate
                     .wait_while(self.released.lock().unwrap(), |open| !*open)
@@ -376,10 +388,12 @@ mod tests {
         let mut first_batch = HashSet::new();
         let mut seen = HashMap::new();
         for _ in 0..REMOTE_TIMER_CONCURRENCY {
-            let (id, deadline) = tokio::time::timeout(Duration::from_secs(20), observed.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let (id, deadline, intended) =
+                tokio::time::timeout(Duration::from_secs(20), observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(intended, if id == fail { future } else { 1 });
             first_batch.insert(id.clone());
             assert!(seen.insert(id, deadline).is_none());
         }
@@ -389,7 +403,8 @@ mod tests {
         backend.release();
 
         let report = reconcile.await.unwrap().unwrap();
-        while let Ok((id, deadline)) = observed.try_recv() {
+        while let Ok((id, deadline, intended)) = observed.try_recv() {
+            assert_eq!(intended, 1);
             assert!(seen.insert(id, deadline).is_none(), "duplicate startup arm");
         }
         assert_eq!(report.schedules_rearmed, 0);

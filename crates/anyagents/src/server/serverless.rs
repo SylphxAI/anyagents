@@ -1198,7 +1198,10 @@ pub(crate) fn settle_remote_turn_and_deliver(
         now,
         inflight_children,
     );
-    if turn.status == "completed" {
+    if matches!(
+        turn.status.as_str(),
+        "completed" | anyagents_core::stateless::TURN_LIMIT_PAUSED
+    ) {
         super::serverless_maintenance::clear_dispatch_retry_state(store, None, &turn.agent_id);
     }
 
@@ -1255,6 +1258,8 @@ pub(crate) struct GuestEventPayload {
     pub entries: Option<Vec<anyagents_guest::transcript_relay::GuestTranscriptEntry>>,
     #[serde(default)]
     pub result_text: Option<String>,
+    #[serde(default)]
+    pub duration_cap_secs: Option<u64>,
     #[serde(default)]
     pub error_text: Option<String>,
     #[serde(default)]
@@ -1771,6 +1776,18 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+fn duration_pause_summary(turn: &PendingRemoteTurn, cap: Option<u64>) -> Result<String, ApiError> {
+    let cap = cap
+        .filter(|cap| *cap > 0 && turn.harness_kind == "sandbox")
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a duration-cap pause requires a sandbox turn and positive duration_cap_secs",
+            )
+        })?;
+    Ok(format!("paused at the {cap}s single-turn duration cap"))
+}
+
 /// `POST /v1/internal/guest/events`: authenticated detached guest push-callback ingress.
 ///
 /// Verifies per-turn `Authorization: Bearer <callback-token>` via constant-time SHA-256
@@ -1796,12 +1813,17 @@ pub(crate) async fn guest_events_route(
     let timer_for_close = Arc::clone(&state.timer_backend);
     let timer_for_drain = Arc::clone(&state.timer_backend);
     let normalized_event = payload.event_type.trim().to_ascii_lowercase();
-    let is_completed_event = matches!(normalized_event.as_str(), "turn_complete" | "completed");
-    let is_terminal_event = is_completed_event
-        || matches!(
-            normalized_event.as_str(),
-            "turn_failed" | "failed" | "turn_cancelled" | "cancelled" | "canceled"
-        );
+    let is_terminal_event = matches!(
+        normalized_event.as_str(),
+        "turn_complete"
+            | "completed"
+            | "turn_failed"
+            | "failed"
+            | "turn_cancelled"
+            | "cancelled"
+            | "canceled"
+            | anyagents_core::stateless::TURN_LIMIT_PAUSED
+    );
     let (json_resp, settled_agent_id, notified_agent_id, synced_auth_updates) =
         spawn_store(move || {
             let Some(turn) = store
@@ -2004,17 +2026,26 @@ pub(crate) async fn guest_events_route(
                     )?;
                     Ok((resp, None, None, 0usize))
                 }
-                "turn_complete" | "completed" => {
+                "turn_complete" | "completed" | anyagents_core::stateless::TURN_LIMIT_PAUSED => {
+                    let paused = normalized_event == anyagents_core::stateless::TURN_LIMIT_PAUSED;
+                    let pause_summary = paused
+                        .then(|| duration_pause_summary(&turn, payload.duration_cap_secs))
+                        .transpose()?;
                     super::serverless_steer::apply_turn_complete_consumed_steers(
                         &store, &turn, &payload, ts,
                     );
+                    let (status, result_text) = if paused {
+                        (anyagents_core::stateless::TURN_LIMIT_PAUSED, pause_summary)
+                    } else {
+                        ("completed", payload.result_text)
+                    };
                     let inflight = payload.inflight_children.unwrap_or(0).max(0);
                     let settled = settle_remote_turn_and_deliver(
                         &store,
                         &turn.turn_id,
                         SettleRemoteTurn {
-                            status: "completed".to_string(),
-                            result_text: payload.result_text,
+                            status: status.to_owned(),
+                            result_text,
                             error_text: None,
                             usage_json: payload.usage,
                             cursor: None,
@@ -4091,6 +4122,76 @@ done
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Isolate process-wide server settings for the router test.
+    async fn duration_cap_callback_parks_turn_without_reclassifying_crashes_or_emitting_output() {
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let agent = store
+            .create_agent(NewAgent::new("duration-cap-worker", "agy"))
+            .unwrap();
+        store.set_agent_running(&agent.id, "/work").unwrap();
+        let token = generate_callback_token();
+        let ledger = store.remote_turn_store();
+        let create = |id: &str| {
+            ledger
+                .create_turn(&NewRemoteTurn {
+                    turn_id: id.into(),
+                    agent_id: agent.id.clone(),
+                    harness_kind: "sandbox".into(),
+                    provider_kind: Some("http".into()),
+                    remote_run_id: None,
+                    callback_token_hash: hash_callback_token(&token),
+                    cursor: None,
+                    status: "running".into(),
+                    metadata_json: None,
+                    next_poll_at_ms: None,
+                })
+                .unwrap();
+        };
+        let app = super::super::build_public_router(make_app_state(Arc::clone(&store), dir.path()));
+        let event = |body: Value| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/internal/guest/events")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        create("turn_crash");
+        assert_eq!(event(json!({"event_type":"turn_failed", "turn_id":"turn_crash", "error_text":"harness exited"})).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            ledger.get_turn("turn_crash").unwrap().unwrap().status,
+            "failed"
+        );
+        assert!(ledger.latest_failed_for_agent(&agent.id).unwrap().is_some());
+        create("turn_cap");
+        let mut pause = json!({"event_type":"turn_limit_paused", "turn_id":"turn_cap", "result_text":"not an answer"});
+        assert_eq!(
+            event(pause.clone()).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        pause["duration_cap_secs"] = json!(1800);
+        for _ in 0..2 {
+            assert_eq!(event(pause.clone()).await.unwrap().status(), StatusCode::OK);
+        }
+        let paused = ledger.get_turn("turn_cap").unwrap().unwrap();
+        assert!(paused.is_terminal());
+        assert_eq!(paused.status, "turn_limit_paused");
+        assert!(paused.error_text.is_none());
+        assert_eq!(
+            paused.result_text.as_deref(),
+            Some("paused at the 1800s single-turn duration cap")
+        );
+        assert!(ledger.latest_failed_for_agent(&agent.id).unwrap().is_none());
+        assert!(ledger.list_active_for_agent(&agent.id).unwrap().is_empty());
+        assert!(!store.has_open_turn(&agent.id).unwrap());
     }
 
     #[test]

@@ -405,6 +405,7 @@ fn assemble_roster(
         }
     }
     let mut agents = Vec::with_capacity(selected_agents.len());
+    let now = now_ms();
     for &agent in selected_agents {
         let reads_private = caller.is_none_or(|c| c.is_self_or_ancestor(&c.caller.id, agent));
         let mut view = agent_view_preloaded(
@@ -420,6 +421,7 @@ fn assemble_roster(
                 reads_private,
             }),
         )?;
+        view.idle_task_volume_age_ms = idle_task_volume_age_ms(store, agent, &view, now);
         view.secrets = metadata
             .secrets
             .remove(agent.id.as_str())
@@ -434,6 +436,50 @@ fn assemble_roster(
         archived_count,
         gateway: crate::gateway::origin(),
     })
+}
+
+const IDLE_TASK_VOLUME_WARN_AFTER_MS: i64 = 30 * 60 * 1_000;
+
+fn idle_task_volume_age_ms(
+    store: &Store,
+    agent: &Agent,
+    view: &AgentView,
+    now: i64,
+) -> Option<i64> {
+    if view.lifecycle != "task"
+        || !matches!(view.state.as_str(), "running" | "idle")
+        || view.turn_state != "idle"
+        || view.has_open_turn
+        || view.oldest_undelivered_age_ms.is_some()
+        || view.retry_at_ms.is_some()
+        || view.block_reason.is_some()
+        || view.automations.total > 0
+    {
+        return None;
+    }
+    let binding = store.sandbox_binding(&agent.id).ok()??;
+    if binding.volume_id.is_empty() && binding.volume_resource.is_empty() {
+        return None;
+    }
+    let since = match binding.lease_state.as_str() {
+        "ready" => binding.idle_since_ms?,
+        // Releasing compute clears idle_since_ms; the release timestamp is
+        // a conservative lower bound on elapsed idle time in that case.
+        "detached" if binding.lease_id.is_none() => binding.updated_at_ms,
+        _ => return None,
+    };
+    let age = now.saturating_sub(since);
+    if since <= 0 || age <= IDLE_TASK_VOLUME_WARN_AFTER_MS {
+        return None;
+    }
+    // Unlike the roster's live projection, this advisory must also rule out
+    // unresolved ledger turns whose last event is too old to project as live.
+    store
+        .remote_turn_store()
+        .list_active_for_agent(&agent.id)
+        .ok()?
+        .is_empty()
+        .then_some(age)
 }
 
 pub(crate) fn compute_block_reason(
@@ -609,6 +655,7 @@ pub(super) fn archived_agent_view_fast(agent: &Agent) -> AgentView {
     AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
+        idle_task_volume_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name.clone(),
@@ -1029,6 +1076,7 @@ fn agent_view_preloaded(
     Ok(AgentView {
         has_open_turn,
         open_turn_age_ms,
+        idle_task_volume_age_ms: None,
         profile: markers.bound_profile(),
         id: agent.id.to_string(),
         name: agent.name.clone(),

@@ -388,7 +388,9 @@ impl HeartbeatGuard {
             .spawn(move || {
                 let tick = || -> bool {
                     let (sid, st) = phase_bg.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if watchdog.expired_reason(st == "in_turn", &harness).is_some() {
+                    if watchdog.duration_cap().is_some()
+                        || watchdog.silent_failure(st == "in_turn", &harness).is_some()
+                    {
                         return false;
                     }
                     emit_heartbeat(&url, &token, &tid, &aid, &harness, sid, st, 1, &sdir);
@@ -624,6 +626,7 @@ fn execute_turn_foreground(
     );
     let base_turns = adapter.turns_served();
 
+    let cold_resume = harness_name == "agy" && session.is_some();
     let initial_sid = adapter.session_id().or(session);
     watchdog.touch();
     hb_guard.set_phase(initial_sid.clone(), "in_turn");
@@ -638,6 +641,7 @@ fn execute_turn_foreground(
         );
     }
     crate::knowledge_wake::enrich(&mut msg, callback_url, callback_token, &args.turn_id);
+    annotate_harness_resume(&mut msg, cold_resume);
     let delivery_id = msg.id.clone();
 
     let mut delivered_done = false;
@@ -712,6 +716,7 @@ fn execute_turn_foreground(
     let mut sent_text_len = 0usize;
     let mut delta_seq = 0u64;
     let mut err_override: Option<String> = None;
+    let mut duration_cap = None;
     let mut turn_finished_cleanly = delivered_done;
     let mut last_persisted_sid: Option<String> = None;
     let mut last_opencode_delta_poll = Instant::now() - OPENCODE_DELTA_POLL_INTERVAL;
@@ -843,8 +848,12 @@ fn execute_turn_foreground(
                 break;
             }
 
-            if let Some(reason) = watchdog.expired_reason(true, &harness_name) {
+            if let Some(reason) = watchdog.silent_failure(true, &harness_name) {
                 err_override = Some(reason);
+                break;
+            }
+            if let Some(cap) = watchdog.duration_cap() {
+                duration_cap = Some(cap.as_secs());
                 break;
             }
 
@@ -877,7 +886,7 @@ fn execute_turn_foreground(
         .latest_answer(adapter.as_ref(), state_dir)
         .or_else(|| adapter.answer_for(&delivery_id, state_dir));
     let reply_empty = reply_opt.as_deref().is_none_or(|s| s.trim().is_empty());
-    if err_override.is_none() && reply_empty {
+    if duration_cap.is_none() && err_override.is_none() && reply_empty {
         err_override = adapter
             .failure_for_id(&delivery_id)
             .or_else(|| steer_pump.first_failure(adapter.as_ref()))
@@ -947,16 +956,19 @@ fn execute_turn_foreground(
     }
 
     let mut audit_payload = json!({
-        "event_type": "turn_complete",
+        "event_type": if duration_cap.is_some() { "turn_limit_paused" } else { "turn_complete" },
         "turn_id": args.turn_id,
         "agent_id": args.agent_id,
         "harness": harness_name,
         "session_id": sid,
-        "result_text": reply,
+        "result_text": if duration_cap.is_none() { reply } else { None },
         "usage": usage_json(&usage),
         "inflight_children": final_snap.inflight_children,
         "timestamp_ms": now_unix_ms(),
     });
+    if let Some(cap) = duration_cap {
+        audit_payload["duration_cap_secs"] = json!(cap);
+    }
     if !steer_pump.consumed_steers().is_empty()
         && let Some(obj) = audit_payload.as_object_mut()
     {
@@ -979,6 +991,24 @@ fn execute_turn_foreground(
         DEFAULT_MAX_RETRIES,
         CALLBACK_TIMEOUT_SECS,
     )
+}
+
+/// A per-turn process can restart independently of the sandbox and coordinator.
+fn annotate_harness_resume(message: &mut OutboundMessage, cold_resume: bool) {
+    if cold_resume {
+        let context = message
+            .context
+            .org_instructions
+            .get_or_insert_with(String::new);
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str(concat!(
+            "<harness_resume>Resuming a saved conversation in a fresh per-turn harness process. ",
+            "A harness restart notice does not establish that the sandbox or coordinator restarted. ",
+            "Check current fleet task status before assuming work stopped.</harness_resume>"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1627,6 +1657,20 @@ mod tests {
                 ..Default::default()
             },
         };
+        let mut fresh = rich.clone();
+        annotate_harness_resume(&mut fresh, false);
+        assert_eq!(fresh, rich);
+        let mut resumed = rich.clone();
+        resumed.context.org_instructions = Some("Existing instructions".into());
+        annotate_harness_resume(&mut resumed, true);
+        assert_eq!(resumed.id, rich.id);
+        assert_eq!(resumed.text, rich.text);
+        let opener =
+            anyagents_harness::compose_message(&resumed.id, &resumed.context, &resumed.text);
+        assert!(opener.contains("Existing instructions"));
+        assert!(opener.contains("fresh per-turn harness process"));
+        assert!(opener.contains("does not establish that the sandbox or coordinator restarted"));
+
         let encoded = anyagents_harness::encode_outbound_message_b64(&rich).unwrap();
         let msg_path =
             materialize_b64_message_file(dir.path(), "turn_abc", &encoded).expect("message file");
@@ -1863,12 +1907,12 @@ mod tests {
         // Active touches keep the watchdog alive.
         std::thread::sleep(Duration::from_millis(50));
         wd.touch();
-        assert!(wd.expired_reason(true, "agy").is_none());
+        assert!(wd.silent_failure(true, "agy").is_none());
 
         // Now go completely silent past silent_timeout while guard is STILL alive.
         std::thread::sleep(Duration::from_millis(180));
         let reason = wd
-            .expired_reason(true, "agy")
+            .silent_failure(true, "agy")
             .expect("silent deadlock must trip watchdog");
         assert!(reason.contains("deadlock watchdog"), "{reason}");
 
@@ -1891,10 +1935,8 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(60));
         max_wd.touch();
-        let max_reason = max_wd
-            .expired_reason(true, "agy")
-            .expect("max turn duration must trip even with fresh touches");
-        assert!(max_reason.contains("max turn duration"), "{max_reason}");
+        assert_eq!(max_wd.duration_cap(), Some(Duration::from_millis(40)));
+        assert!(max_wd.silent_failure(true, "agy").is_none());
     }
 
     #[test]
@@ -1961,7 +2003,7 @@ mod tests {
             );
             wd.touch();
             assert!(
-                wd.expired_reason(true, "agy").is_none(),
+                wd.silent_failure(true, "agy").is_none(),
                 "healthy tool-calling progress at step {step} must keep watchdog alive"
             );
         }
@@ -1983,7 +2025,7 @@ mod tests {
             }
         }
         let reason = wd
-            .expired_reason(true, "agy")
+            .silent_failure(true, "agy")
             .expect("truly silent deadlock must still expire watchdog");
         assert!(reason.contains("deadlock watchdog"), "{reason}");
     }

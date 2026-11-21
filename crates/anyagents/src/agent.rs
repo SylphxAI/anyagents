@@ -931,6 +931,7 @@ fn offline_agent_view(
     Ok(AgentView {
         has_open_turn: false,
         open_turn_age_ms: None,
+        idle_task_volume_age_ms: None,
         profile: None,
         id: agent.id.to_string(),
         name: agent.name,
