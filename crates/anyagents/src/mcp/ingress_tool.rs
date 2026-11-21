@@ -1,14 +1,27 @@
 //! Schema projection only: decode and execute the canonical request on the server.
 
 use agent_ingress::IngressGuardToolRequest;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer};
+use std::borrow::Cow;
 
 use super::AgentMcp;
 
-#[derive(JsonSchema)]
-#[serde(transparent)]
-pub(super) struct Args(#[schemars(with = "RequestSchema")] IngressGuardToolRequest);
+pub(super) struct Args(IngressGuardToolRequest);
+
+impl JsonSchema for Args {
+    fn schema_name() -> Cow<'static, str> {
+        "IngressGuardArgs".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        // The internally tagged request derives a top-level oneOf. MCP also
+        // requires an explicit root object type; keep the variant constraints.
+        let mut schema = RequestSchema::json_schema(generator);
+        schema.insert("type".into(), "object".into());
+        schema
+    }
+}
 
 impl<'de> Deserialize<'de> for Args {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

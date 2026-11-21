@@ -391,6 +391,43 @@ fn http_mcp_serves_only_universal_tools_and_blocks_host_tools() {
         let (status, list) = post_mcp_as(&state, &cap, None, tools_list()).await.unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listed_tools(&list), crate::mcp::UNIVERSAL_MCP_TOOLS);
+        let ingress = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "ingress_guard")
+            .expect("ingress_guard must be advertised");
+        assert_eq!(ingress["inputSchema"]["type"], "object");
+        assert_eq!(ingress["inputSchema"]["oneOf"].as_array().unwrap().len(), 3);
+
+        let target = serde_json::json!({
+            "channel": "telegram",
+            "scope": {"kind": "sender", "sender_id": "87901"}
+        });
+        let block = serde_json::json!({"op": "block_sender", "target": target});
+        let list = serde_json::json!({"op": "list_blocks"});
+        let unblock = serde_json::json!({"op": "unblock_sender", "target": target});
+        let mut forged = block.clone();
+        forged["relationship"] = serde_json::json!("stranger");
+        let (_, refused) = post_mcp_as(&state, &cap, None, tool_call("ingress_guard", forged))
+            .await
+            .unwrap();
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        for (args, result, field, expected) in [
+            (list.clone(), "blocks", "/rules", serde_json::json!([])),
+            (block, "blocked", "/rule/target", target.clone()),
+            (list.clone(), "blocks", "/rules/0/target", target),
+            (unblock, "unblocked", "/removed", serde_json::json!(true)),
+            (list, "blocks", "/rules", serde_json::json!([])),
+        ] {
+            let (status, reply) = post_mcp_as(&state, &cap, None, tool_call("ingress_guard", args))
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            let receipt = &reply["result"]["structuredContent"];
+            assert_eq!(receipt["result"], result, "{reply}");
+            assert_eq!(receipt.pointer(field), Some(&expected), "{reply}");
+        }
 
         let exec = serde_json::json!({
             "action": "exec",
