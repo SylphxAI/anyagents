@@ -59,12 +59,6 @@ impl BrowserMcpServer {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) async fn wait_for_detached_end(&self) {
-        let _operation = self.operations.lock().await;
-        self.session.wait_for_detached_end().await;
-    }
-
-    #[cfg(target_os = "linux")]
     pub(crate) fn start_client_monitor(&self, attached: Arc<AtomicBool>) {
         let server = self.clone();
         tokio::spawn(async move {
@@ -80,16 +74,9 @@ impl BrowserMcpServer {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) async fn finish_client(&self) -> bool {
+    pub(crate) async fn detached_desktop(&self) -> crate::takeover::DetachedDesktop {
         let _operation = self.operations.lock().await;
-        let end = self.session.wait_for_detached_end();
-        tokio::pin!(end);
-        if futures_util::poll!(&mut end).is_ready() {
-            let _ = self.session.close().await;
-            false
-        } else {
-            true
-        }
+        self.session.detached_desktop().await
     }
 
     /// Inspect all registered MCP tool definitions (useful in tests and introspection).
@@ -811,7 +798,7 @@ impl BrowserMcpServer {
     }
 
     #[tool(
-        description = "Check takeover status (`status`), reclaim control (`release`), or stop takeover cleanly (`stop`).",
+        description = "Check takeover status (`status`), revoke the viewer and keep Chromium live (`release`), or end takeover and close the private Wayland browser (`stop`).",
         annotations(read_only_hint = false, open_world_hint = false)
     )]
     pub async fn browser_takeover_status(

@@ -17,11 +17,14 @@ use rmcp::ServiceExt;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::{BrowserMcpServer, signals::terminate_signal};
+use crate::{BrowserMcpServer, signals::terminate_signal, takeover::DetachedDesktop};
 
 pub const DIR_ARG: &str = "--guest-runtime-dir";
 pub const WORKER_ARG: &str = "--guest-runtime-worker";
 const STARTUP: Duration = Duration::from_secs(10);
+/// Leave time for the Coordinator to wake an idle agent after hand-back,
+/// without indefinitely keeping an unused browser in the guest.
+const RECLAIM: Duration = Duration::from_secs(120);
 const READY: u8 = 1;
 
 struct RuntimeDir {
@@ -261,18 +264,32 @@ async fn drive(
     let startup = tokio::time::sleep(STARTUP);
     tokio::pin!(startup);
     let mut first = true;
+    let mut reclaim = None;
+    let mut reap = tokio::time::interval(Duration::from_secs(1));
+    reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let (mut peer, _) = tokio::select! {
             biased;
             _ = &mut signal => return Ok(()),
             _ = &mut startup, if first => return Ok(()),
-            _ = server.wait_for_detached_end(), if !first => return Ok(()),
+            _ = reap.tick(), if !first => {
+                if !retain_detached(server.detached_desktop().await, &mut reclaim, tokio::time::Instant::now()) {
+                    return Ok(());
+                }
+                continue;
+            }
+            _ = async {
+                if let Some(deadline) = reclaim {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if reclaim.is_some() => return Ok(()),
             peer = listener.accept() => peer?,
         };
         if dir.check_peer(&peer).is_err() || peer.write_u8(READY).await.is_err() {
             continue;
         }
         first = false;
+        reclaim = None;
         let (client, attached) = server.attach_client();
         server.start_client_monitor(attached.clone());
         // Keep the relay alive through detach/finalization even after rmcp
@@ -294,12 +311,27 @@ async fn drive(
             server.shutdown().await;
             return Ok(());
         }
-        // Poll once under the operation lock. Ready means EOF ended custody;
-        // Pending after the lock barrier means there is a retained takeover.
-        if !server.finish_client().await {
+        if !retain_detached(
+            server.detached_desktop().await,
+            &mut reclaim,
+            tokio::time::Instant::now(),
+        ) {
+            server.shutdown().await;
             return Ok(());
         }
         drop(guard);
+    }
+}
+
+fn retain_detached(
+    desktop: DetachedDesktop,
+    reclaim: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    match desktop {
+        DetachedDesktop::None => false,
+        DetachedDesktop::Viewing => true,
+        DetachedDesktop::Reclaimable => now < *reclaim.get_or_insert(now + RECLAIM),
     }
 }
 
@@ -317,5 +349,44 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FlushOnly<W> {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_flush(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_reclaim_window_starts_once_and_expires() {
+        let start = tokio::time::Instant::now();
+        let mut deadline = None;
+        assert!(retain_detached(
+            DetachedDesktop::Viewing,
+            &mut deadline,
+            start
+        ));
+        assert!(deadline.is_none());
+        assert!(retain_detached(
+            DetachedDesktop::Reclaimable,
+            &mut deadline,
+            start
+        ));
+        let before = start + RECLAIM - Duration::from_millis(1);
+        assert!(retain_detached(
+            DetachedDesktop::Reclaimable,
+            &mut deadline,
+            before
+        ));
+        assert_eq!(deadline, Some(start + RECLAIM));
+        assert!(!retain_detached(
+            DetachedDesktop::Reclaimable,
+            &mut deadline,
+            start + RECLAIM
+        ));
+        assert!(!retain_detached(
+            DetachedDesktop::None,
+            &mut deadline,
+            start
+        ));
     }
 }
