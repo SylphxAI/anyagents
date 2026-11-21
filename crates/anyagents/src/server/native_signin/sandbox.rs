@@ -276,8 +276,7 @@ async fn keepalive<T>(output: &Output, text: &'static str, work: impl Future<Out
         tokio::select! {
             result = &mut work => return result,
             _ = tick.tick() => {
-                // Never block the actual operation on an unread stream. The
-                // console retains 60 events; the session deadline bounds ticks.
+                // Never block the actual operation on an unread stream.
                 if let Ok(line) = serde_json::to_string(&super::SignInLine { kind: "progress", text: text.into() }) {
                     let _ = output.try_send(line);
                 }
@@ -559,6 +558,7 @@ impl Transcript {
         let candidates = extract_urls(&clean, hyperlinks);
         // Prefer the full OSC-8 href; the printed label may wrap in the PTY.
         let before_input = self.manual || self.callback.is_some();
+        let mut claude_short_link = false;
         for candidate in candidates {
             let Ok(link) = Url::parse(candidate) else {
                 continue;
@@ -587,13 +587,25 @@ impl Transcript {
             }) {
                 continue;
             }
+            // Current Claude Code prints a base64url request handle instead of
+            // OAuth parameters. Only accept it at the two Claude authorize routes.
+            let short_link = spec.harness == "claude-code"
+                && matches!(host, "claude.ai" | "claude.com")
+                && matches!(link.path(), "/oauth/authorize" | "/cai/oauth/authorize")
+                && candidate.split_once('?').is_some_and(|(_, query)| {
+                    query.len() == 43
+                        && query
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                });
             if spec.harness == "codex" {
                 if link.path() != "/codex/device" || link.query().is_some() {
                     continue;
                 }
-            } else if !["client_id", "redirect_uri", "state", "response_type"]
-                .into_iter()
-                .all(|key| params.get(key).is_some_and(|v| !v.is_empty()))
+            } else if !short_link
+                && !["client_id", "redirect_uri", "state", "response_type"]
+                    .into_iter()
+                    .all(|key| params.get(key).is_some_and(|v| !v.is_empty()))
             {
                 continue;
             }
@@ -613,6 +625,7 @@ impl Transcript {
             }
             send(output, "link", link.as_str()).await;
             self.links.push(link);
+            claude_short_link |= short_link;
         }
         if spec.harness == "codex"
             && !self.code
@@ -627,7 +640,9 @@ impl Transcript {
         }
         if !self.links.is_empty() && !self.manual && spec.harness != "codex" {
             let lower = clean.to_ascii_lowercase();
-            self.manual = lower.contains("paste code here") || lower.contains("authorization code");
+            self.manual = claude_short_link
+                || lower.contains("paste code here")
+                || lower.contains("authorization code");
             if self.manual && self.callback.is_none() {
                 send(
                     output,

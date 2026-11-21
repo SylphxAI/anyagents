@@ -31,6 +31,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   const [provider, setProvider] = createSignal<string>(OAUTH_PROVIDERS.find(option => option.provider === props.initial.provider)?.provider ?? OAUTH_PROVIDERS[0].provider);
   const [phase, setPhaseRaw] = createSignal<Phase>('choose');
   const [events, setEvents] = createSignal<SignInEvent[]>([]);
+  const [status, setStatus] = createSignal('');
   const [session, setSession] = createSignal('');
   const [error, setError] = createSignal('');
   const [label, setLabel] = createSignal('');
@@ -46,7 +47,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   async function start() {
     if (controller) return;
     const run = new AbortController(); controller = run;
-    setEvents([]); setError(''); setSession(''); setInputWanted(false); setPaste(''); setPasteState({}); setPhase('running');
+    setEvents([]); setStatus(''); setError(''); setSession(''); setInputWanted(false); setPaste(''); setPasteState({}); setPhase('running');
     try {
       const login = hint();
       const response = await request('/v1/profiles/native-signin', { method: 'POST', signal: run.signal, accept: 'application/x-ndjson',
@@ -55,7 +56,11 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
         if (run.signal.aborted) return;
         if (event.kind === 'session') { setSession(event.text ?? ''); return; }
         if (event.kind === 'input') { setInputWanted(true); return; }
-        setEvents(previous => [...previous, event].slice(-60));
+        if (event.kind === 'progress' && event.text) setStatus(event.text);
+        // Keepalives and other non-actionable updates must not displace a sign-in step.
+        if (event.kind === 'link' || event.kind === 'code' || event.kind === 'prompt') {
+          setEvents(previous => [...previous, event].slice(-60));
+        }
       });
       if (!run.signal.aborted) { setLabel(connected); setPhase('done'); refreshProfiles(true); }
     } catch (cause) {
@@ -102,11 +107,11 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
       <Show when={phase() !== 'choose'}>
         <div class="connect-steps" aria-live="polite">
           <div class="connect-provider"><span class="strong">{option().name}</span><Show when={hint()}><span class="subtle mono">{hint()}</span></Show>
-            <Show when={phase() === 'running'}><span class="connect-status"><LoaderCircle size={14} class="spin" aria-hidden="true" />Waiting for the provider</span></Show></div>
+            <Show when={phase() === 'running'}><span class="connect-status"><LoaderCircle size={14} class="spin" aria-hidden="true" />{status() || (link() ? 'Waiting for the provider' : 'Preparing an isolated sign-in…')}</span></Show></div>
           <ol class="steps">
             <li class={link() ? 'done' : 'current'}>
               <div class="step-title">Open the sign-in page</div>
-              <Show when={link()} fallback={<div class="subtle">{phase() === 'running' ? 'Preparing an isolated sign-in…' : 'The provider did not return a sign-in link.'}</div>}>
+              <Show when={link()} fallback={<Show when={phase() === 'failed'}><div class="subtle">The provider did not return a sign-in link.</div></Show>}>
                 <div class="link-box">
                   <a class="btn primary sm" href={link()} target="_blank" rel="noopener noreferrer"><ArrowUpRight size={13} />Open sign-in page</a>
                   <CopyButton value={link()!} label="Copy link" text />

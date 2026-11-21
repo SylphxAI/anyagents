@@ -6,7 +6,7 @@
   "license": "MIT",
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types --no-warnings=ExperimentalWarning \"src/lib/*.test.ts\"",
+    "test": "node --test --experimental-strip-types --no-warnings=ExperimentalWarning \"src/lib/*.test.ts\" && vitest run --environment happy-dom src/accounts/ConnectDialog.test.tsx",
     "build": "npm run check && npm test && vite build",
     "preview": "node dev/mock-server.mjs"
   },
@@ -16,9 +16,11 @@
   },
   "devDependencies": {
     "@types/node": "22.19.1",
+    "happy-dom": "20.14.6",
     "tailwindcss": "4.3.2",
     "typescript": "5.9.3",
     "vite": "6.4.6",
-    "vite-plugin-solid": "2.11.17"
+    "vite-plugin-solid": "2.11.17",
+    "vitest": "3.2.7"
   }
 }

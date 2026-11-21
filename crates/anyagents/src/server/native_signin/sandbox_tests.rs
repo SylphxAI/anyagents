@@ -235,3 +235,190 @@ config.mkdir()
     assert!(!homes[1].0.exists());
     assert!(!Path::new(&homes[1].1).exists());
 }
+
+// Captured PTY prompt shapes with inert OAuth values in place of session data.
+const CLAUDE_REQUEST: &str =
+    "https://claude.ai/oauth/authorize?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi012345-_";
+const AGY_REQUEST: &str = "https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=fixture&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=fixture";
+const AGY_MENU: &str = " Select login method:\r\n > 1. Google OAuth\n\x1b[4G2. Use a Google Cloud project\n\n\x1b[4G\x1b[1m↑/↓\x1b[m Navigate · \x1b[1menter\x1b[m Select";
+
+fn agy_browser_step() -> String {
+    // Like the real TUI, split the visible URL across rows and leave the full
+    // href in each OSC-8. The href (not a fragment of the label) must be emitted.
+    format!(
+        "\x1b[8;2HYour browser should open automatically. If not:\x1b[K\n\n\x1b[2G\x1b[4m\x1b]8;id=fixture;{AGY_REQUEST}\x07https://accounts.google.com/o/oauth2/auth?access_type=offline\x1b[m\x1b]8;;\x07\r\n \x1b[4m\x1b]8;id=fixture;{AGY_REQUEST}\x07&client_id=fixture\x1b[m\x1b]8;;\x07\r\n"
+    )
+}
+
+fn drain_steps(lines: &mut mpsc::Receiver<String>) -> Vec<(String, String)> {
+    std::iter::from_fn(|| lines.try_recv().ok())
+        .map(|line| {
+            let step: serde_json::Value = serde_json::from_str(&line).unwrap();
+            (
+                step["kind"].as_str().unwrap().to_owned(),
+                step["text"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn current_native_pty_transcripts_emit_actionable_steps() {
+    let (output, mut lines) = mpsc::channel(16);
+    let claude = Spec::for_harness("claude-code").unwrap();
+    let mut transcript = Transcript::default();
+    let prefix = format!(
+        "Opening browser to sign in…\r\nIf the browser didn't open, visit:\r\n\x1b]8;;{CLAUDE_REQUEST}"
+    );
+    transcript.update(&claude, &prefix, &output).await;
+    assert!(drain_steps(&mut lines).is_empty(), "partial OSC-8");
+    let raw = format!("{prefix}\x07{CLAUDE_REQUEST}\x1b]8;;\x07\r\nPaste code here if prompted > ");
+    transcript.update(&claude, &raw, &output).await;
+    assert_eq!(
+        drain_steps(&mut lines),
+        [
+            ("link".into(), CLAUDE_REQUEST.into()),
+            (
+                "prompt".into(),
+                "Finish signing in in your browser, then paste the authorization code below."
+                    .into()
+            ),
+            ("input".into(), String::new()),
+        ]
+    );
+    assert!(matches!(
+        transcript.relay("fixture-code"),
+        Ok(Relay::Terminal { .. })
+    ));
+    transcript.update(&claude, &raw, &output).await;
+    assert!(drain_steps(&mut lines).is_empty());
+
+    let agy = Spec::for_harness("agy").unwrap();
+    let mut transcript = Transcript::default();
+    transcript.update(&agy, AGY_MENU, &output).await;
+    assert!(drain_steps(&mut lines).is_empty());
+    transcript
+        .update(&agy, &format!("{AGY_MENU}{}", agy_browser_step()), &output)
+        .await;
+    assert_eq!(
+        drain_steps(&mut lines),
+        [
+            ("link".into(), AGY_REQUEST.into()),
+            ("input".into(), String::new())
+        ]
+    );
+
+    let codex = Spec::for_harness("codex").unwrap();
+    let mut transcript = Transcript::default();
+    transcript.update(&codex, "  1. Open this link in your browser and sign in to your account\r\n     https://auth.openai.com/codex/device\r\n\r\n  2. Enter this one-time code (expires in 15 minutes)\r\n     U81Q-J76WZ\r\n", &output).await;
+    assert_eq!(
+        drain_steps(&mut lines),
+        [
+            ("link".into(), "https://auth.openai.com/codex/device".into()),
+            ("code".into(), "U81Q-J76WZ".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn short_oauth_query_is_only_accepted_at_claude_authorize_routes() {
+    let (output, mut lines) = mpsc::channel(16);
+    let claude = Spec::for_harness("claude-code").unwrap();
+    let token = CLAUDE_REQUEST.split_once('?').unwrap().1;
+    for url in [
+        format!("https://claude.ai/not-authorize?{token}"),
+        format!("https://claude.ai.example.test/oauth/authorize?{token}"),
+        format!("https://platform.claude.com/oauth/authorize?{token}"),
+        format!("https://claude.ai/oauth/authorize?{token}#fragment"),
+        format!("https://claude.ai/oauth/authorize?{token}&state=fixture"),
+        format!("https://claude.ai/oauth/authorize?code={}", &token[5..]),
+        format!("https://claude.ai/oauth/authorize?{}%2F", &token[3..]),
+        format!("https://claude.ai/oauth/authorize?{}", &token[1..]),
+        "https://claude.ai/oauth/authorize?".to_owned(),
+        "https://claude.ai/oauth/authorize?state".to_owned(),
+    ] {
+        let mut transcript = Transcript::default();
+        transcript
+            .update(
+                &claude,
+                &format!("{url}\r\nPaste code here if prompted > "),
+                &output,
+            )
+            .await;
+        assert!(drain_steps(&mut lines).is_empty(), "accepted {url}");
+        assert!(transcript.relay("fixture-code").is_err());
+    }
+    let mut transcript = Transcript::default();
+    let url = format!("https://claude.com/cai/oauth/authorize?{token}");
+    transcript
+        .update(
+            &claude,
+            &format!("\x1b]8;;{url}\x1b\\Open browser\x1b]8;;\x1b\\"),
+            &output,
+        )
+        .await;
+    let steps = drain_steps(&mut lines);
+    assert_eq!(steps[0], ("link".into(), url));
+    assert_eq!(steps.last().unwrap().0, "input");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn agy_pty_supervisor_selects_google_once_with_ansi_and_wrapping() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("agy-fixture");
+    // Use a raw PTY so the fixture can check the exact key and detect repeats.
+    let script = format!(
+        r#"#!/usr/bin/python3
+import os, select, time, tty
+from pathlib import Path
+tty.setraw(0)
+os.write(1, {first})
+time.sleep(0.05)
+os.write(1, {second})
+assert select.select([0], [], [], 2)[0], 'no Enter received'
+assert os.read(0, 32) == b'\r'
+os.write(1, {browser})
+assert not select.select([0], [], [], 0.2)[0], 'Enter was sent twice'
+artifact = Path('.gemini/antigravity-cli/antigravity-oauth-token')
+artifact.parent.mkdir(parents=True)
+artifact.write_text('{{"access_token":"fixture"}}')
+"#,
+        first = python_bytes(b" Select\x1b[1m login\x1b[0m\r\n\x1b[4Gmethod:\r\n > 1. Go"),
+        second = python_bytes(
+            b"\x1b[32mogle\x1b[0m\r\n\x1b[4GOAuth\r\n\x1b[4G2. Use a Google Cloud project\n"
+        ),
+        browser = python_bytes(agy_browser_step().as_bytes()),
+    );
+    std::fs::write(&binary, script).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let provider: Arc<dyn SandboxProvider> = Arc::new(LocalHostProvider::with_root(root.path()));
+    let (output, mut lines) = mpsc::channel(16);
+    let (_input, requests) = mpsc::channel(1);
+    timeout(
+        Duration::from_secs(10),
+        collect(
+            &provider,
+            EnsureSandboxRequest::for_agent(SLOT),
+            &Spec::for_harness("agy").unwrap(),
+            SANDBOX_PYTHON,
+            binary.to_str(),
+            &output,
+            requests,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(drain_steps(&mut lines).contains(&("link".into(), AGY_REQUEST.into())));
+}
+
+#[cfg(target_os = "linux")]
+fn python_bytes(bytes: &[u8]) -> String {
+    format!(
+        "bytes.fromhex('{}')",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
