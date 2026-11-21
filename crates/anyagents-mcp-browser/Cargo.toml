@@ -11,7 +11,7 @@ name = "anyagents-mcp-browser"
 path = "src/main.rs"
 
 [dependencies]
-agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "ec5247570c2cf786ee40ef49de46eea5ae553a7f" }
+agent-workstation = { git = "https://github.com/SylphxAI/agent-workstation", rev = "d6b69342ea192a736495f9a3c1eb9b593381f640" }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
