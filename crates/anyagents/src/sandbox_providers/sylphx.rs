@@ -875,8 +875,7 @@ impl SylphxSandboxClient {
     pub fn create_lease_with_options(
         &self,
         parent: &str,
-        volume_resource: &str,
-        mount_path: &str,
+        volume_mount: Option<(&str, &str)>,
         image: Option<&str>,
         template: Option<&str>,
         shape: &str,
@@ -898,15 +897,12 @@ impl SylphxSandboxClient {
         if !env.is_empty() {
             spec.insert("env".into(), serde_json::json!(env));
         }
-        spec.insert(
-            "volumes".into(),
-            serde_json::json!([
-                {
-                    "volume": volume_resource,
-                    "mount_path": mount_path,
-                }
-            ]),
-        );
+        if let Some((volume, mount_path)) = volume_mount {
+            spec.insert(
+                "volumes".into(),
+                serde_json::json!([{ "volume": volume, "mount_path": mount_path }]),
+            );
+        }
         if let Some(policy) = network {
             spec.insert("network".into(), sylphx_network_json(policy));
         }
@@ -930,7 +926,7 @@ impl SylphxSandboxClient {
                         .get("code")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|c| c.eq_ignore_ascii_case("NO_CAPACITY")));
-            if retryable_capacity && attempt < MAX_CAPACITY_RETRIES {
+            if volume_mount.is_some() && retryable_capacity && attempt < MAX_CAPACITY_RETRIES {
                 attempt += 1;
                 let retry_ms = val
                     .get("retry_after_ms")
@@ -947,7 +943,10 @@ impl SylphxSandboxClient {
         };
         if !(200..300).contains(&status) {
             return Err(format!(
-                "Sylphx POST {url} returned HTTP {status}: {}",
+                "Sylphx POST {url} returned HTTP {status}: {}{}",
+                val.get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(String::new(), |code| format!("{code}: ")),
                 compact_error_body(&val)
             ));
         }
@@ -1251,8 +1250,7 @@ impl SylphxSandboxClient {
             None => {
                 let created = self.create_lease_with_options(
                     &provider.parent,
-                    &vol.resource_name,
-                    &provider.mount_path,
+                    Some((&vol.resource_name, &provider.mount_path)),
                     image.as_deref(),
                     Some(&provider.template),
                     &provider.shape,
@@ -2457,7 +2455,7 @@ fn parse_envd_event(val: &serde_json::Value) -> Option<EnvdProcessEvent> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -2465,7 +2463,7 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn spawn_mock_http<F>(handler: F) -> (String, std::thread::JoinHandle<()>)
+    pub(crate) fn spawn_mock_http<F>(handler: F) -> (String, std::thread::JoinHandle<()>)
     where
         F: Fn(&str, &str, &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
     {
@@ -2984,8 +2982,10 @@ mod tests {
         let lease = client
             .create_lease_with_options(
                 "orgs/o1/projects/p1/envs/e1",
-                "orgs/o1/projects/p1/envs/e1/volumes/vol_1",
-                "/home/user/agent-data",
+                Some((
+                    "orgs/o1/projects/p1/envs/e1/volumes/vol_1",
+                    "/home/user/agent-data",
+                )),
                 Some("registry.example.com/agent@sha256:abc"),
                 None,
                 "linux-m",

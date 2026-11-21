@@ -3,12 +3,12 @@ import { ArrowUpRight, CircleCheck, KeyRound, LoaderCircle, LogIn } from 'lucide
 import { api, errorMessage, request } from '../api';
 import { safeLink } from '../format';
 import { OAUTH_PROVIDERS, providerName } from '../lib/providers';
+import { readSignInStream, type SignInEvent } from '../lib/signin-stream';
 import { useConsole } from '../state';
 import type { ConnectRequest } from '../state';
 import { CopyButton, Dialog, Field, Problem, Tabs, formText } from '../ui/primitives';
 
 const KEY_PRESETS = ['deepseek', 'glm-code-plan', 'google-gemini', 'kimi-code-plan', 'minimax-code-plan', 'openrouter', 'qwen-token-plan', 'sylphx'];
-type Event = { kind: string; text?: string };
 type Phase = 'choose' | 'running' | 'done' | 'failed';
 
 export function ConnectDialog(props: { request: ConnectRequest; close: () => void }) {
@@ -30,7 +30,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
   const { refreshProfiles } = useConsole();
   const [provider, setProvider] = createSignal<string>(OAUTH_PROVIDERS.find(option => option.provider === props.initial.provider)?.provider ?? OAUTH_PROVIDERS[0].provider);
   const [phase, setPhaseRaw] = createSignal<Phase>('choose');
-  const [events, setEvents] = createSignal<Event[]>([]);
+  const [events, setEvents] = createSignal<SignInEvent[]>([]);
   const [session, setSession] = createSignal('');
   const [error, setError] = createSignal('');
   const [label, setLabel] = createSignal('');
@@ -47,32 +47,17 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
     if (controller) return;
     const run = new AbortController(); controller = run;
     setEvents([]); setError(''); setSession(''); setInputWanted(false); setPaste(''); setPasteState({}); setPhase('running');
-    let terminal = false;
-    const handle = (line: string) => {
-      if (!line.trim() || run.signal.aborted) return;
-      let event: Event;
-      try { event = JSON.parse(line) as Event; } catch { event = { kind: 'prompt', text: line }; }
-      if (event.kind === 'session') { setSession(event.text ?? ''); return; }
-      if (event.kind === 'input') { setInputWanted(true); return; }
-      if (event.kind === 'done') { terminal = true; setLabel(event.text ?? ''); setPhase('done'); refreshProfiles(true); return; }
-      if (event.kind === 'error') { terminal = true; setError(event.text || 'Sign-in failed.'); setPhase('failed'); return; }
-      setEvents(previous => [...previous, event].slice(-60));
-    };
     try {
       const login = hint();
       const response = await request('/v1/profiles/native-signin', { method: 'POST', signal: run.signal, accept: 'application/x-ndjson',
         body: { harness: option().harness, ...(login ? { login_hint: login } : {}) } });
-      if (!response.body) throw new Error('The sign-in stream is unavailable.');
-      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-      let tail = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const lines = (tail + value).split('\n'); tail = lines.pop() ?? '';
-        lines.forEach(handle);
-      }
-      handle(tail);
-      if (!terminal && !run.signal.aborted) throw new Error('The sign-in stream ended before the provider confirmed the account.');
+      const connected = await readSignInStream(response.body, event => {
+        if (run.signal.aborted) return;
+        if (event.kind === 'session') { setSession(event.text ?? ''); return; }
+        if (event.kind === 'input') { setInputWanted(true); return; }
+        setEvents(previous => [...previous, event].slice(-60));
+      });
+      if (!run.signal.aborted) { setLabel(connected); setPhase('done'); refreshProfiles(true); }
     } catch (cause) {
       if (!run.signal.aborted) { setError(errorMessage(cause)); setPhase('failed'); }
     } finally { if (controller === run) controller = null; }
@@ -133,7 +118,7 @@ function OAuthFlow(props: { initial: ConnectRequest; close: () => void; setBusy:
               <div class="step-title">Enter this device code</div>
               <div class="device-code"><span class="mono">{code()}</span><CopyButton value={code()!} label="Copy code" text /></div>
             </li></Show>
-            <Show when={inputWanted()}><li class={pasteState().ok ? 'done' : 'current'}>
+            <Show when={phase() === 'running' && inputWanted()}><li class={pasteState().ok ? 'done' : 'current'}>
               <div class="step-title">Paste the callback URL or authorization code</div>
               <p class="subtle small">After approving access, copy the address your browser lands on (or the code shown) and paste it here.</p>
               <form class="paste-row" onSubmit={submitPaste}>

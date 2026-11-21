@@ -183,10 +183,8 @@ config.mkdir()
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
         assert_eq!(requests[0].agent_id, "anyagents-native-signin");
-        assert_eq!(
-            requests[0].volume.as_ref().unwrap().id_or_name,
-            "anyagents-native-signin"
-        );
+        assert!(requests[0].volume.is_none());
+        assert!(requests[0].existing.is_none());
         assert_eq!(requests[0].lease.ttl_duration_string(), "600s");
     }
     let homes: Vec<_> = {

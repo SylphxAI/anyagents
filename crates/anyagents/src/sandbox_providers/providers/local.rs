@@ -87,6 +87,7 @@ impl SandboxProvider for LocalHostProvider {
             .map(|v| sanitize_name(&v.id_or_name))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("anyagents-{agent_slug}"));
+        let persistent = req.volume.is_some();
         let explicit_workdir = req.workdir.clone();
         let existing_handle = req.existing.clone();
 
@@ -125,7 +126,7 @@ impl SandboxProvider for LocalHostProvider {
             Ok(SandboxHandle {
                 provider: ProviderKind::Local,
                 sandbox_id: format!("local-{agent_slug}"),
-                volume_id: Some(mount_dir.display().to_string()),
+                volume_id: persistent.then(|| mount_dir.display().to_string()),
                 mount_path: mount_dir.display().to_string(),
                 state_dir: state_dir.display().to_string(),
                 workdir: workdir.display().to_string(),

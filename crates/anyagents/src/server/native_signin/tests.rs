@@ -97,3 +97,67 @@ async fn http_stream_is_private_operator_only_and_relays_only_to_the_active_sess
         .unwrap();
     assert_eq!(gone.status(), StatusCode::GONE);
 }
+
+#[tokio::test]
+async fn scratch_sign_in_surfaces_capacity_failure_without_retrying_or_allocating_a_volume() {
+    use crate::sandbox_providers::providers::{
+        EnsureSandboxRequest, SandboxProvider, SylphxConfig, SylphxProvider,
+    };
+    use crate::sandbox_providers::sylphx::tests::spawn_mock_http;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&calls);
+    let (endpoint, _server) = spawn_mock_http(move |method, path, body| {
+        let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        observed
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), path.to_owned(), body));
+        (
+            503,
+            vec![("Content-Type".into(), "application/json".into())],
+            serde_json::to_vec(&json!({
+                "code": "NO_CAPACITY",
+                "message": "compute unavailable at https://example.invalid/private?token=fixture",
+                "retryable": true,
+                "retry_after_ms": 5000,
+            }))
+            .unwrap(),
+        )
+    });
+    let mut config = SylphxConfig::new("orgs/o1/projects/p1/envs/e1");
+    config.endpoint = endpoint;
+    config.default_volume_size_gib = Some(40);
+    let provider: Arc<dyn SandboxProvider> = Arc::new(SylphxProvider::new(config).unwrap());
+    let response = start_session(state(dir.path()), |_, _, _, _| async move {
+        sandbox::ensure(&provider, EnsureSandboxRequest::for_agent("signin-fixture")).await?;
+        panic!("capacity rejection must not start login");
+    })
+    .unwrap();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("a capacity rejection must terminate the stream before the retry timer")
+    .unwrap()
+    .to_bytes();
+    let lines: Vec<Value> = std::str::from_utf8(&body)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["kind"], "session");
+    assert_eq!(
+        lines[1],
+        json!({"kind":"error","text":"Could not prepare sandbox: HTTP 503: NO_CAPACITY: compute unavailable at [endpoint]"})
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "POST");
+    assert_eq!(calls[0].1, "/v1/orgs/o1/projects/p1/envs/e1/leases");
+    assert_eq!(calls[0].2["spec"]["ttl"], "600s");
+    assert!(calls[0].2["spec"].get("volumes").is_none());
+}

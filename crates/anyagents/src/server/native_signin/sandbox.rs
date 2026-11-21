@@ -123,6 +123,11 @@ pub(super) async fn run(
     {
         return Err("This sandbox provider does not support private callback input. Use a provider with native stdin transport for this sign-in.".into());
     }
+    // Other adapters currently synthesize a volume even if none was requested.
+    // Refuse rather than falling back to a persistent sign-in workspace.
+    if !matches!(provider.kind(), ProviderKind::Local | ProviderKind::Sylphx) {
+        return Err("This sandbox provider does not support volume-free native sign-in.".into());
+    }
     let (python, local_binary) = if provider.kind() == ProviderKind::Local {
         (local_tool("python3")?, Some(local_tool(spec.binary)?))
     } else {
@@ -152,11 +157,10 @@ pub(super) async fn run(
 }
 
 fn session_request(mut request: EnsureSandboxRequest) -> EnsureSandboxRequest {
-    if let Some(volume) = &mut request.volume {
-        volume.id_or_name = SLOT.into();
-    }
-    // The remote lease expires on the provider, including when the coordinator
-    // goes away. A new ensure reattaches and renews the lease for this volume.
+    request.volume = None;
+    request.existing = None;
+    request.workdir = None;
+    // The lease expires even if the coordinator dies during sign-in.
     request.lease = LeasePolicy {
         idle_ttl_ms: 600_000,
         max_lease_ttl_ms: 600_000,
@@ -173,12 +177,16 @@ async fn collect(
     output: &Output,
     input: mpsc::Receiver<Input>,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    let handle = progress(
+    let handle = keepalive(
         output,
         "Waiting for the sign-in sandbox…",
         ensure(provider, request),
     )
-    .await??;
+    .await?;
+    if output.is_closed() {
+        release_scratch(provider, &handle).await;
+        return Err(CANCELLED.into());
+    }
     let runner = Runner {
         provider: provider.as_ref(),
         handle: &handle,
@@ -206,12 +214,31 @@ async fn collect(
         Err(err) => Err(err),
     };
     let cleanup = runner.cleanup().await;
+    release_scratch(provider, &handle).await;
     let files = result?;
     cleanup?;
     Ok(files)
 }
 
-async fn ensure(
+async fn release_scratch(provider: &Arc<dyn SandboxProvider>, handle: &SandboxHandle) {
+    // Local work is already scoped by a TempDir. On the remote provider, the
+    // safety TTL backs up release without delaying diagnostics indefinitely.
+    if provider.kind() == ProviderKind::Local {
+        return;
+    }
+    match timeout(Duration::from_secs(5), provider.release(handle)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!(
+            "native sign-in: release scratch lease: {}",
+            diagnostic(&err)
+        ),
+        Err(_) => {
+            eprintln!("native sign-in: scratch lease release timed out; provider TTL applies")
+        }
+    }
+}
+
+pub(super) async fn ensure(
     provider: &Arc<dyn SandboxProvider>,
     request: EnsureSandboxRequest,
 ) -> Result<SandboxHandle, String> {
@@ -219,7 +246,14 @@ async fn ensure(
     timeout(ENSURE_TIMEOUT, provider.ensure(&request))
         .await
         .map_err(|err| report("prepare sandbox (90-second deadline)", &err.to_string()))?
-        .map_err(|err| report("prepare sandbox", &err))
+        .map_err(|err| {
+            let detail = diagnostic(&err);
+            eprintln!("native sign-in: prepare sandbox: {detail}");
+            let Some((_, status)) = detail.split_once(" returned HTTP ") else {
+                return "Could not prepare sandbox. Check the sign-in runtime and coordinator logs, then retry.".into();
+            };
+            format!("Could not prepare sandbox: HTTP {status}")
+        })
 }
 
 async fn progress<T>(
@@ -262,8 +296,8 @@ fn local_tool(name: &str) -> Result<String, String> {
         .ok_or_else(|| "The sign-in executable must have an absolute UTF-8 path.".into())
 }
 
-// Provider text is for operator logs, not the HTTP stream. Strip URL
-// credentials/query strings in addition to the shared credential masker.
+// Strip endpoint URLs in addition to the shared credential masker. Only the
+// provisioning HTTP status and its sanitized message are shown in the stream.
 fn diagnostic(error: &str) -> String {
     let sanitized = mask_known_secrets(error);
     let detail = sanitized
@@ -326,7 +360,7 @@ impl Runner<'_> {
         let result = timeout(
             Duration::from_millis(ms + 1000),
             self.provider
-                .exec(self.handle, &request.with_timeout_ms(ms)),
+                .exec(self.handle, &request.with_cwd("/tmp").with_timeout_ms(ms)),
         )
         .await
         .map_err(|err| report(operation, &err.to_string()))?
