@@ -78,20 +78,42 @@ pub(crate) async fn acquire_pg(pool: &PgPool) -> Result<PoolConnection<Postgres>
     if timed_out || elapsed > SLOW_ACQUIRE {
         let size = pool.size();
         let idle = pool.num_idle();
+        let (idle, active) = checkout_counts(size, idle);
         eprintln!(
-            "WARN postgres_pool_checkout elapsed_ms={} pool_size={size} idle_connections={idle} active_connections={} max_connections={} timed_out={timed_out}",
+            "WARN postgres_pool_checkout elapsed_ms={} pool_size={size} idle_connections={idle} active_connections={active} max_connections={} timed_out={timed_out}",
             elapsed.as_millis(),
-            (size as usize).saturating_sub(idle),
             pool.options().get_max_connections(),
         );
     }
     result
 }
 
+fn checkout_counts(size: u32, idle: usize) -> (String, String) {
+    // SQLx samples size and idle independently. A checkout can even race a
+    // return between its permit release and idle-counter increment. Don't
+    // report a wrapped idle count or infer activity from an invalid sample.
+    (size as usize).checked_sub(idle).map_or_else(
+        || ("unknown".into(), "unknown".into()),
+        |active| (idle.to_string(), active.to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::TEST_POSTGRES_URL_ENV;
+
+    #[test]
+    fn checkout_counts_reject_inconsistent_samples() {
+        assert_eq!(checkout_counts(4, 1), ("1".into(), "3".into()));
+        assert_eq!(checkout_counts(4, 0), ("0".into(), "4".into()));
+        for idle in [5, usize::MAX] {
+            assert_eq!(
+                checkout_counts(4, idle),
+                ("unknown".into(), "unknown".into())
+            );
+        }
+    }
 
     #[test]
     fn pg_pool_defaults_leave_headroom_and_bound_waiting() {
