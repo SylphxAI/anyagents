@@ -3050,9 +3050,21 @@ mod tests {
             .unwrap();
         store.set_agent_running(&owner.id, "/work").unwrap();
         store.set_agent_state(&owner.id, "paused").unwrap();
-        let due = 60_000;
-        let interval = 3_600_000; // timer_schedule's every interval.
-        timer_schedule(&store, &owner.id, "every", "1h", Some(due));
+        // Start on the production jittered phase and use the persisted due time
+        // as the test clock's origin. A synthetic due time predating creation
+        // can be rephased once its next slot is past the creation timestamp.
+        let schedule = create_agent_schedule(
+            &store,
+            &HealthBoard::default(),
+            &owner,
+            None,
+            Some("1h"),
+            None,
+            "resume recurring timer",
+        )
+        .unwrap();
+        let due = schedule.next_fire_at_ms.unwrap();
+        let interval = 3_600_000;
         drop(store);
 
         let resumed = due + interval * 10_000_000_000 + 123;
