@@ -49,7 +49,13 @@ export function App() {
   const [signoutError, setSignoutError] = createSignal('');
 
   onMount(() => {
-    const onHash = () => { setRoute(parseRoute()); setDrawer(false); };
+    const onHash = () => {
+      setRoute(parseRoute());
+      setDrawer(false);
+      setConnect(undefined);
+      setAction(undefined);
+      setPalette(false);
+    };
     const onExpired = () => setExpired(true);
     const onKey = (event: KeyboardEvent) => {
       if (document.querySelector('dialog[open]')) return;

@@ -2,6 +2,7 @@ import { For, Match, Show, Switch, createMemo, createSignal } from 'solid-js';
 import { BookOpen, FileText, History, Pin, Plus, ShieldCheck } from 'lucide-solid';
 import { HttpError, api, createPoll, errorMessage } from '../api';
 import { ago, dateTime } from '../format';
+import { useConsole } from '../state';
 import { Empty, Field, FormDialog, PageHeader, Pill, Problem, SearchField, Section, Skeleton, Tabs, formText } from '../ui/primitives';
 import { Markdown } from '../ui/Markdown';
 import { GrantAccessDialog } from './GrantAccessDialog';
@@ -186,6 +187,8 @@ function Proposals(props: { namespaces: string[]; refresh: () => void }) {
 }
 
 function Grants() {
+  const { fleet } = useConsole();
+  const agentNames = createMemo(() => new Map(fleet().agents.map(agent => [agent.id, agent.name])));
   const grants = createPoll(signal => knowledge<{ grants: Grant[] }>({ action: 'grants', limit: 100 }, signal));
   const [error, setError] = createSignal('');
   const [grantOpen, setGrantOpen] = createSignal(false);
@@ -201,7 +204,9 @@ function Grants() {
       <div class="table-wrap"><table class="table">
         <thead><tr><th>Agent</th><th>Namespace pattern</th><th>Mode</th><th>Granted by</th><th>Granted</th><th class="right"><span class="sr-only">Actions</span></th></tr></thead>
         <tbody><For each={data().grants}>{grant => <tr>
-          <td class="mono">{grant.agent_id}</td><td class="mono strong">{grant.namespace_pattern}</td>
+          <td><Show when={agentNames().get(grant.agent_id)} fallback={<span class="mono">{grant.agent_id}</span>}>{name => <>
+            <div class="strong">{name()}</div><div class="mono subtle small">{grant.agent_id}</div>
+          </>}</Show></td><td class="mono strong">{grant.namespace_pattern}</td>
           <td><Pill tone={grant.mode === 'write' ? 'warn' : 'neutral'}>{grant.mode}</Pill></td>
           <td class="mono subtle">{grant.granted_by}</td><td class="num subtle">{dateTime(grant.granted_at_ms)}</td>
           <td class="right"><button type="button" class="btn sm ghost" onClick={async () => {
