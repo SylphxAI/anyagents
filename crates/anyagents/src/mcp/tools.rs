@@ -1142,7 +1142,7 @@ impl AgentMcp {
     pub(super) async fn archive(
         &self,
         Parameters(args): Parameters<ArchiveArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<AgentView>, String> {
+    ) -> Result<rmcp::handler::server::wrapper::Json<crate::api::ArchiveResponse>, String> {
         let target = args
             .agent
             .as_deref()

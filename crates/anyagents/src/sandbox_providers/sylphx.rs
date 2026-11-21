@@ -1986,10 +1986,13 @@ pub fn destroy_sandbox_for_config_dir(config_dir: &Path) -> Result<(), String> {
     if let Some(cfg) = SylphxLeaseConfig::from_config_dir(config_dir) {
         let client = cfg.client();
         if let Some(lease_ref) = cfg.lease_resource.as_deref().or(cfg.lease_id.as_deref()) {
-            let _ = client.release_lease(&cfg.parent, lease_ref);
+            client.release_lease(&cfg.parent, lease_ref)?;
         }
-        if !cfg.volume_resource.trim().is_empty() {
-            client.delete_volume(&cfg.parent, &cfg.volume_resource)?;
+        if let Some(volume) = [&cfg.volume_resource, &cfg.volume_id]
+            .into_iter()
+            .find(|v| !v.trim().is_empty())
+        {
+            client.delete_volume(&cfg.parent, volume)?;
         }
         let _ = std::fs::remove_file(config_dir.join(SYLPHX_STATE_FILE));
         let _ = std::fs::remove_file(config_dir.join("sandbox.json"));

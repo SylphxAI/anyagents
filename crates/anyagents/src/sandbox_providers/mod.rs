@@ -6,6 +6,7 @@
 use std::path::Path;
 
 pub(crate) mod image_version;
+pub(crate) mod lifecycle;
 pub mod providers;
 pub mod sylphx;
 

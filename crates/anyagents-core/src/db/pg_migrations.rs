@@ -44,4 +44,8 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         14,
         include_str!("../../migrations_pg/014_sandbox_targets.sql"),
     ),
+    (
+        15,
+        include_str!("../../migrations_pg/015_archive_disposition.sql"),
+    ),
 ];

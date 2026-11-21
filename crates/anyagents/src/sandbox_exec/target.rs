@@ -173,37 +173,15 @@ pub(super) fn verify_provider_target(
     Ok(())
 }
 
-pub(crate) fn destroy_sandbox_for_agent(
-    store: &Store,
-    id: &AgentId,
-    config: &Path,
-) -> Result<(), String> {
-    let binding = store.sandbox_binding(id).map_err(|e| e.to_string())?;
-    if let Some(binding) = binding.as_ref()
-        && binding_spec_value(binding)
-            .get("credential_target")
-            .is_some()
-    {
-        let registry = resolve_registry_for_binding(store, binding)?;
-        let handle = sandbox_handle_from_binding(binding).ok_or("invalid sandbox lease binding")?;
-        block_on_provider(registry.active().destroy(&handle))?;
-        store
-            .sandbox_binding_store()
-            .delete(id)
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
+pub(crate) fn validate_legacy_cleanup_target(store: &Store, id: &AgentId) -> Result<(), String> {
     if store
         .sandbox_credential_ref(id)
         .map_err(|e| e.to_string())?
-        .is_none()
+        .is_some()
     {
-        crate::sandbox_providers::destroy_sandbox_for_config_dir(config)?;
-    } else if binding.is_some()
-        || config.join("sandbox-sylphx.json").exists()
-        || config.join("sandbox.json").exists()
-    {
-        return Err("restore the original sandbox target before deleting its resources".into());
+        return Err(
+            "restore the original sandbox target before deleting its legacy resources".into(),
+        );
     }
     Ok(())
 }

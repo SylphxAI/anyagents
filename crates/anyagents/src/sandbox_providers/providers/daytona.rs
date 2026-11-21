@@ -378,15 +378,17 @@ impl SandboxProvider for DaytonaProvider {
         let sandbox_id = handle.sandbox_id.clone();
         let volume_id = handle.volume_id.clone();
         run_blocking(move || {
-            let sbx_url = format!(
-                "{api_url}/sandbox/{}",
-                url_encode_query_component(&sandbox_id)
-            );
-            let (status, val) = http_call_json("DELETE", &sbx_url, &headers, None, 30_000)?;
-            if status != 404 && !(200..300).contains(&status) {
-                return Err(format!(
-                    "Daytona delete sandbox `{sbx_url}` returned HTTP {status}: {val}"
-                ));
+            if !sandbox_id.trim().is_empty() {
+                let sbx_url = format!(
+                    "{api_url}/sandbox/{}",
+                    url_encode_query_component(&sandbox_id)
+                );
+                let (status, val) = http_call_json("DELETE", &sbx_url, &headers, None, 30_000)?;
+                if status != 404 && !(200..300).contains(&status) {
+                    return Err(format!(
+                        "Daytona delete sandbox `{sbx_url}` returned HTTP {status}: {val}"
+                    ));
+                }
             }
             if let Some(vol) = volume_id.filter(|s| !s.trim().is_empty()) {
                 let vol_url = format!("{api_url}/volumes/{}", url_encode_query_component(&vol));

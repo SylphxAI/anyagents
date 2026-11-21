@@ -99,6 +99,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (46, include_str!("../migrations/047_ingress_blocks.sql")),
     (47, include_str!("../migrations/048_sandbox_targets.sql")),
+    (
+        48,
+        include_str!("../migrations/049_archive_disposition.sql"),
+    ),
 ];
 
 /// The version that moves the mailbox search index out of the state

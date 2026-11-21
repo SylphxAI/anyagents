@@ -10,9 +10,10 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 
-use crate::api::AgentView;
+use crate::api::{AgentView, ArchiveResponse, RemoteVolumeReap, VerdictResponse};
 use crate::auth::Principal;
 use crate::create;
+use crate::sandbox_providers::lifecycle::{archive_volume, delete_volume};
 
 use super::agents_roster::{
     Markers, PROFILE_ROTATED, agent_view, compute_block_reason, persisted_fault,
@@ -199,7 +200,7 @@ pub(super) async fn archive_agent_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
-) -> Result<Json<AgentView>, ApiError> {
+) -> Result<Json<ArchiveResponse>, ApiError> {
     spawn_store(move || {
         let clean_name = name.trim().strip_prefix("agent:").unwrap_or(name.trim());
         let found = if clean_name.eq_ignore_ascii_case("self")
@@ -227,19 +228,30 @@ pub(super) async fn archive_agent_route(
             .store
             .lock_agent_lifecycle(&found.id)
             .map_err(ApiError::from_store)?;
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
         let prev_schedules = state
             .store
             .list_schedules(Some(&found.id), true)
-            .unwrap_or_default();
-        let prev_turns = state
-            .store
-            .remote_turn_store()
-            .list_active_for_agent(&found.id)
             .unwrap_or_default();
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        // Read before marking/cancelling the remote turns, but after closing
+        // admission to new sandbox turns.
+        let remote_guard = state.store.try_lock_agent(&agent.id).ok();
+        let prev_turns = state
+            .store
+            .remote_turn_store()
+            .list_active_for_agent(&found.id);
+        let can_probe = found.state != "archived"
+            && remote_guard.is_some()
+            && prev_turns.as_ref().is_ok_and(Vec::is_empty)
+            && state
+                .health
+                .get(&agent.id)
+                .is_none_or(|live| !live.process_alive)
+            && matches!(state.store.has_open_turn(&agent.id), Ok(false));
         for sched in &prev_schedules {
             crate::timer::cancel_schedule_timer(state.timer_backend.as_ref(), sched);
         }
@@ -247,10 +259,13 @@ pub(super) async fn archive_agent_route(
             &state.store,
             state.timer_backend.as_ref(),
             &found.id,
-            &prev_turns,
+            &prev_turns.unwrap_or_default(),
         );
-        finish_agent_archive_locked(&state, &agent, is_self)?;
-        Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+        let volume = finish_agent_archive_locked(&state, &agent, is_self, can_probe, remote_guard)?;
+        Ok(Json(ArchiveResponse {
+            agent: agent_view(&state.store, &state.health, &agent)?,
+            volume,
+        }))
     })
     .await
 }
@@ -269,7 +284,7 @@ pub(super) async fn verdict_route(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Json(body): Json<VerdictRequest>,
-) -> Result<Json<anyagents_core::Outcome>, ApiError> {
+) -> Result<Json<VerdictResponse>, ApiError> {
     let dispatch_store = Arc::clone(&state.store);
     let dispatch_timer = Arc::clone(&state.timer_backend);
     let (outcome, rework_id) = spawn_store(move || {
@@ -300,6 +315,7 @@ pub(super) async fn verdict_route(
             .apply_verdict(actor, &target.id, kind, body.reason, prof)
             .map_err(ApiError::from_store)?;
         let mut rework_id = None;
+        let mut volume = None;
         if let Some(agent) = changed {
             if agent.state == "archived" {
                 for sched in &prev_schedules {
@@ -311,13 +327,13 @@ pub(super) async fn verdict_route(
                     &target.id,
                     &prev_turns,
                 );
-                finish_agent_archive_locked(&state, &agent, false)?;
+                volume = finish_agent_archive_locked(&state, &agent, false, false, None)?;
             } else {
                 clear_explicitly_archived(s.data_dir(), &agent.id);
                 rework_id = Some(agent.id);
             }
         }
-        Ok((outcome, rework_id))
+        Ok((VerdictResponse { outcome, volume }, rework_id))
     })
     .await?;
     if serverless::is_serverless_mode()
@@ -344,14 +360,15 @@ fn finish_agent_archive_locked(
     state: &AppState,
     agent: &Agent,
     is_self: bool,
-) -> Result<(), ApiError> {
+    can_probe: bool,
+    remote_guard: Option<anyagents_core::AgentLock>,
+) -> Result<Option<RemoteVolumeReap>, ApiError> {
+    // Probe while the lease is live. Do not use a cancelled turn record as
+    // proof of quiescence: its guest process may still be winding down.
+    let volume = archive_volume(&state.store, agent, can_probe);
+    drop(remote_guard);
     mark_explicitly_archived_locked(&state.store, state.store.data_dir(), agent)
         .map_err(ApiError::from_store)?;
-    let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
-    if let Err(err) = crate::sandbox_exec::release_sandbox_for_agent(&state.store, &agent.id, &cfg)
-    {
-        eprintln!("anyagents-sandbox: archive release failed: {err}");
-    }
     let mut process_guard = None;
     if !is_self {
         let deadline = std::time::Instant::now() + anyagents_harness::STOP_DEADLINE;
@@ -385,7 +402,7 @@ fn finish_agent_archive_locked(
         );
     }
     drop(process_guard);
-    Ok(())
+    Ok(volume)
 }
 
 #[cfg(test)]
@@ -993,8 +1010,14 @@ pub(super) async fn delete_agent_route(
         let data_dir = state.store.data_dir();
         let config = agent_dir.join("config");
         let seat_ids = detect_seat_ids(&config);
-        crate::sandbox_exec::destroy_sandbox_for_agent(&state.store, &found.id, &config)
-            .map_err(|err| ApiError::new(StatusCode::CONFLICT, err))?;
+        let volume = delete_volume(&state.store, &found);
+        if let Some(volume) = volume.as_ref().filter(|receipt| !receipt.remote_volume_reaped) {
+            return Ok(Json(serde_json::json!({
+                "id": found.id, "name": found.name, "deleted": false,
+                "remote_volume_reaped": false,
+                "remote_volume_reap_reason": volume.remote_volume_reap_reason,
+            })));
+        }
 
         reap_subagent_ephemeral_dirs_in(&state.store, data_dir, &found.id);
         remove_agent_identity_files(data_dir, &found, &agent_dir, seat_ids);
@@ -1012,11 +1035,16 @@ pub(super) async fn delete_agent_route(
             remove_path_with_seat_under(data_dir, &agent_dir, seat_ids);
             let _ = std::fs::remove_dir_all(&agent_dir);
         }
-        Ok(Json(serde_json::json!({
+        let mut response = serde_json::json!({
             "id": deleted.id.as_str(),
             "name": deleted.name,
             "deleted": true,
-        })))
+        });
+        if let Some(volume) = volume {
+            response["remote_volume_reaped"] = serde_json::Value::Bool(volume.remote_volume_reaped);
+            response["remote_volume_reap_reason"] = volume.remote_volume_reap_reason.into();
+        }
+        Ok(Json(response))
     })
     .await
 }

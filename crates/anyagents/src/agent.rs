@@ -2,13 +2,16 @@
 //! the server owns when the boundary is in place, and through the store on a
 //! single-user machine.
 
+pub(crate) mod archive;
 pub(crate) mod presentation;
 
 use std::path::Path;
 
 use anyagents_core::{Agent, AgentId, Error, Store};
 
-use crate::api::{AgentView, AgentsResponse, GroupActionRequest, GroupView, GroupsResponse};
+use crate::api::{
+    AgentView, AgentsResponse, ArchiveResponse, GroupActionRequest, GroupView, GroupsResponse,
+};
 use crate::client;
 use crate::server;
 
@@ -76,14 +79,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 println!("{}\t{}", view.id, view.name);
             }
         }
-        AgentsCommand::Archive { name } => {
-            let view = set_state(data, &name, "archived")?;
-            if crate::ui::is_pretty() {
-                presentation::lifecycle("Archived", &view);
-            } else {
-                println!("{}\t{}\t{}", view.id, view.name, view.state);
-            }
-        }
+        AgentsCommand::Archive { name } => archive_cmd(data, Some(name))?,
         AgentsCommand::Pause { name } => {
             let view = set_state(data, &name, "paused")?;
             if crate::ui::is_pretty() {
@@ -673,11 +669,20 @@ pub fn archive_cmd(data: &Path, name: Option<String>) -> Result<(), Error> {
             .map(|id| id.to_string())
             .ok_or_else(|| Error::Message("archive needs an agent name or id".into()))?,
     };
-    let view = set_state(data, &target, "archived")?;
+    let ArchiveResponse {
+        agent: view,
+        volume,
+    } = archive::archive(data, &target)?;
     if crate::ui::is_pretty() {
         presentation::lifecycle("Archived", &view);
     } else {
         println!("{}\t{}\t{}", view.id, view.name, view.state);
+    }
+    if let Some(volume) = volume {
+        eprintln!(
+            "remote_volume_reaped: {} ({})",
+            volume.remote_volume_reaped, volume.remote_volume_reap_reason
+        );
     }
     Ok(())
 }
@@ -709,6 +714,12 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
         )
         .map_err(Error::Message)?;
         if let Some(val) = answered {
+            if val["deleted"] == false {
+                return Err(Error::Message(format!(
+                    "agent retained: {}",
+                    val["remote_volume_reap_reason"]
+                )));
+            }
             let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("-");
             let deleted_name = val.get("name").and_then(|v| v.as_str()).unwrap_or(name);
             if crate::ui::is_pretty() {
@@ -724,6 +735,13 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
+    store.set_agent_state(&found.id, "archived")?;
+    let _process = store.try_lock_agent(&found.id)?;
+    if let Some(volume) = crate::sandbox_providers::lifecycle::delete_volume(&store, &found)
+        .filter(|v| !v.remote_volume_reaped)
+    {
+        return Err(Error::Message(volume.remote_volume_reap_reason));
+    }
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);
@@ -833,11 +851,7 @@ pub fn peers_with_options(
 }
 
 fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
-    let verb = match state {
-        "archived" => "archive",
-        "paused" => "pause",
-        _ => "wake",
-    };
+    let verb = if state == "paused" { "pause" } else { "wake" };
     if client::can_call_server(data) {
         let answered = client::call::<AgentView>(
             data,
@@ -891,17 +905,6 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let agent = store.set_agent_state(&found.id, state)?;
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
-    } else if state == "archived" {
-        let archived = server::mark_explicitly_archived_locked(&store, data, &agent)?;
-        // The offline path has no daemon maintenance worker. Keep the parent's
-        // lifecycle lock, taking descendant locks only downward as above.
-        for id in archived {
-            if id == agent.id {
-                server::reap_archived_agent_locked(&store, data, &id);
-            } else if let Ok(_child_lifecycle) = store.try_lock_agent_lifecycle(&id) {
-                server::reap_archived_agent_locked(&store, data, &id);
-            }
-        }
     }
     offline_agent_view(&store, data, agent)
 }

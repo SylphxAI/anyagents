@@ -381,7 +381,9 @@ impl SandboxProvider for DockerProvider {
 
     async fn destroy(&self, handle: &SandboxHandle) -> Result<(), String> {
         let this = self.clone();
-        let container = handle.sandbox_id.clone();
+        if !handle.sandbox_id.trim().is_empty() {
+            self.release(handle).await?;
+        }
         let volume_id = handle.volume_id.clone();
         let is_bind = handle
             .metadata
@@ -390,7 +392,6 @@ impl SandboxProvider for DockerProvider {
             || volume_id.as_deref().is_some_and(|v| v.starts_with('/'));
 
         run_blocking(move || {
-            let _ = this.build_cmd()?.args(["rm", "-f", &container]).output();
             if !is_bind && let Some(vol) = volume_id.filter(|s| !s.trim().is_empty()) {
                 let out = this
                     .build_cmd()?
