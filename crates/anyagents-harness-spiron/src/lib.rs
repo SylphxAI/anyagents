@@ -14,6 +14,7 @@ pub mod cloud;
 mod cloud_api;
 #[cfg(test)]
 mod cloud_tests;
+pub mod inference_key;
 mod startup_stderr;
 mod stdio;
 

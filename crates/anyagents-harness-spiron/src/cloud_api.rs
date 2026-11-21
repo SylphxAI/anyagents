@@ -80,8 +80,17 @@ pub(crate) fn ptr_micros(val: &Value, micros: &[&str], usd: &[&str]) -> Option<u
 }
 
 pub(crate) fn resolve_base_url(dir: &Path) -> String {
-    let json_url = read_cloud_json(dir)
-        .and_then(|v| ptr_str(&v, &["/base_url", "/endpoint"]).map(str::to_string));
+    configured_base_url()
+        .or_else(|| {
+            read_cloud_json(dir)
+                .and_then(|v| ptr_str(&v, &["/base_url", "/endpoint"]).map(str::to_string))
+        })
+        .unwrap_or_else(|| DEFAULT_SPIRON_CLOUD_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub(crate) fn configured_base_url() -> Option<String> {
     [
         "ANYAGENTS_SPIRON_CLOUD_URL",
         "SPIRON_API_URL",
@@ -89,11 +98,7 @@ pub(crate) fn resolve_base_url(dir: &Path) -> String {
     ]
     .into_iter()
     .find_map(env_trimmed)
-    .or(json_url)
-    .unwrap_or_else(|| DEFAULT_SPIRON_CLOUD_URL.to_string())
-    .trim()
-    .trim_end_matches('/')
-    .to_string()
+    .map(|url| url.trim_end_matches('/').to_string())
 }
 
 pub(crate) fn resolve_disabled_tools(dir: &Path) -> Vec<String> {

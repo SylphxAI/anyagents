@@ -37,6 +37,15 @@ AnyAgents never runs an internal LLM loop. Every agent is a pure composition of 
   - `cloud`: Vendor-hosted cloud agent driven directly in-process via the ADR 0010 D7 `RemoteSessionProvider` / `RemoteSessionHarness` contract (`create`, `deliver`/`steer`, `events`, `interrupt`, `stop`, `budget`) — such as `SpironCloudProvider` (`spiron@cloud` at `https://api.spiron.ai`) — or via stateless serverless `CloudTurnDriver` (`SpironServerlessDriver`, `GenericHttpCloudDriver`). Remote sessions spawn zero local child processes, keepers, or legacy `cloud-harness` stdio shims, enforce coordination-only MCP callback tokens, and support per-agent micro-USD spend caps (`remote_budget_micros`).
 - **Profile (`profiles/<provider>/<profile>`):** Which upstream subscription or API key authenticates (`anthropic`, `openai`, `google-antigravity`, `muse`, `openrouter`, `sylphx`, Coding Plans). Profile-to-harness resolution is strictly **fail-closed**: if a bound profile has no mapping for the target harness (for example, binding an OAuth-only subscription profile to `opencode` without an OpenCode provider/auth/key mapping), AnyAgents refuses configuration rather than writing an empty config that silently degrades to an external free tier.
 
+For `spiron@cloud`, an operator can grant an encrypted deployment secret with
+`SPIRON_CLOUD_BYOK_KEY` to a single agent, or set
+`ANYAGENTS_SPIRON_CLOUD_BYOK_KEY` on the Coordinator as a shared default. A grant
+takes precedence. Keep the separate Spiron API bearer configured. The
+Coordinator sends the inference key only to the configured Spiron origin, and
+will not send a message unless Spiron confirms setup. Removing the local setting
+does not clear a key already installed on the remote agent; rotate it with a new
+key or revoke it at its issuer.
+
 System prompt rendering (`write_agent_instructions_with_continuity`) injects a minimal, persona-neutral identity and routing envelope (`arXiv:2611.05306`, `arXiv:2611.03931`) so each sub-agent starts with an unpolluted short context window while tool schemas carry API parameter details.
 
 ## AnyAgents owns the state

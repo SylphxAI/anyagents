@@ -11,6 +11,8 @@ use anyagents_harness::{
     RemoteSessionConfig, TurnUsage, decompose_harness_selector, normalize_harness_name,
     resolve_stored_budget_micros,
 };
+use anyagents_harness_spiron::cloud::operator_cloud_url;
+use anyagents_harness_spiron::inference_key::InferenceKey;
 use anyagents_harness_spiron::{SpironCloudConfig, SpironCloudHarness, SpironCloudProvider};
 use anyagents_keeper::Hosted;
 
@@ -145,6 +147,7 @@ pub fn start_remote_session(
     model: Option<&str>,
     session: Option<&str>,
     remote_budget_micros: Option<u64>,
+    inference_key: Option<InferenceKey>,
     env: &[(String, String)],
 ) -> Result<RemoteSessionAdapter, String> {
     let canonical_harness = decompose_harness_selector(harness)
@@ -187,6 +190,12 @@ pub fn start_remote_session(
         ],
     ) {
         spiron_cfg = spiron_cfg.with_api_token(api_token);
+    }
+    if let Some(key) = inference_key {
+        if spiron_cfg.base_url != operator_cloud_url() {
+            return Err("Spiron inference key requires the coordinator's configured origin".into());
+        }
+        spiron_cfg = spiron_cfg.with_inference_key(key);
     }
     let allow_loopback_mcp = env_is_truthy(env, "ANYAGENTS_ALLOW_LOOPBACK_MCP")
         || std::env::var("ANYAGENTS_ALLOW_LOOPBACK_MCP")
@@ -485,6 +494,7 @@ mod tests {
             Some("openai/gpt-5.4"),
             None,
             Some(1_000_000),
+            None,
             &env,
         )
         .expect("start spiron remote session");
@@ -697,6 +707,7 @@ mod tests {
             Some("z-ai/glm-5.3-flash"),
             None,
             Some(500_000),
+            None,
             &env,
         )
         .expect("start turn 1 session");
@@ -737,6 +748,7 @@ mod tests {
             Some("z-ai/glm-5.3-flash"),
             Some(resume_id.trim()),
             Some(500_000),
+            None,
             &env,
         )
         .expect("restart session on persisted remote agent_id");
@@ -778,9 +790,17 @@ mod tests {
             "cursor",
             "cursor-cloud",
         ] {
-            let Err(err) =
-                start_remote_session(harness, dir.path(), "agt_x", "w", None, None, None, &[])
-            else {
+            let Err(err) = start_remote_session(
+                harness,
+                dir.path(),
+                "agt_x",
+                "w",
+                None,
+                None,
+                None,
+                None,
+                &[],
+            ) else {
                 panic!("expected fail-closed error for `{harness}`");
             };
             assert!(

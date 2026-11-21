@@ -33,9 +33,7 @@ use crate::sandbox_exec::{resolve_registry_for_binding, sandbox_handle_from_bind
 use crate::sandbox_providers::providers::{
     ExecRequest, ProviderKind, SandboxHandle, SandboxProvider as AsyncSandboxProvider,
 };
-use crate::serverless_cloud::{
-    CloudSteerAck, CloudTurnSteerRequest, resolve_cloud_driver_from_metadata,
-};
+use crate::serverless_cloud::{CloudSteerAck, CloudTurnSteerRequest, resolve_cloud_message_driver};
 
 use super::serverless::{GuestEventPayload, is_serverless_cloud_harness, resolve_public_url};
 use super::types::ApiError;
@@ -378,11 +376,14 @@ async fn steer_active_cloud_turn(
             reason: "cloud turn has no remote_run_id yet".to_string(),
         };
     };
-    let driver = match resolve_cloud_driver_from_metadata(
+    let driver = match resolve_cloud_message_driver(
+        Arc::clone(&store),
+        agent.id.clone(),
         &active_turn.harness_kind,
         active_turn.metadata_json.as_ref(),
-        None,
-    ) {
+    )
+    .await
+    {
         Ok(d) => d,
         Err(reason) => return SteerPushOutcome::Refused { reason },
     };

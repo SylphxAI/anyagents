@@ -585,7 +585,10 @@ pub(crate) fn resolve_agent_secret_env_for_sandbox(
     }
     Ok(resolved
         .into_iter()
-        .filter(|(k, _)| !anyagents_core::is_reserved_secret_env_key(k))
+        .filter(|(k, _)| {
+            !anyagents_core::is_reserved_secret_env_key(k)
+                && !anyagents_harness_spiron::inference_key::is_env_key(k)
+        })
         .collect())
 }
 
