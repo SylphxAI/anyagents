@@ -314,10 +314,12 @@ dependencies = [
  "clap",
  "libc",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

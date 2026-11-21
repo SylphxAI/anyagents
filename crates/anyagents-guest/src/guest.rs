@@ -655,7 +655,7 @@ pub(crate) fn run_serve_io<R: BufRead + Send + 'static, W: Write>(
         .and_then(|c| c.repo_spec.clone())
         .or_else(|| load_repo_spec(&state_dir));
     if let Some(spec) = repo_spec {
-        ensure_repo_checked_out(&work_dir, &spec, args.git_program.as_deref())?;
+        ensure_repo_checked_out(&work_dir, &state_dir, &spec, args.git_program.as_deref())?;
     }
 
     let raw_harness = args

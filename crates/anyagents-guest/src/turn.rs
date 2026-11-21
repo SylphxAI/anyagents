@@ -520,7 +520,8 @@ fn execute_turn_foreground(
     );
 
     if let Some(ref spec) = repo_spec
-        && let Err(err) = ensure_repo_checked_out(&work_dir, spec, args.git_program.as_deref())
+        && let Err(err) =
+            ensure_repo_checked_out(&work_dir, state_dir, spec, args.git_program.as_deref())
     {
         hb_guard.stop();
         clear_activity_snapshot(state_dir);
