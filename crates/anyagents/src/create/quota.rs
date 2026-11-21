@@ -1,48 +1,15 @@
-//! Quota reset tracking, reset ETA formatting, usage enrichment, Anthropic metadata sync, and model catalog probing.
+//! Quota reset tracking, usage enrichment, and CLI model discovery.
 
 use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, agent_config_dir};
 
-use super::credentials::persist_refreshed_credentials;
-use super::profile_identity::read_first_non_empty_file;
+use super::profile_identity::{extract_profile_account_identity, read_first_non_empty_file};
 use super::{
-    ProviderProfileEntry, QuotaWindow, bound_profile_of_provider, extract_profile_account_identity,
-    probe_one_profile_usage, probe_one_profile_usage_with_options,
-    propagate_profile_files_to_bound_agents, sync_fresher_bound_agent_credentials,
-    update_profile_json_identity, upstream_provider_of, write_seat_shared_file,
+    ProviderProfileEntry, QuotaWindow, bound_profile_of_provider, probe_one_profile_usage,
+    probe_one_profile_usage_with_options, sync_fresher_bound_agent_credentials,
+    upstream_provider_of, write_seat_shared_file,
 };
-
-/// Unknown, malformed and out-of-range observations carry no quota authority.
-pub(super) fn observed_remaining_pct(value: &serde_json::Value) -> Option<i64> {
-    let used = value.as_f64()?;
-    (used.is_finite() && (0.0..=100.0).contains(&used)).then(|| (100.0 - used).round() as i64)
-}
-
-pub(super) fn observed_fraction_pct(value: &serde_json::Value) -> Option<i64> {
-    let left = value.as_f64()?;
-    (left.is_finite() && (0.0..=1.0).contains(&left)).then(|| (left * 100.0).round() as i64)
-}
-
-pub(super) fn observed_window_min(first: Option<i64>, second: Option<i64>) -> Option<i64> {
-    Some(first?.min(second?))
-}
-
-pub(super) fn observed_agy_tier(value: &serde_json::Value) -> Option<String> {
-    let id = value
-        .pointer("/paidTier/id")
-        .or_else(|| value.pointer("/currentTier/id"))?
-        .as_str()?;
-    if id.contains("ultra") {
-        Some("ultra".into())
-    } else if id.contains("pro") {
-        Some("pro".into())
-    } else if id.contains("free") {
-        Some("free".into())
-    } else {
-        None
-    }
-}
 
 pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms: i64) {
     let now_ms = anyagents_core::now_ms();
@@ -125,12 +92,12 @@ fn advance_cached_usage_etas(cached: &str, elapsed_secs: i64) -> String {
 
 pub(super) fn overlay_active_quota_reset_on_cached_usage(
     prof_dir: &Path,
-    last_usage_path: &Path,
+    last_usage_path: Option<&Path>,
     cached: &str,
     now_ms: i64,
 ) -> String {
-    let usage_mtime_ms = std::fs::metadata(last_usage_path)
-        .ok()
+    let usage_mtime_ms = last_usage_path
+        .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
@@ -240,94 +207,6 @@ pub(crate) fn parse_quota_windows_from_usage(
     (quota_5h, quota_weekly)
 }
 
-/// Format an OpenAI/Codex `/backend-api/wham/usage` payload into a unified
-/// `5h` + `7d` usage summary string, capturing BOTH `primary_window` and
-/// `secondary_window` when reported.
-pub(crate) fn format_openai_usage_summary(val: &serde_json::Value) -> Option<String> {
-    let parse_window = |ptr: &str| -> Option<(Option<i64>, i64, Option<String>)> {
-        let win = val.pointer(ptr)?;
-        let used = win
-            .get("used_percent")
-            .and_then(serde_json::Value::as_f64)?;
-        if !used.is_finite() {
-            return None;
-        }
-        let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
-        let window_secs = win
-            .get("limit_window_seconds")
-            .and_then(serde_json::Value::as_i64);
-        let eta = (rem < 100)
-            .then(|| {
-                win.get("reset_after_seconds")
-                    .and_then(serde_json::Value::as_i64)
-                    .and_then(format_reset_eta_secs)
-            })
-            .flatten();
-        Some((window_secs, rem, eta))
-    };
-
-    let primary = parse_window("/rate_limit/primary_window");
-    let secondary = parse_window("/rate_limit/secondary_window");
-    if primary.is_none() && secondary.is_none() {
-        return None;
-    }
-
-    let mut win_5h: Option<(i64, Option<String>)> = None;
-    let mut win_7d: Option<(i64, Option<String>)> = None;
-
-    match (primary, secondary) {
-        (Some((p_secs, p_rem, p_eta)), Some((s_secs, s_rem, s_eta))) => {
-            for (secs, rem, eta, is_primary) in
-                [(p_secs, p_rem, p_eta, true), (s_secs, s_rem, s_eta, false)]
-            {
-                let is_short = secs.map_or(is_primary, |s| s <= 86_400);
-                if is_short {
-                    win_5h = Some((rem, eta));
-                } else {
-                    win_7d = Some((rem, eta));
-                }
-            }
-        }
-        (Some((p_secs, p_rem, p_eta)), None) => {
-            if p_secs.is_some_and(|s| s <= 86_400) {
-                win_5h = Some((p_rem, p_eta));
-            } else {
-                win_7d = Some((p_rem, p_eta));
-            }
-        }
-        (None, Some((s_secs, s_rem, s_eta))) => {
-            if s_secs.is_some_and(|s| s <= 86_400) {
-                win_5h = Some((s_rem, s_eta));
-            } else {
-                win_7d = Some((s_rem, s_eta));
-            }
-        }
-        (None, None) => return None,
-    }
-
-    let mut parts = Vec::new();
-    if let Some((rem, eta)) = win_5h {
-        let eta_str = eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
-        parts.push(format!("5h: {rem}% left{eta_str}"));
-    }
-    if let Some((rem, eta)) = win_7d {
-        let eta_str = eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
-        parts.push(format!("7d: {rem}% left{eta_str}"));
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let joined = parts.join(" · ");
-    match val.get("plan_type").and_then(serde_json::Value::as_str) {
-        Some(plan) if !plan.is_empty() => Some(format!("{joined} ({plan})")),
-        _ => Some(joined),
-    }
-}
-
-/// Syncs any fresher OAuth credentials from active seats back into
-/// `<data>/profiles/<provider>/<profile>` and probes native upstream usage,
-/// quota, or balance for each profile in parallel. When `bypass_cache` is
-/// `true` (`GET /v1/profiles?fresh=1`), stale on-disk usage caches are bypassed.
 pub(crate) fn enrich_profiles_usage_with_options(
     data: &Path,
     entries: &mut [ProviderProfileEntry],
@@ -428,186 +307,6 @@ pub(super) fn anthropic_tier_label(
     }
 }
 
-pub(super) fn sync_anthropic_profile_metadata(
-    http: &ureq::Agent,
-    data: &Path,
-    prof_dir: &Path,
-    profile: &str,
-    token: &str,
-    cred: &mut serde_json::Value,
-    force: bool,
-) -> Option<&'static str> {
-    let existing_sub = cred
-        .pointer("/claudeAiOauth/subscriptionType")
-        .and_then(serde_json::Value::as_str);
-    let existing_tier = cred
-        .pointer("/claudeAiOauth/rateLimitTier")
-        .and_then(serde_json::Value::as_str);
-    let existing_email = cred
-        .pointer("/claudeAiOauth/email")
-        .and_then(serde_json::Value::as_str);
-    let now_ms = anyagents_core::now_ms();
-    let meta_sync_path = prof_dir.join(".anyagents-profile-meta-sync-ms");
-    let last_sync_ms = std::fs::read_to_string(&meta_sync_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let mut changed = false;
-    if (force
-        || existing_sub.is_none()
-        || existing_tier.is_none()
-        || existing_email.is_none()
-        || now_ms.saturating_sub(last_sync_ms) >= 300_000)
-        && let Ok(resp) = http
-            .get("https://api.anthropic.com/api/oauth/profile")
-            .header("authorization", &format!("Bearer {token}"))
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("cache-control", "no-cache")
-            .header("user-agent", "claude-code/2.1.310")
-            .call()
-        && let Ok(body) = resp.into_body().read_to_string()
-        && let Ok(pval) = serde_json::from_str::<serde_json::Value>(&body)
-    {
-        write_seat_shared_file(&meta_sync_path, format!("{now_ms}\n").as_bytes(), 0o600);
-        let org_type = pval
-            .pointer("/organization/organization_type")
-            .and_then(serde_json::Value::as_str);
-        let mapped_sub = match org_type {
-            Some(t) if t.contains("ultra") => Some("ultra"),
-            Some("claude_max") => Some("max"),
-            Some("claude_pro") => Some("pro"),
-            Some("claude_team") => Some("team"),
-            Some("claude_enterprise") => Some("enterprise"),
-            _ => None,
-        };
-        let live_tier = pval
-            .pointer("/organization/rate_limit_tier")
-            .and_then(serde_json::Value::as_str);
-        let acct_uuid = pval
-            .pointer("/account/uuid")
-            .and_then(serde_json::Value::as_str);
-        let acct_email = pval
-            .pointer("/account/email")
-            .and_then(serde_json::Value::as_str);
-        if !profile.starts_with('.') {
-            update_profile_json_identity(prof_dir, "anthropic", acct_email, acct_uuid);
-        }
-        if let Some(oauth) = cred
-            .get_mut("claudeAiOauth")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            if let Some(em) = acct_email
-                && oauth.get("email").and_then(serde_json::Value::as_str) != Some(em)
-            {
-                oauth.insert(
-                    "email".to_string(),
-                    serde_json::Value::String(em.to_string()),
-                );
-                changed = true;
-            }
-            if let Some(au) = acct_uuid
-                && oauth.get("accountUuid").and_then(serde_json::Value::as_str) != Some(au)
-            {
-                oauth.insert(
-                    "accountUuid".to_string(),
-                    serde_json::Value::String(au.to_string()),
-                );
-                changed = true;
-            }
-            if let Some(ms) = mapped_sub
-                && oauth
-                    .get("subscriptionType")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(ms)
-            {
-                oauth.insert(
-                    "subscriptionType".to_string(),
-                    serde_json::Value::String(ms.to_string()),
-                );
-                oauth.insert(
-                    "subscriptionTypeSource".to_string(),
-                    serde_json::Value::String("profile".to_string()),
-                );
-                changed = true;
-            }
-            if let Some(lt) = live_tier
-                && oauth
-                    .get("rateLimitTier")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(lt)
-            {
-                oauth.insert(
-                    "rateLimitTier".to_string(),
-                    serde_json::Value::String(lt.to_string()),
-                );
-                changed = true;
-            }
-        }
-    }
-    if (changed || !prof_dir.join(".claude/.credentials.json").is_file())
-        && let Ok(updated) = serde_json::to_string(cred)
-    {
-        persist_refreshed_credentials(
-            prof_dir,
-            &[".credentials.json", ".claude/.credentials.json"],
-            updated.as_bytes(),
-        )
-        .map_err(|err| {
-            eprintln!(
-                "cannot persist anthropic profile metadata ({}): {err}",
-                prof_dir.display()
-            )
-        })
-        .ok()?;
-        if !profile.starts_with('.') {
-            propagate_profile_files_to_bound_agents(
-                data,
-                "anthropic",
-                profile,
-                &[".credentials.json", ".claude/.credentials.json"],
-            )
-            .map_err(|err| eprintln!("runtime persistence failed: {err}"))
-            .ok()?;
-        }
-    }
-    let sub_type = cred
-        .pointer("/claudeAiOauth/subscriptionType")
-        .and_then(serde_json::Value::as_str);
-    let rate_tier = cred
-        .pointer("/claudeAiOauth/rateLimitTier")
-        .and_then(serde_json::Value::as_str);
-    anthropic_tier_label(sub_type, rate_tier)
-}
-
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let m_adj = if m > 2 {
-        (m - 3) as u64
-    } else {
-        (m + 9) as u64
-    };
-    let doy = (153 * m_adj + 2) / 5 + (d as u64) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + (doe as i64) - 719_468
-}
-
-fn parse_iso_utc_epoch_secs(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.len() < 19 {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: i64 = s.get(5..7)?.parse().ok()?;
-    let day: i64 = s.get(8..10)?.parse().ok()?;
-    let hour: i64 = s.get(11..13)?.parse().ok()?;
-    let min: i64 = s.get(14..16)?.parse().ok()?;
-    let sec: i64 = s.get(17..19)?.parse().ok()?;
-    let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
-}
-
 pub(super) fn format_reset_eta_secs(rem_secs: i64) -> Option<String> {
     if rem_secs <= 0 {
         return None;
@@ -634,161 +333,12 @@ pub(super) fn format_reset_eta_secs(rem_secs: i64) -> Option<String> {
     }
 }
 
-pub(super) fn format_reset_eta_iso(iso_str: &str) -> Option<String> {
-    let target_secs = parse_iso_utc_epoch_secs(iso_str)?;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    format_reset_eta_secs(target_secs - now_secs)
-}
-
 pub(super) fn format_reset_eta_epoch_ms(target_ms: i64) -> Option<String> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_millis() as i64;
     format_reset_eta_secs((target_ms - now_ms) / 1_000)
-}
-
-pub(super) fn format_anthropic_usage_summary(
-    val: &serde_json::Value,
-    tier_badge: Option<&str>,
-) -> Option<String> {
-    let tier_suffix = tier_badge.map(|t| format!(" ({t})")).unwrap_or_default();
-    let limits = val.get("limits").and_then(serde_json::Value::as_array);
-
-    let find_limit = |want_kind: &str, want_group: &str| -> Option<(f64, Option<&str>)> {
-        let arr = limits?;
-        for item in arr {
-            if item.get("is_active").and_then(serde_json::Value::as_bool) == Some(false) {
-                continue;
-            }
-            let kind = item
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let group = item
-                .get("group")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let scope_null = item.get("scope").is_none_or(serde_json::Value::is_null);
-            if kind == want_kind || (group == want_group && scope_null) {
-                let pct = item.get("percent").and_then(serde_json::Value::as_f64)?;
-                let resets = item.get("resets_at").and_then(serde_json::Value::as_str);
-                return Some((pct, resets));
-            }
-        }
-        None
-    };
-
-    let mut parts = Vec::new();
-
-    let window_5h = val
-        .pointer("/five_hour/utilization")
-        .and_then(serde_json::Value::as_f64)
-        .map(|u| {
-            (
-                u,
-                val.pointer("/five_hour/resets_at")
-                    .and_then(serde_json::Value::as_str),
-            )
-        })
-        .or_else(|| find_limit("five_hour_all", "five_hour"));
-
-    if let Some((u5, resets_5h)) = window_5h {
-        let rem_5h = (100.0 - u5).clamp(0.0, 100.0).round() as i64;
-        let eta_5h = (rem_5h < 100)
-            .then(|| resets_5h.and_then(format_reset_eta_iso))
-            .flatten()
-            .map(|e| format!(" ↻{e}"))
-            .unwrap_or_default();
-        parts.push(format!("5h: {rem_5h}% left{eta_5h}"));
-    }
-
-    let window_7d = val
-        .pointer("/seven_day/utilization")
-        .and_then(serde_json::Value::as_f64)
-        .map(|u| {
-            (
-                u,
-                val.pointer("/seven_day/resets_at")
-                    .and_then(serde_json::Value::as_str),
-            )
-        })
-        .or_else(|| find_limit("weekly_all", "weekly"));
-
-    if let Some((u7, resets_7d)) = window_7d {
-        let rem_7d = (100.0 - u7).clamp(0.0, 100.0).round() as i64;
-        let eta_7d = (rem_7d < 100)
-            .then(|| resets_7d.and_then(format_reset_eta_iso))
-            .flatten()
-            .map(|e| format!(" ↻{e}"))
-            .unwrap_or_default();
-        parts.push(format!("7d: {rem_7d}% left{eta_7d}"));
-    }
-
-    if let Some(u_opus) = val
-        .pointer("/seven_day_opus/utilization")
-        .and_then(serde_json::Value::as_f64)
-    {
-        let rem_opus = (100.0 - u_opus).clamp(0.0, 100.0).round() as i64;
-        let eta_opus = (rem_opus < 100)
-            .then(|| {
-                val.pointer("/seven_day_opus/resets_at")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(format_reset_eta_iso)
-            })
-            .flatten()
-            .map(|e| format!(" ↻{e}"))
-            .unwrap_or_default();
-        parts.push(format!("opus: {rem_opus}% left{eta_opus}"));
-    }
-
-    if let Some(minor) = val
-        .pointer("/spend/balance/amount_minor")
-        .and_then(serde_json::Value::as_i64)
-    {
-        let exp = val
-            .pointer("/spend/balance/exponent")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(2) as i32;
-        let dollars = (minor as f64) / 10f64.powi(exp);
-        parts.push(format!("${dollars:.2} left"));
-    } else if let Some(rem_d) = val
-        .pointer("/seven_day/remaining_dollars")
-        .and_then(serde_json::Value::as_f64)
-    {
-        parts.push(format!("${rem_d:.2} left"));
-    } else if val
-        .pointer("/extra_usage/is_enabled")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        && let Some(limit) = val
-            .pointer("/extra_usage/monthly_limit")
-            .and_then(serde_json::Value::as_f64)
-    {
-        let used = val
-            .pointer("/extra_usage/used_credits")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        let exp = val
-            .pointer("/extra_usage/decimal_places")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(2) as i32;
-        let scale = if limit > 1000.0 && exp == 2 {
-            100.0
-        } else {
-            1.0
-        };
-        let rem_d = ((limit - used) / scale).max(0.0);
-        parts.push(format!("extra: ${rem_d:.2} left"));
-    }
-
-    if parts.is_empty() {
-        return None;
-    }
-    Some(format!("{}{tier_suffix}", parts.join(" · ")))
 }
 
 fn json_value_has_secret(val: &serde_json::Value) -> bool {
@@ -1034,20 +584,7 @@ pub(crate) fn probe_profile_remaining_pct(
 ) -> Option<i64> {
     sync_fresher_bound_agent_credentials(data);
     let usage = probe_one_profile_usage(data, provider, profile)?;
-    let pct = parse_remaining_pct_from_usage(&usage, model)?;
-    if provider == "anthropic" && pct > 0 {
-        let prof_dir = data.join("profiles").join(provider).join(profile);
-        let now_ms = anyagents_core::now_ms();
-        let fresh_live_read = std::fs::metadata(prof_dir.join(".anyagents-last-usage.txt"))
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|d| now_ms.saturating_sub(d.as_millis() as i64) < 65_000);
-        if !fresh_live_read {
-            return None;
-        }
-    }
-    Some(pct)
+    parse_remaining_pct_from_usage(&usage, model)
 }
 
 /// Clears historical `CORTEX_STEP_TYPE_ERROR_MESSAGE` (`step_type = 17`) rows
@@ -1143,11 +680,6 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
     let filter = target.map(str::trim).filter(|s| {
         !s.is_empty() && !s.eq_ignore_ascii_case("models") && !s.eq_ignore_ascii_case("all")
     });
-    let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
-        .build()
-        .new_agent();
-
     let mut agy_cli_models = Vec::new();
     let agy_bin = crate::sandbox::host_home_dir()
         .map(|h| h.join(".local/bin/agy"))
@@ -1216,93 +748,12 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
                 }
                 if provider == "google-antigravity" {
                     let _ = probe_one_profile_usage(data, &provider, &profile);
-                    let tok_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
-                    let mut backend_models = Vec::new();
-                    if let Ok(tok_text) = std::fs::read_to_string(&tok_path)
-                        && let Ok(tok_val) = serde_json::from_str::<serde_json::Value>(&tok_text)
-                        && let Some(tok) = tok_val
-                            .pointer("/token/access_token")
-                            .or_else(|| tok_val.get("access_token"))
-                            .and_then(|v| v.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        && let Ok(resp) = http
-                            .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels")
-                            .header("authorization", &format!("Bearer {tok}"))
-                            .header("content-type", "application/json")
-                            .header("user-agent", "antigravity")
-                            .send(b"{}")
-                        && let Ok(body) = resp.into_body().read_to_string()
-                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
-                        && let Some(models_obj) = val.get("models").and_then(|m| m.as_object())
-                    {
-                        for (model_id, m) in models_obj {
-                            let qi = m.get("quotaInfo");
-                            let rem_pct = qi
-                                .and_then(|q| q.get("remainingFraction"))
-                                .and_then(|v| v.as_f64())
-                                .map(|f| (f * 100.0).clamp(0.0, 100.0).round() as i64)
-                                .unwrap_or(0);
-                            let reset_time = qi
-                                .and_then(|q| q.get("resetTime"))
-                                .and_then(|v| v.as_str());
-                            backend_models.push(serde_json::json!({
-                                "id": model_id,
-                                "display_name": m.get("displayName").and_then(|v| v.as_str()),
-                                "remaining_pct": rem_pct,
-                                "reset_time": reset_time,
-                            }));
-                        }
-                    }
                     profiles_out.push(serde_json::json!({
                         "profile": full_name,
                         "provider": provider,
                         "cli_models": agy_cli_models,
-                        "backend_models": backend_models,
+                        "backend_models": [],
                     }));
-                }
-            }
-        }
-    }
-
-    // In thin/serverless coordinators without a host `agy` binary, synthesize
-    // `agy_cli_models` from the live backend model catalog fetched via synced
-    // OAuth tokens so `agents(action="models")` never returns empty `[]`.
-    if agy_cli_models.is_empty() {
-        let mut seen = std::collections::BTreeMap::<String, String>::new();
-        for p in &profiles_out {
-            if let Some(bms) = p.get("backend_models").and_then(|v| v.as_array()) {
-                for bm in bms {
-                    if let Some(id) = bm.get("id").and_then(|v| v.as_str()) {
-                        let label = bm
-                            .get("display_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(id)
-                            .to_string();
-                        seen.entry(id.to_string()).or_insert(label);
-                    }
-                }
-            }
-        }
-        for (id, label) in seen {
-            agy_cli_models.push(serde_json::json!({
-                "id": id,
-                "label": label,
-                "default": false,
-            }));
-        }
-        if !agy_cli_models.is_empty() {
-            for p in &mut profiles_out {
-                if let Some(obj) = p.as_object_mut()
-                    && obj
-                        .get("cli_models")
-                        .and_then(|v| v.as_array())
-                        .is_some_and(Vec::is_empty)
-                {
-                    obj.insert(
-                        "cli_models".to_string(),
-                        serde_json::Value::Array(agy_cli_models.clone()),
-                    );
                 }
             }
         }

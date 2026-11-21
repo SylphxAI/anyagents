@@ -7,10 +7,7 @@ use super::profiles::{
     COPY_EVALUATIONS, copy_seat_file_if_newer, ensure_provider_profile_meta,
     sync_and_list_provider_profiles_inner,
 };
-use super::quota::{
-    anthropic_tier_label, format_anthropic_usage_summary,
-    overlay_active_quota_reset_on_cached_usage,
-};
+use super::quota::{anthropic_tier_label, overlay_active_quota_reset_on_cached_usage};
 use super::runtime::install_changed_harness;
 #[cfg(unix)]
 use super::runtime::{prepare_runtime_config_dir, repair_unseated_config_mode};
@@ -2170,63 +2167,57 @@ fn shared_agents_md_and_managed_repo_worktree_lifecycle() {
 }
 
 #[test]
-fn anthropic_usage_formats_weekly_only_when_five_hour_is_null() {
-    let payload = serde_json::json!({
-        "five_hour": null,
-        "seven_day": {
-            "utilization": 75.0,
-            "resets_at": "2099-11-05T14:59:59.917112+00:00",
-            "limit_dollars": null,
-            "used_dollars": null,
-            "remaining_dollars": null,
-            "locked_reason": null
-        },
-        "limits": [
-            {
-                "kind": "weekly_all",
-                "group": "weekly",
-                "percent": 75,
-                "severity": "warning",
-                "resets_at": "2099-11-05T14:59:59.917112+00:00",
-                "scope": null,
-                "is_active": true
-            }
-        ],
-        "spend": {
-            "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
-            "limit": null,
-            "percent": 0,
-            "enabled": false,
-            "balance": null
-        }
-    });
-    let formatted = format_anthropic_usage_summary(&payload, Some("max 20x")).unwrap();
-    assert!(formatted.starts_with("7d: 25% left ↻"), "got: {formatted}");
-    assert!(formatted.ends_with(" (max 20x)"), "got: {formatted}");
+fn anthropic_subscription_uses_local_tier_not_scraped_quota() {
+    let tmp = crate::test_tempdir();
+    let data = tmp.path();
+    let profile = data.join("profiles/anthropic/default");
+    std::fs::create_dir_all(&profile).unwrap();
+    let credentials = br#"{"claudeAiOauth":{"accessToken":"expired-fixture","refreshToken":"refresh-fixture","expiresAt":1000,"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}"#;
+    let cred_path = profile.join(".credentials.json");
+    std::fs::write(&cred_path, credentials).unwrap();
+    let usage_path = profile.join(".anyagents-last-usage.txt");
+    let scraped = "5h: 82% left · 7d: 15% left (pro)\n".as_bytes();
+    std::fs::write(&usage_path, scraped).unwrap();
+
+    for fresh in [false, true] {
+        let usage =
+            probe_one_profile_usage_with_options(data, "anthropic", "default", fresh).unwrap();
+        assert!(usage.ends_with("(max 20x)"), "{usage}");
+        assert_eq!(parse_quota_windows_from_usage(&usage), (None, None));
+        assert_eq!(parse_remaining_pct_from_usage(&usage, None), None);
+    }
+    assert_eq!(std::fs::read(&cred_path).unwrap(), credentials);
+    assert_eq!(std::fs::read(&usage_path).unwrap(), scraped);
 }
 
 #[test]
-fn anthropic_usage_formats_both_windows_and_spend_balance() {
-    let payload = serde_json::json!({
-        "five_hour": {
-            "utilization": 10.0,
-            "resets_at": "2099-11-01T02:00:00Z"
-        },
-        "seven_day": {
-            "utilization": 40.0,
-            "resets_at": "2099-11-05T15:00:00Z"
-        },
-        "spend": {
-            "balance": { "amount_minor": 4250, "currency": "USD", "exponent": 2 }
-        }
-    });
-    let formatted = format_anthropic_usage_summary(&payload, Some("max 5x")).unwrap();
-    assert!(formatted.contains("5h: 90% left ↻"), "got: {formatted}");
-    assert!(formatted.contains(" · 7d: 60% left ↻"), "got: {formatted}");
-    assert!(
-        formatted.contains(" · $42.50 left (max 5x)"),
-        "got: {formatted}"
-    );
+fn subscription_status_uses_harness_reset_even_if_scraped_cache_is_newer() {
+    let tmp = crate::test_tempdir();
+    let data = tmp.path();
+    let profile = data.join("profiles/openai/default");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("auth.json"),
+        br#"{"tokens":{"access_token":"access-fixture","refresh_token":"refresh-fixture"}}"#,
+    )
+    .unwrap();
+    let reset_path = profile.join(".anyagents-quota-reset-ms");
+    let reset_ms = anyagents_core::now_ms() + 3_600_000;
+    std::fs::write(&reset_path, format!("{reset_ms}\n")).unwrap();
+    std::fs::File::open(&reset_path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+        .unwrap();
+    std::fs::write(
+        profile.join(".anyagents-last-usage.txt"),
+        b"5h: 100% left\n",
+    )
+    .unwrap();
+
+    let usage = probe_one_profile_usage(data, "openai", "default").unwrap();
+    assert!(usage.starts_with("limited ↻"), "{usage}");
+    assert_eq!(parse_quota_windows_from_usage(&usage), (None, None));
+    assert_eq!(parse_remaining_pct_from_usage(&usage, None), Some(0));
 }
 
 #[test]
@@ -2395,7 +2386,7 @@ fn overlay_active_quota_reset_replaces_stale_cached_5h_window() {
     .unwrap();
 
     let overlaid =
-        overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+        overlay_active_quota_reset_on_cached_usage(prof_dir, Some(&usage_path), cached, now_ms);
     assert!(
         overlaid.starts_with("5h: 0% left ↻1h"),
         "expected 5h: 0% left with live reset ETA, got: {overlaid}"
@@ -2423,7 +2414,7 @@ fn overlay_active_quota_reset_never_invents_a_5h_window_for_a_weekly_only_plan()
     .unwrap();
 
     let overlaid =
-        overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+        overlay_active_quota_reset_on_cached_usage(prof_dir, Some(&usage_path), cached, now_ms);
     assert!(!overlaid.contains("5h:"), "got: {overlaid}");
     assert!(overlaid.starts_with("limited ↻2h"), "got: {overlaid}");
     assert!(
@@ -2434,7 +2425,7 @@ fn overlay_active_quota_reset_never_invents_a_5h_window_for_a_weekly_only_plan()
 
     for (cached, want) in [("(ultra)", " (ultra)"), ("", "")] {
         let overlaid =
-            overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+            overlay_active_quota_reset_on_cached_usage(prof_dir, Some(&usage_path), cached, now_ms);
         assert!(!overlaid.contains("5h:"), "got: {overlaid}");
         assert!(overlaid.starts_with("limited ↻2h"), "got: {overlaid}");
         assert!(overlaid.ends_with(want), "got: {overlaid}");

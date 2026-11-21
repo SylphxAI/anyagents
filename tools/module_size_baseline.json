@@ -15,7 +15,7 @@
     "crates/anyagents-supervisor/src/lib.rs": 3560,
     "crates/anyagents/assets/admin/app.js": 1636,
     "crates/anyagents/src/agent.rs": 2021,
-    "crates/anyagents/src/main.rs": 3100,
+    "crates/anyagents/src/main.rs": 2748,
     "crates/anyagents/src/mcp/tools.rs": 2336,
     "crates/anyagents/src/repo.rs": 2743,
     "crates/anyagents/src/sandbox_exec.rs": 3087,
@@ -23,7 +23,7 @@
     "crates/anyagents/src/schedule.rs": 2136,
     "crates/anyagents/src/seat_tree.rs": 1938,
     "crates/anyagents/src/server/admin_auth.rs": 1572,
-    "crates/anyagents/src/server/serverless.rs": 3338,
+    "crates/anyagents/src/server/serverless.rs": 2761,
     "crates/anyagents/src/telegram/channel.rs": 4375,
     "crates/anyagents/src/ui.rs": 1546,
     "crates/anyagents/src/vendor.rs": 2821

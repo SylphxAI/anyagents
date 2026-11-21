@@ -748,7 +748,6 @@ pub(crate) fn hydrate_profiles_from_store_if_postgres(store: &Store, data: &Path
             let mut parts = meta.path.splitn(3, '/');
             if let (Some(prov), Some(prof)) = (parts.next(), parts.next()) {
                 let prof_dir = profiles_root.join(prov).join(prof);
-                let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
                 let _ = std::fs::remove_file(prof_dir.join(".anyagents-last-usage.txt"));
             }
         }

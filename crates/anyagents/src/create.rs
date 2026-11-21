@@ -17,6 +17,7 @@ mod quota_probe;
 mod runtime;
 mod signin;
 mod spawn;
+mod subscription_status;
 mod workspace;
 
 #[cfg(test)]
@@ -45,7 +46,7 @@ pub(crate) use credentials::{
 };
 pub(crate) use model_defaults::persist_spawned_agent_config_to_store;
 pub(crate) use profile_identity::{extract_profile_account_identity, update_profile_json_identity};
-pub(crate) use profile_rotation::{force_refresh_provider_profiles, try_rotate_exhausted_profile};
+pub(crate) use profile_rotation::try_rotate_exhausted_profile;
 pub(crate) use profiles::{
     ProviderProfileEntry, QuotaWindow, bound_profile_name, bound_profile_of_provider,
     compatible_harnesses_for, ensure_harness_runs_profile, ensure_profile_compatible_and_mapped,
@@ -53,8 +54,6 @@ pub(crate) use profiles::{
     list_provider_profiles_fresh, set_provider_profile,
     sync_and_list_provider_profiles_with_options, upstream_provider_of,
 };
-#[cfg(test)]
-pub(crate) use quota::format_openai_usage_summary;
 pub(crate) use quota::{
     clear_stale_agy_quota_error_steps, enrich_profiles_usage_with_options,
     parse_quota_windows_from_usage, parse_remaining_pct_from_usage, probe_profile_models_catalog,

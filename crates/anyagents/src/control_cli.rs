@@ -118,7 +118,7 @@ pub(crate) enum ProfilesCommand {
         #[arg(long)]
         url: Option<String>,
     },
-    /// Force-refresh profile credentials and probe fresh 5h + Weekly quotas (`GET /v1/profiles?fresh=1`).
+    /// Re-read profile status and bypass public API-key usage caches (`GET /v1/profiles?fresh=1`).
     Refresh {
         /// Optional provider or profile filter.
         filter: Option<String>,
@@ -556,9 +556,6 @@ pub(crate) fn run_profiles_cmd(data: &Path, args: ProfilesCliArgs) -> Result<(),
             url,
         } => profiles_native_signin_cmd(data, &harness, profile.as_deref(), url.as_deref()),
         ProfilesCommand::Refresh { filter, url, json } => {
-            if url.is_none() && !server::socket_path(data).exists() {
-                let _ = create::force_refresh_provider_profiles(data, filter.as_deref());
-            }
             profiles_list_cmd(data, filter.as_deref(), true, url.as_deref(), json)
         }
         ProfilesCommand::Set {
