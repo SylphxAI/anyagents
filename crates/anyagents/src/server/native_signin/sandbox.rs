@@ -353,14 +353,15 @@ impl Runner<'_> {
     async fn exec(
         &self,
         operation: &str,
-        request: ExecRequest,
+        mut request: ExecRequest,
         ms: u64,
         private: bool,
     ) -> Result<crate::sandbox_providers::providers::ExecOutput, String> {
+        request.cwd.get_or_insert_with(|| "/tmp".into());
         let result = timeout(
             Duration::from_millis(ms + 1000),
             self.provider
-                .exec(self.handle, &request.with_cwd("/tmp").with_timeout_ms(ms)),
+                .exec(self.handle, &request.with_timeout_ms(ms)),
         )
         .await
         .map_err(|err| report(operation, &err.to_string()))?
