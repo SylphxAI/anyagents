@@ -1,10 +1,10 @@
 //! Run against a dedicated PostgreSQL 16+ database with pg_stat_statements
 //! preloaded and CREATE EXTENSION pg_stat_statements applied there.
-use std::process::Command;
 use std::sync::{Arc, Barrier};
 
 use anyagents_core::{AgentId, NewAgent, Store};
 use serde_json::json;
+use sqlx::{Connection, PgConnection};
 
 use super::super::build_router;
 use super::helpers::{env_lock, raw_http, state_for_store};
@@ -12,30 +12,15 @@ use super::helpers::{env_lock, raw_http, state_for_store};
 const POOL_MAX: &str = "ANYAGENTS_PG_MAX_CONNECTIONS";
 const POOL_TIMEOUT: &str = "ANYAGENTS_PG_ACQUIRE_TIMEOUT_SECS";
 
-fn statements(url: &str) -> i64 {
-    let output = Command::new("psql")
-        .args([
-            "-XAt",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_statements
-             WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
-               AND query NOT LIKE '%FROM pg_stat_statements%'",
-            url,
-        ])
-        .output()
-        .expect("psql is required for the PostgreSQL budget check");
-    assert!(
-        output.status.success(),
-        "cannot count statements: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+async fn statements(observer: &mut PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_statements
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND query NOT LIKE '%FROM pg_stat_statements%'",
+    )
+    .fetch_one(observer)
+    .await
+    .expect("pg_stat_statements must be enabled in the disposable database")
 }
 
 #[test]
@@ -103,16 +88,21 @@ fn postgres_coordinator_hot_paths_stay_within_sql_budgets_and_handle_burst() {
     assert_eq!(status, 200, "warm roster: {body}");
     let (status, body) = send(0, "warm");
     assert_eq!(status, 200, "warm send: {body}");
-    let before = statements(&url);
+    // The observer does not use a slot from the pool under test.
+    let mut observer = rt
+        .block_on(PgConnection::connect(&url))
+        .expect("cannot connect the PostgreSQL statement observer");
+    let before = rt.block_on(statements(&mut observer));
     let (status, body) = roster();
-    let after_roster = statements(&url);
+    let after_roster = rt.block_on(statements(&mut observer));
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body["agents"].as_array().unwrap().len(),
         recipients.len() + 1
     );
     let (status, body) = send(0, "budget");
-    let after_send = statements(&url);
+    let after_send = rt.block_on(statements(&mut observer));
+    rt.block_on(observer.close()).unwrap();
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["deliveries"].as_array().unwrap().len(), 1);
     let roster_sql = after_roster - before;
