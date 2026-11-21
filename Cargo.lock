@@ -63,11 +63,12 @@ dependencies = [
 [[package]]
 name = "agent-workstation"
 version = "0.2.0"
-source = "git+https://github.com/SylphxAI/agent-workstation?rev=ec5247570c2cf786ee40ef49de46eea5ae553a7f#ec5247570c2cf786ee40ef49de46eea5ae553a7f"
+source = "git+https://github.com/SylphxAI/agent-workstation?rev=d6b69342ea192a736495f9a3c1eb9b593381f640#d6b69342ea192a736495f9a3c1eb9b593381f640"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "cc",
  "chrono",
  "clap",
  "futures",
