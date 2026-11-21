@@ -16,7 +16,9 @@ pub const PG_ACTIVE_TURN_UNIQUE_SQL: &str =
     include_str!("../../migrations_pg/008_active_turn_unique.sql");
 const PG_CHANNEL_IDENTITY_UNIQUE_SQL: &str =
     include_str!("../../migrations_pg/009_channel_identity_unique.sql");
-pub const PG_LATEST_VERSION: i64 = 11;
+pub const PG_TURN_TRANSCRIPT_EVENTS_SQL: &str =
+    include_str!("../../migrations_pg/012_turn_transcript_events.sql");
+pub const PG_LATEST_VERSION: i64 = 12;
 
 pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
     (1, PG_INIT_SQL),
@@ -33,4 +35,5 @@ pub(super) const PG_MIGRATIONS: &[(i64, &str)] = &[
         11,
         include_str!("../../migrations_pg/011_runtime_issues.sql"),
     ),
+    (12, PG_TURN_TRANSCRIPT_EVENTS_SQL),
 ];

@@ -124,7 +124,8 @@ pub(crate) fn build_public_router(state: AppState) -> Router {
         .merge(takeover_tunnel::router())
         .route(
             "/v1/internal/guest/events",
-            post(serverless::guest_events_route),
+            post(serverless::guest_events_route)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         .route(
             "/v1/internal/cloud/events",
@@ -158,7 +159,8 @@ fn build_webhook_router(state: AppState) -> Router {
     .merge(takeover_tunnel::router())
     .route(
         "/v1/internal/guest/events",
-        post(serverless::guest_events_route),
+        post(serverless::guest_events_route)
+            .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
     )
     .route(
         "/v1/internal/cloud/events",
@@ -204,7 +206,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .merge(takeover_tunnel::router())
         .route(
             "/v1/internal/guest/events",
-            post(serverless::guest_events_route),
+            post(serverless::guest_events_route)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         .route(
             "/v1/internal/cloud/events",

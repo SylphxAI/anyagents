@@ -298,6 +298,7 @@ dependencies = [
  "anyagents-toolchain",
  "clap",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS turn_transcript_events (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    session_id TEXT,
+    harness TEXT NOT NULL,
+    source TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'thinking', 'tool_call', 'tool_result', 'system', 'raw')),
+    tool_name TEXT,
+    tool_call_id TEXT,
+    text TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    UNIQUE (agent_id, source, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_transcript_events_agent_ts
+    ON turn_transcript_events (agent_id, timestamp_ms DESC, rowid DESC);
+CREATE INDEX IF NOT EXISTS idx_turn_transcript_events_turn_seq
+    ON turn_transcript_events (agent_id, turn_id, seq ASC, rowid ASC);
+CREATE INDEX IF NOT EXISTS idx_turn_transcript_events_tool
+    ON turn_transcript_events (agent_id, tool_name, timestamp_ms DESC);

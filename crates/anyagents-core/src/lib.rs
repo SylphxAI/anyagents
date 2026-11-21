@@ -103,6 +103,10 @@ pub use store::{
     is_session_turn_error,
 };
 pub use store::{
+    NewTurnTranscriptEvent, TurnTranscriptEvent, TurnTranscriptSearchHit,
+    VALID_TRANSCRIPT_EVENT_ROLES, normalize_transcript_event_role,
+};
+pub use store::{
     REMOTE_SESSION_TOKEN_PREFIX, RemoteSession, RemoteSessionGrant, RemoteSessionToken,
     is_remote_session_token,
 };

@@ -825,6 +825,7 @@ pub fn read_conversation(
                 tool_name: None,
                 tool_names: Vec::new(),
                 role: None,
+                turn_id: None,
             })
             .collect(),
     })

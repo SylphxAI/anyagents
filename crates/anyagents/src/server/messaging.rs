@@ -15,8 +15,8 @@ use crate::auth::Principal;
 
 use super::agents_lifecycle::is_explicitly_archived;
 use super::messaging_conversation::{
-    conversation_route, inbox, media_file_route, operator_inbox, operator_reports,
-    redact_conversation_route,
+    conversation_route, history_route, inbox, media_file_route, operator_inbox, operator_reports,
+    redact_conversation_route, turn_events_route,
 };
 use super::messaging_delivery::{
     archived_conflict, archived_refusal, deliver_agent_with_media, deliver_operator,
@@ -37,6 +37,11 @@ pub(super) fn router() -> Router<AppState> {
         .route("/v1/agents/{name}/inbox", get(inbox))
         .merge(messaging_memory::router())
         .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route("/v1/history", get(history_route))
+        .route(
+            "/v1/agents/{name}/turns/{turn_id}/events",
+            get(turn_events_route),
+        )
         .route(
             "/v1/agents/{name}/conversation/redact",
             post(redact_conversation_route),

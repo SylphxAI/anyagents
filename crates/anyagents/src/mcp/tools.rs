@@ -68,7 +68,9 @@ impl AgentMcp {
                 || !args.queries.is_empty()
                 || !args.exclude.is_empty()
                 || args.only_tools == Some(true)
-                || args.tool_name.is_some());
+                || args.tool_name.is_some()
+                || args.turn_id.is_some()
+                || args.role.is_some());
         let default_agent = if is_search_mode {
             "all".to_string()
         } else {
@@ -188,6 +190,22 @@ impl AgentMcp {
             .filter(|s| !s.is_empty())
         {
             query.push(format!("tool_name={}", urlencoding_simple(tname)));
+        }
+        if let Some(tid) = args
+            .turn_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("turn_id={}", urlencoding_simple(tid)));
+        }
+        if let Some(role) = args
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("role={}", urlencoding_simple(role)));
         }
         if let Some(since_ms) = args.since_ms {
             query.push(format!("since_ms={since_ms}"));

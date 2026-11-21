@@ -658,6 +658,8 @@ pub struct ConversationTurnView {
     pub tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// `"in"` (received by the agent) or `"out"` (sent by the agent).
     pub direction: String,
     pub from: String,
@@ -677,6 +679,56 @@ pub struct ConversationResponse {
     /// How a relevance search was ranked; absent for reads that rank nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalView>,
+}
+
+/// One raw, lossless step emitted during an in-flight or completed agent turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnTranscriptEventView {
+    pub rowid: i64,
+    pub agent_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub harness: String,
+    pub source: String,
+    pub seq: i64,
+    pub timestamp_ms: i64,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub text: String,
+    pub raw_json: String,
+}
+
+impl From<anyagents_core::TurnTranscriptEvent> for TurnTranscriptEventView {
+    fn from(event: anyagents_core::TurnTranscriptEvent) -> Self {
+        Self {
+            rowid: event.rowid,
+            agent_id: event.agent_id.to_string(),
+            turn_id: event.turn_id,
+            session_id: event.session_id,
+            harness: event.harness,
+            source: event.source,
+            seq: event.seq,
+            timestamp_ms: event.timestamp_ms,
+            role: event.role,
+            tool_name: event.tool_name,
+            tool_call_id: event.tool_call_id,
+            text: event.text,
+            raw_json: event.raw_json,
+        }
+    }
+}
+
+/// Ordered live/completed step stream returned by `GET /v1/agents/{name}/turns/{turn_id}/events`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnEventsResponse {
+    pub agent: String,
+    pub agent_id: String,
+    pub turn_id: String,
+    pub events: Vec<TurnTranscriptEventView>,
 }
 
 /// The ranking stages a relevance search ran. Every turn cites its raw record
