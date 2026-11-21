@@ -69,6 +69,10 @@ on:
 permissions:
   contents: read
 
+# Keep Buildx job summaries without uploading the optional .dockerbuild archives.
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
 concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: false
@@ -153,7 +157,6 @@ jobs:
       attestations: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-      image_ref: ${{ steps.record.outputs.image_ref }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -202,30 +205,6 @@ jobs:
           cache-from: type=gha,scope=coordinator
           cache-to: type=gha,mode=max,scope=coordinator
 
-      - name: Record immutable Coordinator digest
-        id: record
-        env:
-          IMAGE: ${{ needs.resolve.outputs.coordinator_image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [ -n "$DIGEST" ]; then
-            ref="${IMAGE}@${DIGEST}"
-          else
-            ref="${IMAGE} (unpushed build-only verification)"
-          fi
-          echo "image_ref=${ref}" >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s\n' "$ref" > "$RUNNER_TEMP/digests/coordinator.txt"
-          echo "Coordinator OCI digest: ${ref}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload Coordinator digest receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-digest-coordinator
-          path: ${{ runner.temp }}/digests/coordinator.txt
-          retention-days: 1
-
   sandbox:
     needs: resolve
     if: github.event.repository.private == false
@@ -246,6 +225,11 @@ jobs:
             tag_prefix: dev
           - target: sandbox-full
             tag_prefix: full
+    # Each matrix child writes only its own key; the runner omits empty outputs.
+    outputs:
+      base_digest: ${{ matrix.tag_prefix == 'base' && steps.build.outputs.digest || '' }}
+      dev_digest: ${{ matrix.tag_prefix == 'dev' && steps.build.outputs.digest || '' }}
+      full_digest: ${{ matrix.tag_prefix == 'full' && steps.build.outputs.digest || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -297,33 +281,9 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
-      - name: Record immutable ${{ matrix.target }} digest
-        id: record
-        env:
-          IMAGE: ${{ needs.resolve.outputs.sandbox_image }}
-          TARGET: ${{ matrix.target }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [ -n "$DIGEST" ]; then
-            ref="${IMAGE}@${DIGEST}"
-          else
-            ref="${IMAGE} (unpushed build-only verification)"
-          fi
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s\n' "$ref" > "$RUNNER_TEMP/digests/${TARGET}.txt"
-          echo "${TARGET} OCI digest: ${ref}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload ${{ matrix.target }} digest receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-digest-${{ matrix.target }}
-          path: ${{ runner.temp }}/digests/${{ matrix.target }}.txt
-          retention-days: 1
-
   summary:
     needs: [resolve, coordinator, sandbox]
-    if: github.event.repository.private == false && needs.resolve.outputs.push == 'true'
+    if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -332,21 +292,32 @@ jobs:
       sandbox_dev: ${{ steps.receipts.outputs.sandbox_dev }}
       sandbox_full: ${{ steps.receipts.outputs.sandbox_full }}
     steps:
-      - name: Download digest receipts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: oci-digest-*
-          path: ${{ runner.temp }}/digests
-          merge-multiple: true
-
       - name: Emit immutable OCI digest summary
         id: receipts
+        env:
+          PUSH: ${{ needs.resolve.outputs.push }}
+          COORDINATOR_IMAGE: ${{ needs.resolve.outputs.coordinator_image }}
+          SANDBOX_IMAGE: ${{ needs.resolve.outputs.sandbox_image }}
+          COORDINATOR_DIGEST: ${{ needs.coordinator.outputs.digest }}
+          SANDBOX_BASE_DIGEST: ${{ needs.sandbox.outputs.base_digest }}
+          SANDBOX_DEV_DIGEST: ${{ needs.sandbox.outputs.dev_digest }}
+          SANDBOX_FULL_DIGEST: ${{ needs.sandbox.outputs.full_digest }}
         run: |
           set -euo pipefail
-          coord="$(cat "$RUNNER_TEMP/digests/coordinator.txt")"
-          base="$(cat "$RUNNER_TEMP/digests/sandbox-base.txt")"
-          dev="$(cat "$RUNNER_TEMP/digests/sandbox-dev.txt")"
-          full="$(cat "$RUNNER_TEMP/digests/sandbox-full.txt")"
+          if [[ "$PUSH" == false ]]; then
+            echo 'Build-only verification: no images were pushed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for key in COORDINATOR_DIGEST SANDBOX_BASE_DIGEST SANDBOX_DEV_DIGEST SANDBOX_FULL_DIGEST; do
+            if [[ ! ${!key} =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Missing or invalid image digest: $key" >&2
+              exit 1
+            fi
+          done
+          coord="${COORDINATOR_IMAGE}@${COORDINATOR_DIGEST}"
+          base="${SANDBOX_IMAGE}@${SANDBOX_BASE_DIGEST}"
+          dev="${SANDBOX_IMAGE}@${SANDBOX_DEV_DIGEST}"
+          full="${SANDBOX_IMAGE}@${SANDBOX_FULL_DIGEST}"
           {
             echo "coordinator=$coord"
             echo "sandbox_base=$base"
