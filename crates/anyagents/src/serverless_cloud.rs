@@ -16,6 +16,8 @@ use std::io::Read as _;
 use std::time::Duration;
 
 use anyagents_core::{constant_time_eq, verify_hmac_sha256_signature};
+use anyagents_harness_spiron::cloud::operator_cloud_url;
+use anyagents_harness_spiron::inference_key::{BYOK_ENV_SHORT, InferenceKey};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -432,6 +434,7 @@ pub struct SpironServerlessDriver {
     pub base_url: String,
     pub auth_token: Option<String>,
     pub remote_agent_id: Option<String>,
+    inference_key: Option<InferenceKey>,
     pub webhook_secret: Option<String>,
     pub timeout_secs: u64,
 }
@@ -462,9 +465,15 @@ impl SpironServerlessDriver {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             remote_agent_id: None,
+            inference_key: None,
             webhook_secret: None,
             timeout_secs: DEFAULT_HTTP_TIMEOUT_SECS,
         }
+    }
+
+    fn with_inference_key(mut self, key: Option<InferenceKey>) -> Self {
+        self.inference_key = key;
+        self
     }
 
     pub fn with_remote_agent_id(mut self, remote_agent_id: Option<String>) -> Self {
@@ -612,6 +621,10 @@ impl CloudTurnDriver for SpironServerlessDriver {
         let driver = self.clone();
         let req = req.clone();
         tokio::task::spawn_blocking(move || {
+            if driver.inference_key.is_some() {
+                InferenceKey::validate_target(&driver.base_url, driver.auth_token.as_deref())
+                    .map_err(|err| err.to_string())?;
+            }
             let mut remote_agent_id = req
                 .remote_agent_id
                 .clone()
@@ -655,6 +668,15 @@ impl CloudTurnDriver for SpironServerlessDriver {
 
             let target_agent =
                 validate_path_segment(remote_agent_id.as_deref().unwrap_or(""), "remote_agent_id")?;
+            if let Some(key) = &driver.inference_key {
+                key.install(
+                    &driver.base_url,
+                    driver.auth_token.as_deref(),
+                    &target_agent,
+                    Duration::from_secs(driver.timeout_secs),
+                )
+                .map_err(|err| err.to_string())?;
+            }
             let mut msg_body = json!({ "content": req.prompt });
             // Per-turn Streamable HTTP MCP attachment (#5421).
             if let Some(ref mcp_servers) = req.mcp_servers {
@@ -706,6 +728,12 @@ impl CloudTurnDriver for SpironServerlessDriver {
     }
 
     async fn steer_turn(&self, req: &CloudTurnSteerRequest) -> Result<CloudSteerAck, String> {
+        if self.inference_key.is_some() {
+            // An active turn may already have selected a different credential.
+            return Ok(CloudSteerAck::Refused {
+                reason: "Spiron inference-key inputs wait for the next turn".into(),
+            });
+        }
         let driver = self.clone();
         let req = req.clone();
         tokio::task::spawn_blocking(move || {
@@ -1314,6 +1342,52 @@ pub fn resolve_cloud_driver_from_metadata(
     metadata: Option<&Value>,
     webhook_secret_override: Option<String>,
 ) -> Result<Box<dyn CloudTurnDriver>, String> {
+    resolve_cloud_driver(harness_kind, metadata, webhook_secret_override, None)
+}
+
+/// Resolve a driver for a message write. The inference key is only used on
+/// this replica and never included in turn metadata or request DTOs.
+pub(crate) async fn resolve_cloud_message_driver(
+    store: std::sync::Arc<anyagents_core::Store>,
+    agent_id: anyagents_core::AgentId,
+    harness_kind: &str,
+    metadata: Option<&Value>,
+) -> Result<Box<dyn CloudTurnDriver>, String> {
+    let key = if matches!(
+        harness_kind.trim().to_ascii_lowercase().as_str(),
+        "spiron" | "spiron-cloud" | "spiron_cloud"
+    ) {
+        tokio::task::spawn_blocking(move || resolve_inference_key(Some((&store, &agent_id))))
+            .await
+            .map_err(|_| "Spiron inference key resolution failed".to_string())??
+    } else {
+        None
+    };
+    resolve_cloud_driver(harness_kind, metadata, None, key)
+}
+
+pub(crate) fn resolve_inference_key(
+    target: Option<(&anyagents_core::Store, &anyagents_core::AgentId)>,
+) -> Result<Option<InferenceKey>, String> {
+    if let Some((store, agent_id)) = target {
+        let mut env = store
+            .resolve_agent_secret_env(agent_id)
+            .map_err(|_| "Could not resolve granted secrets for Spiron inference".to_string())?;
+        if let Some(value) = env.remove(BYOK_ENV_SHORT) {
+            return InferenceKey::new(value)
+                .map(Some)
+                .map_err(|err| err.to_string());
+        }
+    }
+    InferenceKey::from_process_env().map_err(|err| err.to_string())
+}
+
+fn resolve_cloud_driver(
+    harness_kind: &str,
+    metadata: Option<&Value>,
+    webhook_secret_override: Option<String>,
+    inference_key: Option<InferenceKey>,
+) -> Result<Box<dyn CloudTurnDriver>, String> {
     let endpoint_from_meta = metadata
         .and_then(|m| {
             m.get("cloud_endpoint")
@@ -1331,11 +1405,13 @@ pub fn resolve_cloud_driver_from_metadata(
 
     match harness_kind.trim().to_ascii_lowercase().as_str() {
         "spiron" | "spiron-cloud" | "spiron_cloud" => {
-            let base_url = endpoint_from_meta
-                .or_else(|| env_non_empty("ANYAGENTS_SPIRON_CLOUD_URL"))
-                .or_else(|| env_non_empty("SPIRON_API_URL"))
-                .or_else(|| env_non_empty("SPIRON_CLOUD_URL"))
-                .unwrap_or_else(|| "https://api.spiron.ai".to_string());
+            let operator_url = operator_cloud_url();
+            let base_url = endpoint_from_meta.unwrap_or_else(|| operator_url.clone());
+            if inference_key.is_some() && base_url.trim_end_matches('/') != operator_url {
+                return Err(
+                    "Spiron inference key requires the coordinator's configured origin".into(),
+                );
+            }
             let token = env_non_empty("ANYAGENTS_SPIRON_API_KEY")
                 .or_else(|| env_non_empty("SPIRON_API_KEY"))
                 .or_else(|| env_non_empty("SPIRON_TOKEN"));
@@ -1344,6 +1420,7 @@ pub fn resolve_cloud_driver_from_metadata(
                 .or_else(|| env_non_empty("ANYAGENTS_CLOUD_WEBHOOK_SECRET"));
             Ok(Box::new(
                 SpironServerlessDriver::new(base_url, token)
+                    .with_inference_key(inference_key)
                     .with_remote_agent_id(remote_agent_id)
                     .with_webhook_secret(secret),
             ))
@@ -1379,9 +1456,92 @@ mod tests {
     use anyagents_core::hmac_sha256_hex;
     use axum::extract::{Path as AxumPath, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn inference_key_setup_gates_serverless_messages() {
+        const ID: &str = "00000000-0000-4000-8000-000000000001";
+        const AUTH: &str = "spiron-test-bearer";
+        let fixture = ["sylphx", "sk", "serverless-test-fixture"].join("_");
+        for (status, configured, expected) in [
+            (None, false, vec!["create", "message"]),
+            (
+                Some(StatusCode::OK),
+                true,
+                vec!["create", "setup", "message"],
+            ),
+            (
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                true,
+                vec!["create", "setup"],
+            ),
+            (Some(StatusCode::FORBIDDEN), false, vec!["create", "setup"]),
+            (Some(StatusCode::OK), false, vec!["create", "setup"]),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let create_calls = Arc::clone(&calls);
+            let setup_calls = Arc::clone(&calls);
+            let message_calls = Arc::clone(&calls);
+            let expected_key = fixture.clone();
+            let create_key = fixture.clone();
+            let message_key = fixture.clone();
+            let app = Router::new()
+                .route("/v1/agents", post(move |Json(body): Json<Value>| async move {
+                    assert!(!body.to_string().contains(&create_key));
+                    create_calls.lock().unwrap().push("create");
+                    (StatusCode::CREATED, Json(json!({"id": ID})))
+                }))
+                .route("/v1/agents/{id}/inference-key", put(move |
+                    AxumPath(id): AxumPath<String>, headers: HeaderMap, Json(body): Json<Value>
+                | async move {
+                    assert_eq!(id, ID);
+                    assert_eq!(headers["authorization"].to_str().unwrap(), format!("Bearer {AUTH}"));
+                    assert_eq!(body, json!({"sylphx_api_key": expected_key}));
+                    setup_calls.lock().unwrap().push("setup");
+                    (status.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                     Json(json!({"byok_configured": configured, "untrusted": expected_key})))
+                }))
+                .route("/v1/agents/{id}/messages", post(move |
+                    AxumPath(id): AxumPath<String>, headers: HeaderMap, Json(body): Json<Value>
+                | async move {
+                    assert_eq!(id, ID);
+                    assert_eq!(headers["authorization"].to_str().unwrap(), format!("Bearer {AUTH}"));
+                    assert!(!body.to_string().contains(&message_key));
+                    message_calls.lock().unwrap().push("message");
+                    (StatusCode::ACCEPTED, Json(json!({"id": "receipt_1"})))
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let driver = SpironServerlessDriver::new(format!("http://{addr}"), Some(AUTH.into()))
+                .with_inference_key(status.map(|_| InferenceKey::new(fixture.clone()).unwrap()));
+            assert!(!format!("{driver:?}").contains(&fixture));
+            let request = CloudTurnSubmitRequest {
+                turn_id: "turn_1".into(),
+                agent_id: "agt_local_1".into(),
+                remote_agent_id: None,
+                prompt: "hello".into(),
+                model: None,
+                instructions: None,
+                mcp_servers: None,
+                callback_url: None,
+                callback_token: None,
+                metadata: BTreeMap::new(),
+            };
+            let outcome = driver.submit_turn(&request).await;
+            if expected.contains(&"message") {
+                assert_eq!(outcome.unwrap().remote_agent_id.as_deref(), Some(ID));
+            } else {
+                let err = outcome.unwrap_err();
+                assert!(err.contains("message not sent"), "{err}");
+                assert!(!err.contains(&fixture));
+            }
+            assert_eq!(*calls.lock().unwrap(), expected);
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn spiron_serverless_driver_submits_with_mcp_polls_receipt_and_events_cancels_and_parses_webhook()

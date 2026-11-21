@@ -89,6 +89,61 @@ async fn send_json(
     (status, raw, parsed)
 }
 
+#[test]
+fn inference_key_uses_encrypted_agent_grant_without_entering_sandbox_env() {
+    use anyagents_harness_spiron::inference_key::{BYOK_ENV, BYOK_ENV_SHORT};
+
+    let _env = crate::server::tests::env_lock();
+    let _restore = EnvRestore::capture(&[MASTER_KEY_ENV, BYOK_ENV, BYOK_ENV_SHORT]);
+    let invalid_global = "invalid-global-inference-fixture";
+    // SAFETY: shared test environment lock is held.
+    unsafe {
+        std::env::set_var(MASTER_KEY_ENV, TEST_MASTER_KEY);
+        std::env::set_var(BYOK_ENV, invalid_global);
+        std::env::remove_var(BYOK_ENV_SHORT);
+    }
+    let (dir, store, _app) = make_confined_app();
+    let opted_in = store
+        .create_agent(NewAgent::new("opted-in", "spiron"))
+        .unwrap();
+    let other = store
+        .create_agent(NewAgent::new("other", "spiron"))
+        .unwrap();
+    let fixture = ["sylphx", "sk", "grant-test-fixture"].join("_");
+    let entries = BTreeMap::from([
+        (BYOK_ENV_SHORT.into(), fixture.clone()),
+        ("ORDINARY_ENV".into(), "ordinary-value".into()),
+    ]);
+    let meta = store
+        .upsert_deployment_secret("inference", &entries)
+        .unwrap();
+    assert!(!format!("{meta:?}").contains(&fixture));
+    store
+        .set_agent_secrets(&opted_in.id, &["inference".into()], None)
+        .unwrap();
+    let key = crate::serverless_cloud::resolve_inference_key(Some((&store, &opted_in.id)))
+        .unwrap()
+        .unwrap();
+    assert!(!format!("{key:?}").contains(&fixture));
+    let err =
+        crate::serverless_cloud::resolve_inference_key(Some((&store, &other.id))).unwrap_err();
+    assert!(!err.contains(invalid_global));
+    let sandbox = super::resolve_agent_secret_env_for_sandbox(&store, &opted_in.id).unwrap();
+    assert_eq!(
+        sandbox,
+        BTreeMap::from([("ORDINARY_ENV".into(), "ordinary-value".into())])
+    );
+    for path in ["state.db", "state.db-wal"] {
+        if let Ok(bytes) = std::fs::read(dir.path().join(path)) {
+            assert!(
+                !bytes
+                    .windows(fixture.len())
+                    .any(|w| w == fixture.as_bytes())
+            );
+        }
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn sandbox_target_api_is_operator_only_and_keeps_billing_secrets_off_read_surfaces() {

@@ -47,7 +47,7 @@ use crate::sandbox_exec::{
 };
 use crate::serverless_cloud::{
     CloudTurnDriver, CloudTurnSubmitRequest, GenericHttpCloudDriver, SpironServerlessDriver,
-    resolve_cloud_driver_from_metadata,
+    resolve_cloud_message_driver,
 };
 
 pub(super) const DEFAULT_CLOUD_POLL_DELAY_MS: i64 = 5_000;
@@ -299,6 +299,13 @@ async fn dispatch_cloud_turn(
         saved_remote_agent.as_deref(),
     );
 
+    let driver = resolve_cloud_message_driver(
+        Arc::clone(&store),
+        input.agent.id.clone(),
+        harness_kind,
+        Some(&meta_val),
+    )
+    .await?;
     let now = now_ms();
     let store_create = Arc::clone(&store);
     let new_turn = NewRemoteTurn {
@@ -343,7 +350,6 @@ async fn dispatch_cloud_turn(
         return Ok(None);
     };
 
-    let driver = resolve_cloud_driver_from_metadata(harness_kind, Some(&meta_val), None)?;
     let prompt = super::knowledge::cloud_wake_prompt(&store, &input).await;
     let submit_req = CloudTurnSubmitRequest {
         turn_id: turn_id.clone(),

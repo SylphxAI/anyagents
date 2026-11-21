@@ -26,6 +26,6 @@
     "crates/anyagents/src/server/serverless.rs": 3338,
     "crates/anyagents/src/telegram/channel.rs": 4375,
     "crates/anyagents/src/ui.rs": 1546,
-    "crates/anyagents/src/vendor.rs": 2844
+    "crates/anyagents/src/vendor.rs": 2821
   }
 }

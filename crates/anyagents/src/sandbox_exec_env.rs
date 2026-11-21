@@ -58,7 +58,8 @@ pub(crate) fn is_blocked_sandbox_env_key(key: &str) -> bool {
             | "ANYAGENTS_MCP_TOKEN_FILE"
             | "ANYAGENTS_GATEWAY_URL"
             | "ANYAGENTS_GATEWAY_TOKEN"
-    ) || upper.starts_with("ANYAGENTS_OPERATOR_")
+    ) || anyagents_harness_spiron::inference_key::is_env_key(&upper)
+        || upper.starts_with("ANYAGENTS_OPERATOR_")
         || upper.starts_with("ANYAGENTS_ADMIN_")
         || upper.starts_with("ANYAGENTS_OIDC_")
         || upper.starts_with("ANYAGENTS_CONTROL_")

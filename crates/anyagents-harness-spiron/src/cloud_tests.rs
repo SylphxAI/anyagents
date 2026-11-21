@@ -1538,3 +1538,117 @@ fn probe_spend_cap_parses_effective_cap_fields_and_http_error_preserves_safe_det
         other => panic!("expected Protocol error, got {other:?}"),
     }
 }
+
+#[test]
+fn inference_key_setup_gates_hosted_messages_and_stays_out_of_session_files() {
+    use crate::inference_key::InferenceKey;
+
+    let fixture = ["sylphx", "sk", "hosted-test-fixture"].join("_");
+    for (status, configured, should_send) in [
+        (None, false, true),
+        (Some(200), true, true),
+        (Some(503), false, false),
+        (Some(403), false, false),
+        (Some(200), false, false),
+        (Some(307), true, false),
+    ] {
+        let echoed = fixture.clone();
+        let server =
+            MockSpironServer::start(
+                move |req, _| match (req.method.as_str(), req.uri.as_str()) {
+                    ("GET", "/v1/openapi.json") => MockResponse::json(200, strict_openapi()),
+                    ("GET", "/v1/spend-cap") => MockResponse::json(404, json!({})),
+                    ("POST", "/v1/agents") => MockResponse::json(201, json!({"id": AGENT_ID})),
+                    ("PUT", path) if path == format!("/v1/agents/{AGENT_ID}/inference-key") => {
+                        MockResponse::json(
+                            status.unwrap_or(500),
+                            json!({"byok_configured": configured, "untrusted": echoed}),
+                        )
+                        .with_header("Location", "/should-not-follow")
+                    }
+                    ("POST", path) if path == format!("/v1/agents/{AGENT_ID}/messages") => {
+                        MockResponse::json(
+                            202,
+                            json!({
+                                "id": RECEIPT_1, "agent_id": AGENT_ID, "provider_message_id": REQ_1,
+                                "status": "completed", "reply": "ok",
+                                "input_delivery": input_proof(REQ_1, REQ_1),
+                            }),
+                        )
+                    }
+                    _ => MockResponse::json(500, json!({})),
+                },
+            );
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path(), &server.base_url);
+        if status.is_some() {
+            cfg = cfg.with_inference_key(InferenceKey::new(fixture.clone()).unwrap());
+        }
+        assert!(!format!("{cfg:?}").contains(&fixture));
+        let mut provider = SpironCloudProvider::new(cfg);
+        let start = provider.create(&sample_session_config(None));
+        if should_send {
+            start.unwrap();
+        } else {
+            let err = start.unwrap_err().to_string();
+            assert!(err.contains("message not sent"), "{err}");
+            assert!(!err.contains(&fixture));
+        }
+        let delivery = provider.deliver(&RemoteDeliveryInput {
+            request_id: REQ_1.into(),
+            text: "hello".into(),
+            steer: false,
+            mcp_url: None,
+            mcp_token: None,
+        });
+        if should_send {
+            assert!(matches!(
+                delivery.unwrap(),
+                RemoteDeliveryAck::Accepted { .. }
+            ));
+        } else {
+            assert!(delivery.is_err());
+        }
+        let requests = server.requests();
+        let setup = requests
+            .iter()
+            .position(|req| req.uri.ends_with("/inference-key"));
+        let message = requests
+            .iter()
+            .position(|req| req.uri.ends_with("/messages"));
+        assert_eq!(setup.is_some(), status.is_some());
+        assert_eq!(message.is_some(), should_send);
+        assert!(!requests.iter().any(|req| req.uri == "/should-not-follow"));
+        if let Some(index) = setup {
+            assert!(
+                requests[..index]
+                    .iter()
+                    .any(|req| req.method == "POST" && req.uri == "/v1/agents")
+            );
+            let put = &requests[index];
+            assert_eq!(put.method, "PUT");
+            assert_eq!(put.headers["authorization"], format!("Bearer {TEST_TOKEN}"));
+            assert_eq!(put.body, json!({"sylphx_api_key": fixture}));
+            if let Some(index_of_message) = message {
+                assert!(index < index_of_message);
+            }
+        }
+        for (index, req) in requests.iter().enumerate() {
+            if Some(index) != setup {
+                assert!(!format!("{req:?}").contains(&fixture));
+            }
+        }
+        let mut dirs = vec![dir.path().to_path_buf()];
+        while let Some(path) = dirs.pop() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    assert!(!String::from_utf8_lossy(&bytes).contains(&fixture));
+                }
+            }
+        }
+    }
+}

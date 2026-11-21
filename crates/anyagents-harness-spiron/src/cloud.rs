@@ -26,15 +26,23 @@ use sha2::{Digest as _, Sha256};
 use crate::cloud_api::{
     ACTIVE_RUN_FILE, ActiveRunState, DEFAULT_RETRY_AFTER_MS, HttpOutcome, PendingRecord, SpironApi,
     bind_origin_and_cred, build_capabilities, classify_http_error, classify_receipt_failure,
-    classify_rejected_4xx, clear_active_run, declares_next_step, env_trimmed, extract_usage,
-    is_spend_cap_error, now_epoch_ms, persist_json, persist_terminal, proto, ptr_micros, ptr_str,
-    read_cloud_json, resolve_api_token, resolve_base_url, resolve_completed_reply,
-    resolve_disabled_tools, resolve_or_create_agent, spend_cap_bounds, sync_mcp_servers, transport,
-    validate_proof, validate_remote_mcp_url, validate_request_id, workspace_context,
+    classify_rejected_4xx, clear_active_run, configured_base_url, declares_next_step, env_trimmed,
+    extract_usage, is_spend_cap_error, now_epoch_ms, persist_json, persist_terminal, proto,
+    ptr_micros, ptr_str, read_cloud_json, resolve_api_token, resolve_base_url,
+    resolve_completed_reply, resolve_disabled_tools, resolve_or_create_agent, spend_cap_bounds,
+    sync_mcp_servers, transport, validate_proof, validate_remote_mcp_url, validate_request_id,
+    workspace_context,
 };
+
+use crate::inference_key::InferenceKey;
 
 /// Default Spiron Cloud API base URL.
 pub const DEFAULT_SPIRON_CLOUD_URL: &str = "https://api.spiron.ai";
+/// Trusted cloud endpoint from coordinator environment, or the public default.
+pub fn operator_cloud_url() -> String {
+    configured_base_url().unwrap_or_else(|| DEFAULT_SPIRON_CLOUD_URL.to_string())
+}
+
 /// Server-written rotated remote session token filename inside `config_dir`.
 pub const REMOTE_SESSION_TOKEN_FILE: &str = "remote-session-token";
 /// Server-written public coordination MCP URL filename inside `config_dir`.
@@ -62,6 +70,7 @@ pub struct SpendCapStatus {
 pub struct SpironCloudConfig {
     pub base_url: String,
     pub api_token: Option<String>,
+    inference_key: Option<InferenceKey>,
     pub config_dir: PathBuf,
     pub request_timeout: Duration,
     pub turn_budget: Duration,
@@ -96,6 +105,7 @@ impl SpironCloudConfig {
         Self {
             base_url,
             api_token: None,
+            inference_key: None,
             mcp_url_file: config_dir.join(REMOTE_MCP_URL_FILE),
             mcp_token_file: config_dir.join(REMOTE_SESSION_TOKEN_FILE),
             config_dir,
@@ -118,6 +128,11 @@ impl SpironCloudConfig {
 
     pub fn with_api_token(mut self, token: impl Into<String>) -> Self {
         self.api_token = Some(token.into());
+        self
+    }
+
+    pub fn with_inference_key(mut self, key: InferenceKey) -> Self {
+        self.inference_key = Some(key);
         self
     }
 
@@ -689,13 +704,16 @@ impl RemoteSessionProvider for SpironCloudProvider {
             .trim()
             .trim_end_matches('/')
             .to_string();
+        if self.config.inference_key.is_some() {
+            InferenceKey::validate_target(&base_url, token.as_deref())?;
+        }
         let cred_hash = format!(
             "{:x}",
             Sha256::digest(token.as_deref().unwrap_or("").as_bytes())
         );
         bind_origin_and_cred(&self.config.config_dir, &base_url, &cred_hash)?;
 
-        let api = SpironApi::new(base_url.clone(), token, self.config.request_timeout);
+        let api = SpironApi::new(base_url.clone(), token.clone(), self.config.request_timeout);
         let openapi = match api.get_json("/v1/openapi.json")? {
             HttpOutcome::Ok(val) => val,
             HttpOutcome::Error(err) => return Err(classify_http_error(&err)),
@@ -703,6 +721,14 @@ impl RemoteSessionProvider for SpironCloudProvider {
         let strict = declares_next_step(&openapi);
         let capabilities = build_capabilities(strict);
         let (agent_id, fresh) = resolve_or_create_agent(&self.config, &api, config)?;
+        if let Some(key) = &self.config.inference_key {
+            key.install(
+                &base_url,
+                token.as_deref(),
+                &agent_id,
+                self.config.request_timeout,
+            )?;
+        }
         let scope = format!("{base_url}/{agent_id}/{cred_hash}");
         let session = OpenSession {
             _lock: lock,
