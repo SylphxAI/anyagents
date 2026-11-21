@@ -35,14 +35,13 @@ const BROWSER_PROFILE_SUFFIX: &str = ".tar.zst";
 /// Mount all S3 browser-profile and scoped media endpoints onto the authenticated
 /// coordinator router.
 pub(super) fn router() -> Router<AppState> {
-    let archive_router = Router::new()
+    Router::new()
         .route(
             "/v1/browser-profiles/{profile}/archive",
-            get(get_browser_profile_archive_route).put(put_browser_profile_archive_route),
+            axum::routing::put(put_browser_profile_archive_route)
+                .route_layer(DefaultBodyLimit::max(MAX_PROFILE_ARCHIVE_BYTES))
+                .get(get_browser_profile_archive_route),
         )
-        .layer(DefaultBodyLimit::max(MAX_PROFILE_ARCHIVE_BYTES));
-
-    Router::new()
         .route("/v1/browser-profiles", get(list_browser_profiles_route))
         .route(
             "/v1/browser-profiles/{profile}",
@@ -56,7 +55,6 @@ pub(super) fn router() -> Router<AppState> {
             "/v1/media/{agent_id}/{media_id}",
             get(scoped_media_file_route),
         )
-        .merge(archive_router)
 }
 
 pub(crate) fn browser_profile_s3_key(profile: &str) -> String {
@@ -954,8 +952,8 @@ mod tests {
         (format!("http://{addr}"), objects)
     }
 
-    fn make_test_app(store: Arc<Store>) -> Router {
-        let state = AppState {
+    fn make_test_state(store: Arc<Store>) -> AppState {
+        AppState {
             store,
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(super::super::ProcessRunner)),
@@ -965,8 +963,11 @@ mod tests {
             identity: Arc::new(crate::identity::ServingIdentity::capture()),
             profiles: Default::default(),
             timer_backend: Arc::new(crate::timer::NoopTimerBackend),
-        };
-        router().with_state(state)
+        }
+    }
+
+    fn make_test_app(store: Arc<Store>) -> Router {
+        router().with_state(make_test_state(store))
     }
 
     fn request_as(
@@ -984,6 +985,24 @@ mod tests {
         req.extensions_mut()
             .insert(crate::auth::InjectedPrincipal(principal));
         req
+    }
+
+    fn profile_test_archive(mib: usize) -> Bytes {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        let mut tar = tar::Builder::new(encoder);
+        let data = vec![42; mib * 1024 * 1024];
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(data.len() as u64);
+        tar.append_data(
+            &mut header,
+            "Default/IndexedDB/session.ldb",
+            data.as_slice(),
+        )
+        .unwrap();
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+        assert!(archive.len() >= data.len());
+        Bytes::from(archive)
     }
 
     #[tokio::test]
@@ -1645,7 +1664,8 @@ mod tests {
         let sess_b = store.begin_remote_session(&off_host_b.id, 60_000).unwrap();
         let sess_local = store.begin_remote_session(&local_agent.id, 60_000).unwrap();
 
-        let app = make_test_app(Arc::clone(&store));
+        let state = make_test_state(Arc::clone(&store));
+        let app = super::super::build_router(state.clone());
 
         // 1. `GET /v1/browser-profiles` with single `x-anyagents-agent` remote session token -> 200.
         let req = Request::builder()
@@ -1671,29 +1691,63 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 3. `PUT` and `GET /v1/browser-profiles/{profile}/archive` via remote session token -> 200.
-        let archive_payload = b"\x28\xb5\x2f\xfdremote-session-browser-profile-archive".to_vec();
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/v1/browser-profiles/team-site/archive")
-            .header(crate::operator::AGENT_HEADER, &sess_a.token)
-            .header(header::CONTENT_TYPE, "application/zstd")
-            .body(Body::from(archive_payload.clone()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // 3. Exercise both production router assemblies that expose archive sync.
+        // Use real gzip-compressed tar archives above Axum's implicit 2 MiB limit.
+        unsafe { std::env::set_var("ANYAGENTS_SERVERLESS", "true") };
+        let webhook = super::super::build_webhook_router(state);
+        unsafe { std::env::remove_var("ANYAGENTS_SERVERLESS") };
+        let archive_uri = "/v1/browser-profiles/team-site/archive";
+        let archive_request = |method, body| {
+            Request::builder()
+                .method(method)
+                .uri(archive_uri)
+                .header(crate::operator::AGENT_HEADER, &sess_a.token)
+                .header(header::CONTENT_TYPE, "application/gzip")
+                .body(body)
+                .unwrap()
+        };
+        for (router, mib) in [(app.clone(), 4), (webhook, 12)] {
+            let archive = profile_test_archive(mib);
+            let size = archive.len();
+            let resp = router
+                .clone()
+                .oneshot(archive_request("PUT", Body::from(archive.clone())))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{mib} MiB profile PUT");
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(receipt["size_bytes"], size);
+            assert_eq!(receipt["encrypted"], true);
+            assert_eq!(receipt["stored"], true);
 
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/browser-profiles/team-site/archive")
-            .header(crate::operator::AGENT_HEADER, &sess_a.token)
-            .header(header::AUTHORIZATION, format!("Bearer {}", sess_a.token))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let got = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(got.as_ref(), archive_payload.as_slice());
+            // Exercise the real cap even without Content-Length and without
+            // allocating a 256 MiB fixture. Axum rejects before concatenating.
+            let chunk = Bytes::from_static(&[0; 1024 * 1024]);
+            let chunks = (0..MAX_PROFILE_ARCHIVE_BYTES / chunk.len())
+                .map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone()))
+                .chain(std::iter::once(Ok(Bytes::from_static(b"x"))));
+            let oversized = Body::from_stream(futures::stream::iter(chunks));
+            let resp = router
+                .clone()
+                .oneshot(archive_request("PUT", oversized))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+            let resp = router
+                .oneshot(archive_request("GET", Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/gzip");
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                got == archive,
+                "oversized PUT must not replace the stored archive"
+            );
+        }
 
         // 4. `GET /v1/media/{agent_id}/{media_id}` with fixed guest headers (`x-anyagents-agent` + `x-anyagents-agent-id`) and pure Bearer -> 200.
         let req = Request::builder()
@@ -1746,7 +1800,7 @@ mod tests {
             ),
         ] {
             let body = if method == "PUT" {
-                Body::from(archive_payload.clone())
+                Body::from("ungranted-profile-archive")
             } else {
                 Body::empty()
             };
