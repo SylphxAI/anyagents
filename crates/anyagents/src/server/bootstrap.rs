@@ -746,7 +746,7 @@ async fn serve(
         .await;
     }
     let public_task = public_listener.map(|tcp_listener| {
-        let public_app = build_public_router(state.clone());
+        let public_app = in_flight::listener(build_public_router(state.clone()), &stopping);
         let stop = stopped(&stopping);
         tokio::spawn(async move {
             let _ = axum::serve(tcp_listener, public_app)
@@ -755,10 +755,13 @@ async fn serve(
         })
     });
     let webhook_task = if let Some(listener) = startup_listener {
-        Some(listener.mount(build_webhook_router(state.clone())))
+        Some(listener.mount(in_flight::listener(
+            build_webhook_router(state.clone()),
+            &stopping,
+        )))
     } else {
         webhook_listener.map(|tcp_listener| {
-            let webhook_app = build_webhook_router(state.clone());
+            let webhook_app = in_flight::listener(build_webhook_router(state.clone()), &stopping);
             let stop = stopped(&stopping);
             tokio::spawn(async move {
                 let _ = axum::serve(tcp_listener, webhook_app)
@@ -779,7 +782,7 @@ async fn serve(
             }
         });
     }
-    let app = build_router(state);
+    let app = in_flight::listener(build_router(state), &stopping);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let serving = axum::serve(listener, app)
         .with_graceful_shutdown(stopped(&stopping))
@@ -789,29 +792,21 @@ async fn serve(
     let result = tokio::select! {
         result = &mut serving => result,
         () = stop_requested(&mut terminate) => {
-            // From here no new connection is taken: a call made now waits on
-            // the agent's side for the next server (`mcp::RESTART_WAIT`).
-            // Calls already running finish first: dropping a call's future
-            // does not stop its blocking work, and what does stop it is the
-            // process exiting, which can cut a mutation between its steps.
-            eprintln!(
-                "anyagents: stopping; no new calls are taken; waiting up to {}s for {} mutating \
-                 call(s) still running to finish (reads end with the process){}",
-                MUTATION_DRAIN_WITHIN.as_secs(),
-                in_flight::MUTATIONS.running(),
-                if kept {
-                    format!("; this process exits within {}s", STOP_WITHIN.as_secs())
-                } else {
-                    String::new()
-                }
-            );
+            // Close admission before running any cleanup, including on
+            // keep-alive connections. Already admitted requests can finish.
+            stopping.send_replace(true);
             if kept {
-                // A keeper still starting is the next server's to take over:
-                // a call waiting for its `ready` (up to three minutes) returns
-                // now instead of holding the stop.
-                anyagents_keeper::abandon_starts();
                 exit_after(STOP_WITHIN);
+                // A keeper still starting is the next server's to take over:
+                // a call waiting for its `ready` returns now.
+                anyagents_keeper::abandon_starts();
             }
+            eprintln!(
+                "anyagents: stopping; no new requests are admitted; draining HTTP connections \
+                 and {} active request handler(s) or blocking job(s) for up to {}s",
+                in_flight::REQUESTS.running(),
+                REQUEST_DRAIN_WITHIN.as_secs(),
+            );
 
             let preserve_webhook = preserve_webhooks_on_shutdown(data);
             if !preserve_webhook && let Some(ref poller) = poller {
@@ -829,53 +824,26 @@ async fn serve(
                     )
                 }));
             }
-            let _ = stopping.send(true);
-            // `serving` is polled first so the Unix listener closes at once,
-            // while `settling` keeps waiting even after `serving` has no open
-            // socket connections (for TCP mutations and detached blocking work).
-            let settling = in_flight::MUTATIONS.settle(MUTATION_DRAIN_WITHIN);
-            tokio::pin!(settling);
-            let mut serving_done = false;
-            let mut serve_result = Ok(());
-            let left = loop {
-                tokio::select! {
-                    biased;
-                    result = &mut serving, if !serving_done => {
-                        serving_done = true;
-                        serve_result = result;
-                    }
-                    left = &mut settling => break left,
-                }
+            let listeners = async {
+                let (result, (), ()) = tokio::join!(&mut serving, join_listener(public_task), join_listener(webhook_task));
+                result
             };
+            let result = in_flight::drain(listeners, &in_flight::REQUESTS, REQUEST_DRAIN_WITHIN).await;
             if kept {
-                // Nothing left to wait for once the mutations are done: the
-                // answers, the Telegram release and the joins after it get a
-                // few seconds, then the process exits whatever still runs.
                 exit_after(STOP_AFTER_DRAIN_WITHIN);
             }
-            if left > 0 {
-                eprintln!(
-                    "anyagents: {left} mutating call(s) still running after {}s end with \
-                     the process; each caller is told its call may or may not have \
-                     applied",
-                    MUTATION_DRAIN_WITHIN.as_secs()
-                );
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    eprintln!(
+                        "anyagents: HTTP drain deadline reached after {}s; outstanding responses \
+                         may be interrupted ({} request handler(s) or blocking job(s) still active)",
+                        REQUEST_DRAIN_WITHIN.as_secs(),
+                        in_flight::REQUESTS.running(),
+                    );
+                    Ok(())
+                }
             }
-            // Answers of calls that just finished are written out across every
-            // listener; reads still running end with the process.
-            let flush = async {
-                if !serving_done {
-                    serve_result = (&mut serving).await;
-                }
-                if let Some(task) = public_task {
-                    let _ = task.await;
-                }
-                if let Some(task) = webhook_task {
-                    let _ = task.await;
-                }
-            };
-            let _ = tokio::time::timeout(RESPONSE_FLUSH_WITHIN, flush).await;
-            serve_result
         }
     };
     let preserve_webhook = preserve_webhooks_on_shutdown(data);
@@ -925,33 +893,26 @@ fn preserve_webhooks_on_shutdown(data: &Path) -> bool {
         || crate::remote::require_public_url(data).is_ok()
 }
 
-/// How long a stopping server waits for the mutating calls it is running
-/// (spawn, delete, send, schedules, any call but a read) to finish before it
-/// exits. No connection is taken meanwhile; the agents' tool servers wait for
-/// the next server (`mcp::RESTART_WAIT`). A mutation still running after it
-/// ends with the process, and its caller is told the call may or may not have
-/// applied.
-///
-/// A spawn, the longest common mutation, typically takes a few seconds; a
-/// minute covers one that provisions a large checkout, and keeps a restart
-/// well inside the shortest long tool deadline a harness sets (three minutes).
-const MUTATION_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+async fn join_listener(task: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+}
 
-/// Once the mutations are done, how long their answers get to be written out
-/// before the server stops serving; reads still running end with the process.
-const RESPONSE_FLUSH_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// One deadline for admitted reads, writes, finite response bodies and any
+/// blocking work they started. Keep restarts within the MCP retry window.
+const REQUEST_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The longest a server whose harnesses live in keepers takes to exit once
 /// told to stop. Past it the process exits at once: its harnesses stay with
 /// their keepers for the next server, exactly as after a crash, and its store
 /// writes are transactions, so a write cut short is not half made.
 pub(crate) const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(
-    MUTATION_DRAIN_WITHIN.as_secs() + STOP_AFTER_DRAIN_WITHIN.as_secs(),
+    REQUEST_DRAIN_WITHIN.as_secs() + STOP_AFTER_DRAIN_WITHIN.as_secs(),
 );
 
-/// Once the mutations are done (or their wait is over), the longest a server
-/// whose harnesses live in keepers takes to exit: the answers are written out
-/// ([`RESPONSE_FLUSH_WITHIN`]), the Telegram release and the joins after it
+/// Once requests have drained (or their wait is over), the longest a server
+/// whose harnesses live in keepers takes to exit: the Telegram release and joins
 /// finish, and the runtime abandons its blocking work. Background loops (the
 /// schedule timers and their external probes among them) already ended at the
 /// stop. The budget includes response flushing, nine-second desktop session

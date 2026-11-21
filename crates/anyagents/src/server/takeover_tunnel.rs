@@ -43,6 +43,7 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
 use crate::auth::{Principal, is_valid_takeover_session_id};
 
+use super::in_flight::Stopping;
 use super::serverless;
 use super::types::AppState;
 
@@ -1137,7 +1138,10 @@ async fn handle_viewer_request(
         )
         .await;
     }
-    proxy_viewer_http(
+    let stop_events = (subpath == "/events")
+        .then(|| parts.extensions.get::<Stopping>().cloned())
+        .flatten();
+    let response = proxy_viewer_http(
         registry,
         session,
         parts.method.as_str().to_string(),
@@ -1147,7 +1151,9 @@ async fn handle_viewer_request(
         body,
         mint_cookie,
     )
-    .await
+    .await;
+    // Dropping the event body on shutdown also cancels the guest request.
+    Stopping::close_event_stream(response, stop_events)
 }
 
 fn try_send_control(tunnel_tx: &mpsc::Sender<OutboundTunnelMsg>, frame: &ControlFrame) {
@@ -1504,6 +1510,7 @@ mod tests {
         agent_a_token: String,
         agent_b_token: String,
         server_task: tokio::task::JoinHandle<()>,
+        stopping: tokio::sync::watch::Sender<bool>,
     }
 
     impl Drop for TestFixture {
@@ -1543,11 +1550,17 @@ mod tests {
             profiles: Default::default(),
             timer_backend: Arc::new(crate::timer::NoopTimerBackend),
         };
-        let app = crate::server::build_public_router(state);
+        use crate::server::{bootstrap, in_flight};
+        let (stopping, _) = tokio::sync::watch::channel(false);
+        let app = in_flight::listener(crate::server::build_public_router(state), &stopping);
+        let stop = bootstrap::stopped(&stopping);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await
+                .unwrap();
         });
         TestFixture {
             _dir: dir,
@@ -1555,6 +1568,7 @@ mod tests {
             agent_a_token: tok_a,
             agent_b_token: tok_b,
             server_task,
+            stopping,
         }
     }
 
@@ -1681,6 +1695,66 @@ mod tests {
             }
         });
         (stop_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn takeover_events_end_cleanly_on_shutdown_and_cancel_the_guest_subscription() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            use hyper_util::rt::TokioIo;
+            let mut fx = start_fixture(Duration::from_secs(5), Duration::from_secs(25)).await;
+            let session_id = "tk_shutdown_test";
+            let token = "event-stream-fixture-token";
+            let mut guest = dial_guest(fx.addr, session_id, &fx.agent_a_token).await;
+            let register = ControlFrame::Register {
+                token: token.into(),
+                agent_id: None,
+                local_origin: None,
+            };
+            async fn next_control(
+                guest: &mut tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+            ) -> ControlFrame {
+                loop {
+                    if let ClientWsMsg::Text(text) = guest.next().await.unwrap().unwrap() {
+                        return serde_json::from_str(&text).unwrap();
+                    }
+                }
+            }
+            guest.send(ClientWsMsg::Text(serde_json::to_string(&register).unwrap().into())).await.unwrap();
+            assert!(matches!(next_control(&mut guest).await, ControlFrame::Registered { .. }));
+
+            let socket = tokio::net::TcpStream::connect(fx.addr).await.unwrap();
+            let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket)).await.unwrap();
+            tokio::spawn(async move { conn.await.unwrap() });
+            let request = hyper::Request::get(format!("/takeover/{session_id}/events?token={token}"))
+                .header(header::HOST, fx.addr.to_string())
+                .body(http_body_util::Empty::<Bytes>::new()).unwrap();
+            let request = tokio::spawn(async move { client.send_request(request).await.unwrap() });
+            let ControlFrame::HttpRequest { id, path, .. } = next_control(&mut guest).await else {
+                panic!("expected proxy request");
+            };
+            assert_eq!(path, "/events");
+            let head = ControlFrame::HttpResponseHead {
+                id,
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream; charset=utf-8".into())],
+                done: false,
+            };
+            guest.send(ClientWsMsg::Text(serde_json::to_string(&head).unwrap().into())).await.unwrap();
+            let event = b"data: ready\n\n";
+            guest.send(ClientWsMsg::Binary(encode_binary_frame(BIN_TAG_HTTP_CHUNK, id, event))).await.unwrap();
+            let mut response = request.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let first = response.body_mut().frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(first.as_ref(), event);
+
+            // The upstream intentionally never sends HttpResponseEnd.
+            fx.stopping.send_replace(true);
+            assert!(response.into_body().collect().await.unwrap().to_bytes().is_empty());
+            assert!(matches!(next_control(&mut guest).await, ControlFrame::HttpCancel { id: canceled } if canceled == id));
+            (&mut fx.server_task).await.unwrap();
+        }).await.expect("open SSE stream prevented shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

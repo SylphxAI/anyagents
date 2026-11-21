@@ -82,18 +82,21 @@ fn writes_on_the_tcp_listeners_hold_the_stop() {
                 .await
                 .unwrap();
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while in_flight::MUTATIONS.running() == 0 && std::time::Instant::now() < until {
+            while in_flight::REQUESTS.running() == 0 && std::time::Instant::now() < until {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             assert!(
-                in_flight::MUTATIONS.running() > 0,
+                in_flight::REQUESTS.running() > 0,
                 "a write on the {name} listener does not hold the stop"
             );
             drop(stream);
             served.abort();
-            in_flight::MUTATIONS
-                .settle(std::time::Duration::from_secs(5))
-                .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                in_flight::REQUESTS.wait_until_idle(),
+            )
+            .await
+            .unwrap();
         }
     });
 }

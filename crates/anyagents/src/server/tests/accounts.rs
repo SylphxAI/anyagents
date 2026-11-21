@@ -94,16 +94,16 @@ fn sign_in_route_carries_in_flight_token_until_blocking_work_finishes() {
         // holds its carried `in_flight` token until `sign_in` finishes.
         drop(response);
         assert!(
-            in_flight::MUTATIONS.running() > 0,
+            in_flight::REQUESTS.running() > 0,
             "streaming sign-in dropped its in_flight token before blocking work finished"
         );
         release_tx.send(()).unwrap();
-        assert_eq!(
-            in_flight::MUTATIONS
-                .settle(std::time::Duration::from_secs(5))
-                .await,
-            0
-        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            in_flight::REQUESTS.wait_until_idle(),
+        )
+        .await
+        .unwrap();
     });
 }
 
